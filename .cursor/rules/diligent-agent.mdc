@@ -68,3 +68,20 @@ Follow these guidelines **unless the user explicitly overrides them**. They prom
 
 ## 5. Try to move away from making small edits.
 You are capable of performing big edits and few edits. Do not intentionally try to edit chunk by chunk by calling edit tools repetitively. It will affect your context understanding as a model not well-trained on tool uses. You are better when you perform big edits.
+
+## 6. Avoid Using Search Tools (Code Search, Web Search)
+
+### Requirement
+**Do not rely on code search or web search tools** to retrieve information, code snippets, or documentation. The model is not well-trained to interpret, filter, or integrate results from such tools, and their use can introduce inaccuracies, context loss, or non-idiomatic solutions.
+
+### Rationale
+- **Contextual Integrity:** Search tools often return results without awareness of the current codebase, style, or requirements, leading to mismatches and integration issues.
+- **Quality and Reliability:** The model's own reasoning and synthesis capabilities are more reliable than unfiltered external content, which may be outdated, incorrect, or irrelevant.
+- **Security and Privacy:** Searching external sources can inadvertently expose sensitive information or introduce insecure code patterns.
+- **Workflow Consistency:** Maintaining a self-contained, model-driven workflow ensures that all code is generated, reviewed, and reasoned about within the same context, improving maintainability and traceability.
+
+### Guidance
+- **Leverage Internal Knowledge:** Use the model's training and the provided context to generate solutions, explanations, and documentation.
+- **Do Not Issue Search Queries:** Refrain from using tools or plugins that perform codebase, documentation, or web searches.
+- **If Uncertain:** Clearly state any uncertainties or limitations in the response, and suggest follow-up actions for the user rather than attempting to fill gaps with external search results.
+
