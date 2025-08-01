@@ -1,0 +1,70 @@
+---
+alwaysApply: true
+---
+# Implementation Quality & Workflow Guidelines
+
+These guidelines apply to **all coding tasks**. They ensure that generated code is production-ready, thoroughly thought out, and that progress is transparently tracked.
+
+## 1. No Unrequested Simplifications
+
+### Requirement
+Implement the **full, idiomatic** solution unless the user *explicitly* requests a simplified or partial version.
+
+### Positive Example
+> User: “Add CSV export to the report feature.”  
+> Assistant: *Implements streaming writer, handles large datasets, adds tests, updates docs.*
+
+### Negative Example
+> Assistant: *Writes a stub that only supports <100 records and ignores delimiter escaping because it’s “good enough for now.”*
+
+## 2. Placeholders Must Be Revisited
+
+### Requirement
+Temporary placeholders (`TODO`, `pass`, `// FIXME`, mock data, dummy credentials, etc.) **must** be replaced with a complete implementation **before finishing the task**.
+
+### Positive Example
+1. Initial pass inserts `TODO: replace with real DB lookup`.
+2. Before completion, the assistant replaces the TODO with the actual query and removes the comment.
+
+### Negative Example
+Finishing a task while leaving `def fetch_user(): pass` in the code or returning hard-coded mock data.
+
+## 3. Plan → Verify → Sanity-Check
+
+### Requirement
+1. **Plan Ahead** – Outline the high-level approach *before* coding.
+2. **Verify** – Ensure the plan satisfies all user requirements, covers edge cases, and integrates with existing code.
+3. **Sanity-Check** – After coding, review for errors, performance, and adherence to style.
+
+### Positive Example
+- Assistant lists the steps (update schema → write migration → adapt model → update API → add tests).
+- Confirms compatibility with current ORM version and rollback strategy.
+- Runs lints/tests and fixes issues before delivering.
+
+### Negative Example
+Jumping straight into editing files without thinking through migration implications, leading to runtime errors.
+
+## 4. Use the TODO Tool for Progress Tracking
+
+### Requirement
+For multi-step or non-trivial tasks (≥ 3 steps), maintain a TODO list:
+- Create items with clear descriptions.
+- Mark one item `in_progress` at a time.
+- Update to `completed` immediately after finishing.
+
+### Positive Example
+```
+(todo)
+- Setup DB migration [in_progress]
+- Refactor service layer [pending]
+- Write tests [pending]
+```
+
+### Negative Example
+Completing a four-step refactor with no TODO tracking, leaving reviewers unsure of progress.
+
+---
+Follow these guidelines **unless the user explicitly overrides them**. They promote reliability, clarity, and maintainability in all code you write.
+
+## 5. Try to move away from making small edits.
+You are capable of performing big edits and few edits. Do not intentionally try to edit chunk by chunk by calling edit tools repetitively. It will affect your context understanding as a model not well-trained on tool uses. You are better when you perform big edits.

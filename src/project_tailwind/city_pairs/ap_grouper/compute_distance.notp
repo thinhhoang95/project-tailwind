@@ -1,0 +1,74 @@
+"""
+This module provides functions for computing the distance between trajectories.
+"""
+
+from typing import List, Tuple
+
+import numpy as np
+import traj_dist.distance as tdist
+from shapely.geometry import LineString
+
+
+def great_circle_distance(
+    path1: List[Tuple[float, float]], path2: List[Tuple[float, float]]
+) -> float:
+    """
+    Computes the great-circle distance between two paths.
+    This is not a true trajectory distance metric, but a simple way to
+    compare two paths.
+
+    Args:
+        path1 (List[Tuple[float, float]]): A list of (latitude, longitude) tuples.
+        path2 (List[Tuple[float, float]]): A list of (latitude, longitude) tuples.
+
+    Returns:
+        float: The great-circle distance between the two paths.
+    """
+    line1 = LineString(path1)
+    line2 = LineString(path2)
+    return line1.distance(line2)
+
+
+def frechet_distance(
+    path1: List[Tuple[float, float]], path2: List[Tuple[float, float]]
+) -> float:
+    """
+    Computes the Frechet distance between two paths.
+
+    Args:
+        path1 (List[Tuple[float, float]]): A list of (latitude, longitude) tuples.
+        path2 (List[Tuple[float, float]]): A list of (latitude, longitude) tuples.
+
+    Returns:
+        float: The Frechet distance between the two paths.
+    """
+    p = np.array(path1)
+    q = np.array(path2)
+    return tdist.frechet(p, q)
+
+
+def compute_distance_matrix(
+    trajectories: List[List[Tuple[float, float]]], distance_metric: str = "frechet"
+) -> np.ndarray:
+    """
+    Computes the pairwise distance matrix for a list of trajectories.
+
+    Args:
+        trajectories (List[List[Tuple[float, float]]]): A list of trajectories.
+        distance_metric (str, optional): The distance metric to use.
+            Defaults to "frechet".
+
+    Returns:
+        np.ndarray: The pairwise distance matrix.
+    """
+    n = len(trajectories)
+    distance_matrix = np.zeros((n, n))
+    metric = frechet_distance if distance_metric == "frechet" else great_circle_distance
+
+    for i in range(n):
+        for j in range(i, n):
+            distance = metric(trajectories[i], trajectories[j])
+            distance_matrix[i, j] = distance
+            distance_matrix[j, i] = distance
+
+    return distance_matrix
