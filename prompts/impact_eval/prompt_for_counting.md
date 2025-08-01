@@ -4,9 +4,14 @@ The starting point is the code in `src/project_tailwind/traffic_counting/impact_
 
 1. We would like to assign an index to each traffic volume time window (called a TVTW). For example, traffic volume `EBBUELS1` from `00:00-00:30` is one TVTW (the time starts from take off time: 00:00 is the takeoff time). We note this assignment into an external file, and write some helper functions (in a separate python module) that allows quickly conversion between the index and the tuple (traffic volume, time window) - in human readable format.
 
-2. We would like to repurpose the counting code in `impact_vector_derivation` so that it will produce **a sequence of TVTW indices that the count related to the route can be counted towards to**. 
+2. Given the route, first compute the 4D trajectory using the `get_4d_trajectory` function in `src/project_tailwind/get4d/get_4d_trajectory.py`. 
+
+3. We would like to repurpose the counting code in `impact_vector_derivation` so that it will produce **a sequence of TVTW indices that the count related to the route can be counted towards to**. 
 
 *For example: given the route `LFPG RESMI TOU LFBO`, the computation will give a sequence `121 242 193 207 206` where 121 is the TVTW of the Bordeaux Traffic Volume LFBBZ1 for instance, at takeoff time, 00:00-00:30 for example.* 
 
 ## For context
 - The waypoints can be read from the graph in `D:/project-akrav/data/graphs/ats_fra_nodes_only.gml` networkx gml file. The node id is directly the waypoint name, and each node has two attributes: lat and lon. There are no edges in the graph (in compliance with free route airspace context).
+ 
+# Requirements
+- Always verify your code, sanity check it when you write.

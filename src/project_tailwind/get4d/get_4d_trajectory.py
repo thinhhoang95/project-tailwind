@@ -46,14 +46,19 @@ def get_4d_trajectory(
         cruise_altitude_ft: Cruise altitude in feet.
 
     Returns:
-        A tuple containing two lists:
-        - altitudes_ft: Altitude in feet at each waypoint.
-        - elapsed_times_s: Elapsed time in seconds from takeoff at each waypoint.
+        A tuple containing five elements:
+        - altitudes_ft: Altitude in feet at each point in the final trajectory.
+        - elapsed_times_s: Elapsed time in seconds from takeoff at each point.
+        - final_waypoints: A list of waypoint dictionaries for the full trajectory,
+                           including synthetic TOC/TOD points. Each dictionary contains
+                           'name', 'lat', and 'lon'.
+        - toc_index: The index of the Top of Climb (TOC) waypoint in `final_waypoints`. -1 if not present.
+        - tod_index: The index of the Top of Descent (TOD) waypoint in `final_waypoints`. -1 if not present.
     """
     # 1. Parse route string
     waypoint_names = [wp.upper() for wp in route.split() if wp]
     if not waypoint_names:
-        return [], []
+        return [], [], [], -1, -1
 
     # 2. Load waypoint geometry
     if nodes_graph is None:
@@ -135,7 +140,17 @@ def get_4d_trajectory(
             seen_dists.add(event['dist'])
 
     final_cum_dists = [item['dist'] for item in final_waypoints_with_dist]
+    final_waypoints = [item['waypoint'] for item in final_waypoints_with_dist]
     
+    toc_index = -1
+    tod_index = -1
+    if toc_dist < tod_dist:
+        for i, wp in enumerate(final_waypoints):
+            if wp['name'] == 'TOC':
+                toc_index = i
+            elif wp['name'] == 'TOD':
+                tod_index = i
+
     # 6. Generate altitude profile
     altitudes_ft = []
     if toc_dist < tod_dist:
@@ -179,10 +194,10 @@ def get_4d_trajectory(
         # Returning altitudes but empty times for this complex case.
         # A full implementation would solve for the intersection altitude and time.
         raise NotImplementedError("Overlapping climb/descent is not implemented yet.")
-        return altitudes_ft, []
+        return altitudes_ft, [], final_waypoints, -1, -1
 
     # 8. Return
-    return altitudes_ft, elapsed_times_s
+    return altitudes_ft, elapsed_times_s, final_waypoints, toc_index, tod_index
 
 
 if __name__ == '__main__':
@@ -221,7 +236,7 @@ if __name__ == '__main__':
     descent_table = get_eta_and_distance_descent(perf_model, destination_airport_elevation_ft=0)
     
     # 4. Get the 4D trajectory
-    altitudes, times = get_4d_trajectory(
+    altitudes, times, final_wps, toc_idx, tod_idx = get_4d_trajectory(
         route=route_str,
         nodes_graph=G,
         eta_and_distance_climb_table=climb_table,
@@ -232,14 +247,11 @@ if __name__ == '__main__':
 
     # 5. Print results
     print(f"4D Trajectory for route: {route_str}")
-    print("-" * 50)
-    # Re-parse route to get waypoint names for printing
-    waypoints_for_print = [wp.upper() for wp in route_str.split() if wp]
-    # This part needs adjustment to get the final waypoint list including synthetic ones
-    # For now, we'll just print the raw lists. A more advanced printout would need the final waypoint list from the function.
-    
-    print(f"{'Altitude (ft)':>15} | {'Elapsed Time (s)':>20}")
-    print("-" * 50)
-    for alt, t in zip(altitudes, times):
-        print(f"{alt:15.2f} | {t:20.2f}")
+    print(f"TOC at index: {toc_idx}, TOD at index: {tod_idx}")
+    print("-" * 70)
+    print(f"{'Waypoint':>15} | {'Altitude (ft)':>15} | {'Elapsed Time (s)':>20}")
+    print("-" * 70)
+    for i, (alt, t) in enumerate(zip(altitudes, times)):
+        wp_name = final_wps[i]['name']
+        print(f"{wp_name:>15} | {alt:15.2f} | {t:20.2f}")
 

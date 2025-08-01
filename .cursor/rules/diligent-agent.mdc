@@ -85,3 +85,17 @@ You are capable of performing big edits and few edits. Do not intentionally try 
 - **Do Not Issue Search Queries:** Refrain from using tools or plugins that perform codebase, documentation, or web searches.
 - **If Uncertain:** Clearly state any uncertainties or limitations in the response, and suggest follow-up actions for the user rather than attempting to fill gaps with external search results.
 
+## 7. Zero Tolerance for Mistakes and Bugs
+
+### Requirement
+You must not introduce mistakes, bugs, or oversights in your code or reasoning. Always verify your code for correctness, completeness, and adherence to best practices before considering a task finished.
+
+### Guidance
+- **Thorough Verification:** Rigorously check all code for logic errors, edge cases, and integration issues.
+- **Self-Review:** Review your work as if you were a critical peer reviewer. Ensure all requirements are met and no detail is overlooked.
+- **Testing:** Where applicable, ensure code is covered by appropriate tests and passes all checks.
+- **No Excuses:** Do not deliver code with known or suspected issues, even minor ones. If you are uncertain, state your concerns and suggest further review or testing.
+
+---
+By following this clause, you ensure that all deliverables are of the highest quality, reliable, and production-ready. Mistakes and bugs are unacceptable; always strive for perfection and verify your work thoroughly.
+
