@@ -81,7 +81,7 @@ def compute_impact_vector_for_route(
     """
     # For simplicity, we assume a fixed takeoff time for all routes.
     # This could be randomized or varied in a more advanced simulation.
-    takeoff_time = datetime.datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
+    takeoff_time = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
     impact_vector = compute_impact_vector(
         route=route,
@@ -219,8 +219,10 @@ def main():
             if 'route' in df.columns:
                 all_routes.extend(df['route'].tolist())
     
-    all_routes = all_routes[:10] # test with only 10 routes
     print(f"Loaded {len(all_routes)} routes to process.")
+
+    all_routes = all_routes[:10] # test with only 10 routes
+    print(f"Processing only {len(all_routes)} routes for debugging...")
 
     # 2. Setup TVTW Indexer
     if os.path.exists(args.tvtw_indexer_path):

@@ -81,7 +81,7 @@ def compute_impact_vector_for_route(
     """
     # For simplicity, we assume a fixed takeoff time for all routes.
     # This could be randomized or varied in a more advanced simulation.
-    takeoff_time = datetime.datetime.now().replace(hour=12, minute=0, second=0, microsecond=0)
+    takeoff_time = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
     impact_vector = compute_impact_vector(
         route=route,
@@ -227,7 +227,7 @@ def main():
         tvtw_indexer = TVTWIndexer.load(args.tvtw_indexer_path)
     else:
         print("Building new TVTW indexer...")
-        tvtw_indexer = TVTWIndexer(time_bin_minutes=30)
+        tvtw_indexer = TVTWIndexer(time_bin_minutes=15)
         tvtw_indexer.build_from_tv_geojson(args.tv_path)
         tvtw_indexer.save(args.tvtw_indexer_path)
         print(f"TVTW indexer saved to {args.tvtw_indexer_path}")
