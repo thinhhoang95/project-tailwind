@@ -35,7 +35,9 @@ dependencies = [
     "scipy",
     "geopandas",
     "geopy",
-    "tqdm"
+    "tqdm",
+    "pyroaring",
+    "orjson"
 ]
 
 [project.optional-dependencies]
