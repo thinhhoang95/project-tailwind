@@ -10,10 +10,10 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Optional
 import numpy as np
 
-from src.project_tailwind.impact_eval.operators.delay import delay_operator
-from src.project_tailwind.impact_eval.operators.reroute import find_alternative_route
-from src.project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
-from src.project_tailwind.rqs.bitmap_querying_system import RouteQuerySystem
+from project_tailwind.impact_eval.operators.delay import delay_operator
+from project_tailwind.impact_eval.operators.reroute import find_alternative_route
+from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
+from project_tailwind.rqs.bitmap_querying_system import RouteQuerySystem
 
 
 def display_occupancy_vector_human_readable(
@@ -348,7 +348,7 @@ def main():
         return
     
     # Load Cirrus flight data
-    cirrus_file = "D:/project-cirrus/cases/flights_20230801.csv"
+    cirrus_file = "/Volumes/CrucialX/project-cirrus/cases/flights_20230801.csv"
     try:
         cirrus_df = load_cirrus_flight_data(cirrus_file)
         print(f"Loaded {len(cirrus_df)} flight segments from {cirrus_file}")
