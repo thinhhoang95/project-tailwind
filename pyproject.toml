@@ -37,7 +37,8 @@ dependencies = [
     "geopy",
     "tqdm",
     "pyroaring",
-    "orjson"
+    "orjson",
+    "alns"
 ]
 
 [project.optional-dependencies]
@@ -51,9 +52,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/project-tailwind"
-Repository = "https://github.com/yourusername/project-tailwind"
-Issues = "https://github.com/yourusername/project-tailwind/issues"
+Homepage = "https://github.com/thinhhoang95/project-tailwind"
+Repository = "https://github.com/thinhhoang95/project-tailwind"
+Issues = "https://github.com/thinhhoang95/project-tailwind/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
