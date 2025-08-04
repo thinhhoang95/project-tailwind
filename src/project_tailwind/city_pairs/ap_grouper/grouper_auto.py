@@ -24,7 +24,7 @@ DISTANCE_THRESHOLD = 1.8
 GML_FILE_PATH = "D:/project-akrav/data/graphs/ats_fra_nodes_only.gml"
 
 # Get number of CPUs for multiprocessing
-N_PROCESSES = max(1, mp.cpu_count() - 2)
+N_PROCESSES = max(1, mp.cpu_count() - 1)
 
 # Set multiprocessing start method for Windows compatibility
 if os.name == 'nt':  # Windows
@@ -449,7 +449,7 @@ def main():
     input_dir = "output/city_pairs/grouped_flights_by_cpairs"
     output_dir = "output/city_pairs/representatives"
     
-    # Ensure output directory exists
+    # Ensure output directory exists    
     os.makedirs(output_dir, exist_ok=True)
     
     # Get all CSV files in the input directory
