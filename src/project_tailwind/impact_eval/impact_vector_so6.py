@@ -73,15 +73,31 @@ def compute_occupancy_for_flight(
     tv_gdf: gpd.GeoDataFrame,
     tvtw_indexer: TVTWIndexer,
     sampling_dist_nm: float = 5.0
-) -> Tuple[str, List[int]]:
+) -> Tuple[str, List[int], float, str, str, str]:
     """
     Computes the occupancy vector (a sequence of TVTW indices) for a single flight
     by processing all its segments.
     """
     flight_identifier, flight_df = flight_data
     occupancy_vector = set()
+    total_distance_nm = 0.0
 
-    for _, segment in flight_df.sort_values(by='time_begin_segment').iterrows():
+    sorted_segments = flight_df.sort_values(by='time_begin_segment')
+    
+    if sorted_segments.empty:
+        return (flight_identifier, [], 0.0, None, None, None)
+
+    first_segment = sorted_segments.iloc[0]
+    origin = first_segment.get('origin_aerodrome')
+    destination = first_segment.get('destination_aerodrome')
+    takeoff_time = None
+    try:
+        takeoff_time_dt = parse_so6_time(first_segment['date_begin_segment'], first_segment['time_begin_segment'])
+        takeoff_time = takeoff_time_dt.isoformat()
+    except (ValueError, KeyError, TypeError):
+        pass
+
+    for _, segment in sorted_segments.iterrows():
         try:
             start_time = parse_so6_time(segment['date_begin_segment'], segment['time_begin_segment'])
             end_time = parse_so6_time(segment['date_end_segment'], segment['time_end_segment'])
@@ -89,8 +105,14 @@ def compute_occupancy_for_flight(
             p1_geom = Point(segment['longitude_begin'], segment['latitude_begin'])
             p2_geom = Point(segment['longitude_end'], segment['latitude_end'])
             
-            if p1_geom.is_empty or p2_geom.is_empty or p1_geom.distance(p2_geom) == 0:
+            if p1_geom.is_empty or p2_geom.is_empty:
                 continue
+
+            dist_nm = geodesic((p1_geom.y, p1_geom.x), (p2_geom.y, p2_geom.x)).nm
+            if dist_nm == 0:
+                continue
+
+            total_distance_nm += dist_nm
 
             alt1_ft = segment['flight_level_begin'] * 100
             alt2_ft = segment['flight_level_end'] * 100
@@ -106,7 +128,6 @@ def compute_occupancy_for_flight(
 
             # Sample along the segment to find intermediate occupancies
             line = LineString([p1_geom, p2_geom])
-            dist_nm = geodesic((p1_geom.y, p1_geom.x), (p2_geom.y, p2_geom.x)).nm
             num_samples = int(dist_nm / sampling_dist_nm) if sampling_dist_nm > 0 else 0
 
             if num_samples > 0:
@@ -131,13 +152,13 @@ def compute_occupancy_for_flight(
             # print(f"Warning: Skipping segment for flight '{flight_identifier}' due to error: {e}")
             continue
 
-    return (flight_identifier, sorted(list(occupancy_vector)))
+    return (flight_identifier, sorted(list(occupancy_vector)), total_distance_nm, takeoff_time, origin, destination)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Compute occupancy matrix from SO6 flight data.")
-    parser.add_argument("--so6_path", type=str, required=False, default="D:/project-cirrus/cases/flights_20230801.csv", help="Path to the SO6 flight data CSV file.")
-    parser.add_argument("--tv_path", type=str, required=False, default="D:/project-cirrus/cases/traffic_volumes_simplified.geojson", help="Path to the traffic volumes GeoJSON file.")
+    parser.add_argument("--so6_path", type=str, required=False, default="/Volumes/CrucialX/project-cirrus/cases/flights_20230801.csv", help="Path to the SO6 flight data CSV file.")
+    parser.add_argument("--tv_path", type=str, required=False, default="/Volumes/CrucialX/project-cirrus/cases/traffic_volumes_simplified.geojson", help="Path to the traffic volumes GeoJSON file.")
     parser.add_argument("--output_path", type=str, required=False, default="output/so6_occupancy_matrix.json", help="Path to save the output JSON file with occupancy vectors.")
     parser.add_argument("--tvtw_indexer_path", type=str, required=False, default="output/tvtw_indexer.json", help="Path to save or load the TVTW indexer. If not provided, defaults to a path next to the output.")
     parser.add_argument("--n_jobs", type=int, default=None, help="Number of parallel jobs. Defaults to CPU count.")
@@ -157,7 +178,8 @@ def main():
     required_cols = [
         'flight_identifier', 'date_begin_segment', 'time_begin_segment',
         'date_end_segment', 'time_end_segment', 'longitude_begin', 'latitude_begin',
-        'longitude_end', 'latitude_end', 'flight_level_begin', 'flight_level_end'
+        'longitude_end', 'latitude_end', 'flight_level_begin', 'flight_level_end',
+        'origin_aerodrome', 'destination_aerodrome'
     ]
     so6_df.dropna(subset=required_cols, inplace=True)
     
@@ -186,9 +208,15 @@ def main():
     results = {}
     with Pool(processes=n_jobs) as pool:
         with tqdm(total=len(flight_data_list)) as pbar:
-            for flight_id, occupancy_vector in pool.imap_unordered(process_func, flight_data_list):
+            for flight_id, occupancy_vector, total_distance, takeoff_time, origin, destination in pool.imap_unordered(process_func, flight_data_list):
                 if occupancy_vector:
-                    results[str(flight_id)] = occupancy_vector
+                    results[str(flight_id)] = {
+                        "occupancy_vector": occupancy_vector,
+                        "distance": total_distance,
+                        "takeoff_time": takeoff_time,
+                        "origin": origin,
+                        "destination": destination
+                    }
                 pbar.update()
     
     os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
