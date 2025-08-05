@@ -1,60 +1,47 @@
 
-import pandas as pd
 import datetime
-
+from typing import List, Dict, Any
 
 def assign_delays(
-    flights_df: pd.DataFrame,
-    hotspot_flights: list,
+    entrants: List[Dict[str, Any]],
+    capacity: int,
     window_end: datetime.datetime,
-    rate: int,
-):
+    epsilon_s: int = 1,
+) -> List[Dict[str, Any]]:
     """
-    Assigns delays to flights in a hotspot.
+    Assigns delays to entrants in a CASA window if capacity is exceeded.
+
+    This function implements the "push excess to the end of the window (FIFO)" logic
+    from the C-CASA re-adaptation plan. It revises the crossing time for flights
+    that exceed the window's capacity.
 
     Args:
-        flights_df (pd.DataFrame): The main DataFrame of all flights.
-        hotspot_flights (list): A list of flight identifiers in the hotspot.
-        window_end (datetime.datetime): The end time of the hotspot window.
-        rate (int): The maximum allowed number of flights in the window.
+        entrants (List[Dict[str, Any]]): A list of CASA event dictionaries, sorted
+                                         by 't_entry_star'. Each dictionary must
+                                         contain at least 't_entry_star'.
+        capacity (int): The number of flights allowed in this window.
+        window_end (datetime.datetime): The end time of the CASA window.
+        epsilon_s (int): A small buffer in seconds to push flights strictly
+                         beyond the window end time.
 
     Returns:
-        pd.DataFrame: The updated flights DataFrame with new revised_takeoff_time.
+        List[Dict[str, Any]]: The list of entrants with updated 't_entry_star'
+                              for any delayed flights. The list itself is modified
+                              in-place, but also returned for clarity.
     """
-    if not hotspot_flights:
-        return flights_df
+    if len(entrants) <= capacity:
+        return entrants
 
-    # Sort flights in the hotspot by their current revised takeoff time
-    hotspot_flights_df = flights_df[
-        flights_df["flight_identifier"].isin(hotspot_flights)
-    ].sort_values("revised_takeoff_time")
+    # The first 'capacity' flights are allowed. The rest are delayed.
+    flights_to_delay = entrants[capacity:]
 
-    # The flights to be delayed are those exceeding the rate
-    flights_to_delay = hotspot_flights_df.iloc[rate:]
+    # All excess flights are pushed to at least epsilon_s seconds after the window ends.
+    push_to_time = window_end + datetime.timedelta(seconds=epsilon_s)
 
-    if not flights_to_delay.empty:
-        # The reference flight for delay calculation is the one at the 'rate' position
-        reference_flight = hotspot_flights_df.iloc[rate - 1]
-        
-        # All subsequent flights in the hotspot are delayed
-        for flight_id in flights_to_delay["flight_identifier"]:
-            current_flight = flights_df[flights_df["flight_identifier"] == flight_id].iloc[0]
-            
-            # The delay is calculated to move the flight just after the window
-            # relative to the reference flight's takeoff time.
-            time_to_end_of_window = (window_end - reference_flight["revised_takeoff_time"]).total_seconds() / 60
-            
-            # Add a small buffer to ensure it's outside the window
-            delay_minutes = time_to_end_of_window + 1 
+    for event in flights_to_delay:
+        # Set the revised crossing time to be the later of its current scheduled time
+        # or the time it's being pushed to.
+        revised_time = max(event["t_entry_star"], push_to_time)
+        event["t_entry_star"] = revised_time
 
-            new_takeoff_time = current_flight["initial_takeoff_time"] + datetime.timedelta(
-                minutes=delay_minutes
-            )
-
-            # Update the takeoff time only if the new delay is greater
-            if new_takeoff_time > current_flight["revised_takeoff_time"]:
-                flights_df.loc[
-                    flights_df["flight_identifier"] == flight_id, "revised_takeoff_time"
-                ] = new_takeoff_time
-
-    return flights_df
+    return entrants
