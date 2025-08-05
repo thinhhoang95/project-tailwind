@@ -142,6 +142,137 @@ class RegulationParser:
         
         return True
 
+    def explain_regulation(self, regulation: Regulation) -> str:
+        """
+        Convert a regulation into human-readable English explanation.
+        """
+        explanation_parts = []
+        
+        # Location part
+        explanation_parts.append(f"Apply traffic regulation at traffic volume '{regulation.location}'")
+        
+        # Time windows part
+        time_windows_desc = self._format_time_windows(regulation.time_windows)
+        explanation_parts.append(f"during time windows {time_windows_desc}")
+        
+        # Rate part
+        explanation_parts.append(f"with a maximum rate of {regulation.rate} flights per time window")
+        
+        # Filter condition part
+        filter_desc = self._explain_filter_condition(regulation.filter_type, regulation.filter_value)
+        explanation_parts.append(f"for flights {filter_desc}")
+        
+        return ", ".join(explanation_parts) + "."
+    
+    def _format_time_windows(self, time_windows: List[int]) -> str:
+        """Format time windows list into readable string with actual times."""
+        if not time_windows:
+            return "none"
+        
+        # Group consecutive numbers into ranges and convert to time format
+        ranges = []
+        start = time_windows[0]
+        end = start
+        
+        for i in range(1, len(time_windows)):
+            if time_windows[i] == end + 1:
+                end = time_windows[i]
+            else:
+                ranges.append(self._format_time_range(start, end))
+                start = time_windows[i]
+                end = start
+        
+        # Add the last range
+        ranges.append(self._format_time_range(start, end))
+        
+        return ", ".join(ranges)
+    
+    def _format_time_range(self, start_idx: int, end_idx: int) -> str:
+        """Format a time window range into readable time format."""
+        start_time = self.tvtw_indexer.time_window_map.get(start_idx, f"TW{start_idx}")
+        
+        if start_idx == end_idx:
+            return f"{start_time} (TW{start_idx})"
+        else:
+            end_time = self.tvtw_indexer.time_window_map.get(end_idx, f"TW{end_idx}")
+            # Extract just the start time of the first window and end time of the last window
+            start_time_only = start_time.split('-')[0]
+            end_time_only = end_time.split('-')[1]
+            return f"{start_time_only}-{end_time_only} (TW{start_idx}-{end_idx})"
+    
+    def _explain_filter_condition(self, filter_type: str, filter_value: str) -> str:
+        """Explain the filter condition in human-readable terms."""
+        if filter_type == 'IC':
+            return self._explain_ic_filter(filter_value)
+        elif filter_type == 'TV':
+            return self._explain_tv_filter(filter_value)
+        else:
+            return f"with unknown filter type '{filter_type}'"
+    
+    def _explain_ic_filter(self, filter_value: str) -> str:
+        """Explain ICAO code filter in human-readable terms."""
+        if filter_value == '_':
+            return "from any origin to any destination"
+        
+        if '_' not in filter_value:
+            return f"with invalid filter format '{filter_value}'"
+        
+        orig_pattern, dest_pattern = filter_value.split('_', 1)
+        
+        orig_desc = self._explain_icao_pattern(orig_pattern, "origin")
+        dest_desc = self._explain_icao_pattern(dest_pattern, "destination")
+        
+        return f"from {orig_desc} to {dest_desc}"
+    
+    def _explain_icao_pattern(self, pattern: str, location_type: str) -> str:
+        """Explain a single ICAO pattern."""
+        if pattern in ('', '_'):
+            return f"any {location_type}"
+        
+        if pattern.endswith('>'):
+            prefix = pattern[:-1]
+            if not prefix:
+                return f"any {location_type}"
+            return f"{location_type}s in country/region '{prefix}*'"
+        
+        if pattern.endswith('_') and pattern != '_':
+            prefix = pattern[:-1]
+            if not prefix:
+                return f"any {location_type}"
+            return f"{location_type}s in city area '{prefix}*'"
+        
+        return f"{location_type} '{pattern}'"
+    
+    def _explain_tv_filter(self, filter_value: str) -> str:
+        """Explain traffic volume filter in human-readable terms."""
+        if '_' not in filter_value:
+            return f"with invalid TV filter format '{filter_value}'"
+        
+        from_tvs_str, to_tvs_str = filter_value.split('_', 1)
+        
+        from_tvs = [tv.strip() for tv in from_tvs_str.split(',') if tv.strip()]
+        to_tvs = [tv.strip() for tv in to_tvs_str.split(',') if tv.strip()]
+        
+        if not from_tvs and not to_tvs:
+            return "passing through any traffic volumes"
+        
+        parts = []
+        if from_tvs:
+            if len(from_tvs) == 1:
+                parts.append(f"passing through traffic volume '{from_tvs[0]}'")
+            else:
+                tv_list = "', '".join(from_tvs)
+                parts.append(f"passing through traffic volumes '{tv_list}'")
+        
+        if to_tvs:
+            if len(to_tvs) == 1:
+                parts.append(f"then through traffic volume '{to_tvs[0]}'")
+            else:
+                tv_list = "', '".join(to_tvs)
+                parts.append(f"then through traffic volumes '{tv_list}'")
+        
+        return " ".join(parts)
+
 if __name__ == '__main__':
     # Example usage:
     # 1. Initialize the TVTWIndexer
