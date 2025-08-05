@@ -75,7 +75,8 @@ def compute_occupancy_for_flight(
     sampling_dist_nm: float = 5.0
 ) -> Tuple[str, List[Dict[str, Any]], float, str, str, str]:
     """
-    Computes the occupancy intervals (entry/exit times for each TVTW) for a single flight.
+    Computes the occupancy intervals for a single flight.
+    Entry and exit times are reported in seconds from takeoff.
     """
     flight_identifier, flight_df = flight_data
     total_distance_nm = 0.0
@@ -84,19 +85,20 @@ def compute_occupancy_for_flight(
     sorted_segments = flight_df.sort_values(by='time_begin_segment')
     
     if sorted_segments.empty:
-        return (flight_identifier, [], 0.0, None, None, None)
+        return flight_identifier, [], 0.0, None, None, None
 
     first_segment = sorted_segments.iloc[0]
     origin = first_segment.get('origin_aerodrome')
     destination = first_segment.get('destination_aerodrome')
-    takeoff_time = None
+    
     try:
         takeoff_time_dt = parse_so6_time(first_segment['date_begin_segment'], first_segment['time_begin_segment'])
-        takeoff_time = takeoff_time_dt.isoformat()
+        takeoff_time_iso = takeoff_time_dt.isoformat()
     except (ValueError, KeyError, TypeError):
-        pass
+        # If takeoff time cannot be parsed, we cannot calculate relative seconds.
+        return flight_identifier, [], 0.0, None, origin, destination
 
-    # 1. Collect all points from all segments
+    # 1. Collect all trajectory points from segments
     for _, segment in sorted_segments.iterrows():
         try:
             start_time = parse_so6_time(segment['date_begin_segment'], segment['time_begin_segment'])
@@ -129,13 +131,13 @@ def compute_occupancy_for_flight(
             
             all_points.append({'geom': p2_geom, 'alt_ft': alt2_ft, 'time': end_time})
 
-        except (ValueError, KeyError, TypeError) as e:
+        except (ValueError, KeyError, TypeError):
             continue
 
     if not all_points:
-        return (flight_identifier, [], total_distance_nm, takeoff_time, origin, destination)
+        return flight_identifier, [], total_distance_nm, takeoff_time_iso, origin, destination
 
-    # 2. Sort points chronologically
+    # 2. Sort all points chronologically
     all_points.sort(key=lambda p: p['time'])
 
     # 3. Process points to find entry/exit events
@@ -159,8 +161,8 @@ def compute_occupancy_for_flight(
                 if tvtw_index is not None:
                     observed_intervals.append({
                         "tvtw_index": tvtw_index,
-                        "entry_time": entry_time.isoformat(),
-                        "exit_time": current_time.isoformat()
+                        "entry_time_s": (entry_time - takeoff_time_dt).total_seconds(),
+                        "exit_time_s": (current_time - takeoff_time_dt).total_seconds()
                     })
 
         entered_tvtws = current_tvtws - previous_tvtws
@@ -170,34 +172,34 @@ def compute_occupancy_for_flight(
 
         previous_tvtws = current_tvtws
 
-    # 4. Close any remaining open occupancies
+    # 4. Close any remaining open occupancies at the end of the trajectory
     final_time = all_points[-1]['time']
     for tvtw_tuple, entry_time in open_occupancies.items():
         tvtw_index = tvtw_indexer.get_tvtw_index(tvtw_tuple[0], tvtw_tuple[1])
         if tvtw_index is not None:
             observed_intervals.append({
                 "tvtw_index": tvtw_index,
-                "entry_time": entry_time.isoformat(),
-                "exit_time": final_time.isoformat()
+                "entry_time_s": (entry_time - takeoff_time_dt).total_seconds(),
+                "exit_time_s": (final_time - takeoff_time_dt).total_seconds()
             })
     
-    # 5. Sort intervals by entry time
-    observed_intervals.sort(key=lambda x: x['entry_time'])
+    # 5. Sort intervals by their entry time
+    observed_intervals.sort(key=lambda x: x['entry_time_s'])
 
-    return (flight_identifier, observed_intervals, total_distance_nm, takeoff_time, origin, destination)
+    return flight_identifier, observed_intervals, total_distance_nm, takeoff_time_iso, origin, destination
 
 
 def main():
     parser = argparse.ArgumentParser(description="Compute occupancy matrix from SO6 flight data.")
-    parser.add_argument("--so6_path", type=str, required=False, default="/Volumes/CrucialX/project-cirrus/cases/flights_20230801.csv", help="Path to the SO6 flight data CSV file.")
-    parser.add_argument("--tv_path", type=str, required=False, default="/Volumes/CrucialX/project-cirrus/cases/traffic_volumes_simplified.geojson", help="Path to the traffic volumes GeoJSON file.")
-    parser.add_argument("--output_path", type=str, required=False, default="output/so6_occupancy_matrix.json", help="Path to save the output JSON file with occupancy vectors.")
+    parser.add_argument("--so6_path", type=str, required=False, default="D:/project-cirrus/cases/flights_20230801.csv", help="Path to the SO6 flight data CSV file.")
+    parser.add_argument("--tv_path", type=str, required=False, default="D:/project-cirrus/cases/traffic_volumes_simplified.geojson", help="Path to the traffic volumes GeoJSON file.")
+    parser.add_argument("--output_path", type=str, required=False, default="output/so6_occupancy_matrix_with_times.json", help="Path to save the output JSON file with occupancy intervals.")
     parser.add_argument("--tvtw_indexer_path", type=str, required=False, default="output/tvtw_indexer.json", help="Path to save or load the TVTW indexer. If not provided, defaults to a path next to the output.")
     parser.add_argument("--n_jobs", type=int, default=None, help="Number of parallel jobs. Defaults to CPU count.")
     parser.add_argument("--time_bin_minutes", type=int, default=15, help="Time bin duration in minutes for TVTWs.")
     args = parser.parse_args()
 
-    n_jobs = args.n_jobs if args.n_jobs is not None else cpu_count()
+    n_jobs = args.n_jobs if args.n_jobs is not None else (cpu_count() - 3)
     tvtw_indexer_path = args.tvtw_indexer_path or os.path.join(os.path.dirname(args.output_path), "tvtw_indexer.json")
 
 
@@ -252,7 +254,7 @@ def main():
                 pbar.update()
     
     os.makedirs(os.path.dirname(args.output_path), exist_ok=True)
-    print(f"Saving {len(results)} occupancy vectors to {args.output_path}...")
+    print(f"Saving {len(results)} occupancy results to {args.output_path}...")
     with open(args.output_path, 'w') as f:
         json.dump(results, f, indent=4)
     
@@ -260,8 +262,8 @@ def main():
 
 if __name__ == '__main__':
     # Example usage:
-    # python src/project_tailwind/impact_eval/impact_vector_so6.py \
+    # python src/project_tailwind/impact_eval/impact_vector_so6_with_entry_time.py \
     #   --so6_path D:/project-cirrus/cases/flights_20230801.csv \
     #   --tv_path D:/project-cirrus/cases/traffic_volumes_simplified.geojson \
-    #   --output_path output/so6_occupancy_matrix.json
+    #   --output_path output/so6_occupancy_matrix_with_times.json
     main()
