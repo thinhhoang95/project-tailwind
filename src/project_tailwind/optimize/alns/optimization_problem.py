@@ -6,9 +6,9 @@ from project_tailwind.optimize.eval.flight_list import FlightList
 
 class OptimizationProblem:
     def __init__(self, traffic_volumes_gdf: gpd.GeoDataFrame, flight_list: FlightList, horizon_time_windows: int):
-        self.traffic_volumes_gdf = traffic_volumes_gdf
         self.flight_list = flight_list
         self.horizon_time_windows = horizon_time_windows
+        self.traffic_volumes_gdf = traffic_volumes_gdf
 
         self.network_evaluator = NetworkEvaluator(
             traffic_volumes_gdf=self.traffic_volumes_gdf,

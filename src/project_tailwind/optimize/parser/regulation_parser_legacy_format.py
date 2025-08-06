@@ -29,22 +29,13 @@ class RegulationParser:
 
         return matching_flights
 
-    def _get_occupancy_vector(self, flight_data: Dict[str, Any]) -> List[int]:
-        """
-        Extracts the occupancy vector from flight data, supporting both the legacy `occupancy_vector` 
-        (list of int) and the new `occupancy_intervals` (list of dicts) formats.
-        """
-        if "occupancy_intervals" in flight_data:
-            return [item["tvtw_index"] for item in flight_data["occupancy_intervals"]]
-        return flight_data.get("occupancy_vector", [])
-
     def _filter_by_ref_loc_and_time(self, regulation: Regulation) -> List[str]:
         """
         Filter flights that pass through the reference location within the given time windows.
         """
         candidate_flights = []
         for flight_id, flight_data in self.flights_data.items():
-            occupancy_vector = self._get_occupancy_vector(flight_data)
+            occupancy_vector = flight_data.get("occupancy_vector", [])
             for tvtw_idx in occupancy_vector:
                 tv_name, time_idx = self.tvtw_indexer.get_tvtw_from_index(tvtw_idx)
                 if tv_name == regulation.location and time_idx in regulation.time_windows:
@@ -62,8 +53,7 @@ class RegulationParser:
         if regulation.filter_type == 'IC':
             return self._matches_ic_filter(origin, destination, regulation.filter_value)
         elif regulation.filter_type == 'TV':
-            occupancy_vector = self._get_occupancy_vector(flight_info)
-            return self._matches_tv_filter(occupancy_vector, regulation.filter_value)
+            return self._matches_tv_filter(flight_info.get("occupancy_vector", []), regulation.filter_value)
         else:
             return False
 
@@ -325,6 +315,5 @@ if __name__ == '__main__':
     print(f"Regulation: '{regulation_country.raw_str}'")
     print(f"Matched {len(matched_flights_country)} flights:")
     print(json.dumps(matched_flights_country, indent=2))
-
 
 

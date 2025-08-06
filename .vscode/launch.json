@@ -24,6 +24,13 @@
             "request": "launch",
             "program": "src/project_tailwind/optimize/eval/test_network_eval.py",
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Test Regulation Move (Debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "tests/test_regulation_move_integration.py",
+            "console": "integratedTerminal"
         }
     ]
 }

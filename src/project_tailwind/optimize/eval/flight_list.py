@@ -82,12 +82,28 @@ class FlightList:
                 col_indices.append(tvtw_index)
                 data.append(1.0)  # Binary occupancy
         
-        # Create sparse matrix in CSR format for efficient operations
-        self.occupancy_matrix = sparse.csr_matrix(
-            (data, (row_indices, col_indices)),
-            shape=(self.num_flights, self.num_tvtws),
+        # Create sparse matrix in LIL format for efficient updates, keep CSR for reads
+        self._occupancy_matrix_lil = sparse.lil_matrix(
+            (self.num_flights, self.num_tvtws),
             dtype=np.float32
         )
+        
+        # Populate the LIL matrix
+        for row_idx, flight_id in enumerate(self.flight_ids):
+            flight_info = self.flight_data[flight_id]
+            
+            for interval in flight_info['occupancy_intervals']:
+                tvtw_index = interval['tvtw_index']
+                self._occupancy_matrix_lil[row_idx, tvtw_index] = 1.0
+        
+        # Convert to CSR for efficient operations
+        self.occupancy_matrix = self._occupancy_matrix_lil.tocsr()
+        
+        # Track if LIL matrix has been modified
+        self._lil_matrix_dirty = False
+        
+        # Create temporary buffer for occupancy vector operations (reused to avoid allocations)
+        self._temp_occupancy_buffer = np.zeros(self.num_tvtws, dtype=np.float32)
     
     def _extract_flight_metadata(self):
         """Extract and store flight metadata for quick access."""
@@ -224,15 +240,69 @@ class FlightList:
         
         row_idx = self.flight_id_to_row[flight_id]
         
-        # Convert to sparse format and update
-        new_sparse_row = sparse.csr_matrix(new_occupancy_vector.reshape(1, -1))
+        # Update LIL matrix (efficient for modifications)
+        self._occupancy_matrix_lil[row_idx, :] = new_occupancy_vector
+        self._lil_matrix_dirty = True
+    
+    def clear_flight_occupancy(self, flight_id: str):
+        """
+        Clear all occupancy data for a specific flight by setting its row to zero.
         
-        # Update the matrix row
-        self.occupancy_matrix[row_idx] = new_sparse_row
+        Args:
+            flight_id: The flight identifier
+        """
+        if flight_id not in self.flight_id_to_row:
+            raise ValueError(f"Flight ID {flight_id} not found")
+        
+        row_idx = self.flight_id_to_row[flight_id]
+        
+        # Clear the row in LIL matrix (efficient for modifications)
+        self._occupancy_matrix_lil[row_idx, :] = 0
+        self._lil_matrix_dirty = True
+    
+    def add_flight_occupancy(self, flight_id: str, tvtw_indices: np.ndarray):
+        """
+        Add occupancy data for a flight at specific TVTW indices.
+        This method assumes the flight's occupancy has been cleared first.
+        
+        Args:
+            flight_id: The flight identifier
+            tvtw_indices: Array of TVTW indices where the flight should be marked as occupying
+        """
+        if flight_id not in self.flight_id_to_row:
+            raise ValueError(f"Flight ID {flight_id} not found")
+        
+        row_idx = self.flight_id_to_row[flight_id]
+        
+        if len(tvtw_indices) == 0:
+            # No occupancy to add, keep the row empty
+            return
+        
+        # Validate indices
+        if np.any(tvtw_indices >= self.num_tvtws) or np.any(tvtw_indices < 0):
+            raise ValueError(f"TVTW indices out of range: {tvtw_indices}")
+        
+        # Update LIL matrix (efficient for modifications)
+        self._occupancy_matrix_lil[row_idx, tvtw_indices] = 1.0
+        self._lil_matrix_dirty = True
+    
+    def _sync_occupancy_matrix(self):
+        """Sync the CSR matrix with the LIL matrix if it's been modified."""
+        if self._lil_matrix_dirty:
+            self.occupancy_matrix = self._occupancy_matrix_lil.tocsr()
+            self._lil_matrix_dirty = False
     
     def get_matrix_shape(self) -> tuple:
         """Get the shape of the occupancy matrix."""
+        self._sync_occupancy_matrix()
         return self.occupancy_matrix.shape
+    
+    def finalize_occupancy_updates(self):
+        """
+        Finalize all pending occupancy updates by converting LIL to CSR.
+        Call this method after batch updates for optimal performance.
+        """
+        self._sync_occupancy_matrix()
     
     def get_summary_stats(self) -> Dict[str, Any]:
         """Get summary statistics about the flight data."""
