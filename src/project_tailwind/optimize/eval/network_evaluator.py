@@ -276,7 +276,7 @@ class NetworkEvaluator:
 
         return overloaded_tvtws
 
-    def compute_horizon_metrics(self, horizon_time_windows: int) -> Dict[str, float]:
+    def compute_horizon_metrics(self, horizon_time_windows: int, percentile_for_z_max: int = 95) -> Dict[str, float]:
         """
         Compute z_max and z_sum metrics within a specified horizon.
 
@@ -292,7 +292,7 @@ class NetworkEvaluator:
         if horizon_time_windows > 0:
             excess_vector = excess_vector[:horizon_time_windows]
 
-        z_max = float(np.max(excess_vector)) if len(excess_vector) > 0 else 0.0
+        z_max = float(np.percentile(excess_vector, percentile_for_z_max)) if len(excess_vector) > 0 else 0.0
         z_sum = float(np.sum(excess_vector))
 
         return {
