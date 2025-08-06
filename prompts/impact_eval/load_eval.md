@@ -45,72 +45,61 @@ Each *network plan* is a set of *regulations*. Each *regulation* is a triplet of
 
 7. We return the new occupancy matrix, `z_max` and `z_sum`.
 
-# Background
-We will focus **exclusively** on the computation of the nominal dynamics, and the cost of the network plan.
-
-1. For each *regulation* $r_j$ in the network plan, we invoke the C-CASA algorithm. At the high level, C-CASA works out the delay for each flight targetted by the regulations. If there are multiple regulations, the flight will take the highest delay from all the regulations.
-
-2. The rudimentary implementation of the C-CASA algorithm is already implemented in `src/project_tailwind/casa/delay_assigner.py`. You may need to refactor this code as you see fit, because the original code requires a pandas dataframe. 
-
 # Instructions
-1. The current flights' occupancy matrix is precomputed in `output/so6_occupancy_matrix.json` file which an excerpt can be found here:
+We will focus **exclusively** on the computation of TVTW excess traffic vector.
 
-    ```json
-    [
-        "263863565": {
-            "occupancy_vector": [
-                3489,
-                3585,
-                3872,
-                ...
+We load the traffic volumes, which is defined in `D:/project-cirrus/cases/traffic_volumes_simplified.geojson`. Here is an excerpt of the file:
+```.geojson
+...
+"coordinates": [
+            [
+                4.4833333333,
+                50.9
             ],
-            "distance": 547.0039034212813,
-            "takeoff_time": "2023-08-01T07:05:00",
-            "origin": "LFBO",
-            "destination": "EDDM"
-        },...
-    ]
-    ```
-
-    We first read this and store it.
-
-2. We also load the traffic volumes, which is defined in `/Volumes/CrucialX/project-cirrus/cases/traffic_volumes_simplified.geojson`. Here is an excerpt of the file:
-    ```.geojson
-    ...
-    "coordinates": [
-                [
-                    4.4833333333,
-                    50.9
-                ],
-                ...
-            ]
+            ...
         ]
-    },
-    "properties": {
-        "traffic_volume_id": "EBBUELS1",
-        "name": "",
-        "category": "MO",
-        "airspace_id": "EBBUELS",
-        "role": "G",
-        "skip_in": "60",
-        "skip_out": "900",
-        "min_fl": 45,
-        "max_fl": 185,
-        "airblock_count": 23,
-        "elementary_sectors": [
-            "EBBUELS"
-        ],
-        "capacity": {
-            "6:00-7:00": 23,
-            "7:00-8:00": 10,
-            "8:00-9:00": 17,
-            "9:00-10:00": 23,
-            "10:00-11:00": 15,
-            "11:00-12:00": 24
-        }
-      },...
-    ```
+    ]
+},
+"properties": {
+    "traffic_volume_id": "EBBUELS1",
+    "name": "",
+    "category": "MO",
+    "airspace_id": "EBBUELS",
+    "role": "G",
+    "skip_in": "60",
+    "skip_out": "900",
+    "min_fl": 45,
+    "max_fl": 185,
+    "airblock_count": 23,
+    "elementary_sectors": [
+        "EBBUELS"
+    ],
+    "capacity": {
+        "6:00-7:00": 23,
+        "7:00-8:00": 10,
+        "8:00-9:00": 17,
+        "9:00-10:00": 23,
+        "10:00-11:00": 15,
+        "11:00-12:00": 24
+    }
+    },...
+```
 
-3. The regulation is given in the format `<REFERENCE LOCATION OR TRAFFIC VOLUME> <FILTERING CONDITION> <RATE> <TIME WINDOWS>` and the network plan is a list of such regulations. 
+You may find in this, the capacity values set for each hour (note that this is different from the time window employed by the TVTW's time window length).
 
-    3.1. We first build a `flight_parser` function that returns the list of 
+The `src/project_tailwind/impact_eval/tvtw_indexer.py` (the output json can be located in `output/tvtw_indexer.json`) module will give you the mapping between TVTW and the index of the excess traffic vector. 
+
+The occupancy matrix is the sparse matrix where each row is a flight, and the count is 1 for each TVTW that should be counted towards, and 0 otherwise.
+
+**Instruction:** We are going to implement the entire scaffold for overload detection:
+
+1. Design and implement a class of `FlightList`, which loads the original (unregulated) flight list from `output/so6_occupancy_matrix_with_times.json` into a desirable format with sparse matrix indicating the occupancy vectors, and the relevant information such as entry and exit time can be rapidly retrieved.
+
+2. Implement a function in a separate Python module called `NetworkEvalulator` class which takes the traffic volumes GDF object, the `FlightList` object, and outputs an excess flight vector, which shows 0 if the TVTW is not overloaded, and `count - capacity` for the overloaded TVTWs.
+
+# Requirements
+1. Make sure you gracefully handle the time window difference between the capacity in the traffic volumes GDF and the time windows length (it is part of the `tvtw_indexer.json`).
+
+2. Efficiency and speed is of paramount importance. Think about the approach first before you implement.
+
+3. Implement everything in `src/project_tailwind/optimize/eval` please.

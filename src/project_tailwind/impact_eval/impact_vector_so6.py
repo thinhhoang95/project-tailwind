@@ -1,3 +1,7 @@
+## ATTENTION: Use the impact_vector_so6_with_entry_time.py instead.
+## This is legacy code.
+## It is not used in the project.
+
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point, LineString
