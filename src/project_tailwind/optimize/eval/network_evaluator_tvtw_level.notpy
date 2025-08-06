@@ -1,0 +1,351 @@
+"""
+NetworkEvaluator class for computing excess traffic vectors from flight occupancy data.
+"""
+
+import json
+import numpy as np
+import geopandas as gpd
+from typing import Dict, List, Any, Optional, Tuple
+from datetime import datetime, timedelta
+import pandas as pd
+
+from .flight_list import FlightList
+
+
+class NetworkEvaluator:
+    """
+    A class to evaluate network overload by comparing flight occupancy with traffic volume capacities.
+    
+    This class handles the conversion between different time window formats and computes
+    excess traffic vectors to identify overloaded Traffic Volume Time Windows (TVTWs).
+    """
+    
+    def __init__(self, traffic_volumes_gdf: gpd.GeoDataFrame, flight_list: FlightList):
+        """
+        Initialize NetworkEvaluator with traffic volumes and flight data.
+        
+        Args:
+            traffic_volumes_gdf: GeoDataFrame containing traffic volume data with capacities
+            flight_list: FlightList object with loaded occupancy data
+        """
+        self.traffic_volumes_gdf = traffic_volumes_gdf
+        self.flight_list = flight_list
+        
+        # Extract time window information
+        self.time_bin_minutes = flight_list.time_bin_minutes
+        self.tv_id_to_idx = flight_list.tv_id_to_idx
+        
+        # Process capacity data and handle time window conversion
+        self._process_capacity_data()
+    
+    def _process_capacity_data(self):
+        """
+        Process and convert capacity data from hourly format to TVTW format.
+        
+        The traffic volumes have hourly capacity data (e.g., "6:00-7:00": 23),
+        but TVTWs use smaller time bins (e.g., 15 minutes). This method handles
+        the conversion by distributing hourly capacity across time bins.
+        """
+        self.capacity_by_tvtw = {}
+        
+        # Get total number of TVTWs from flight data
+        num_tvtws = self.flight_list.num_tvtws
+        
+        # Calculate how many time bins per hour
+        bins_per_hour = 60 // self.time_bin_minutes
+        
+        for _, tv_row in self.traffic_volumes_gdf.iterrows():
+            tv_id = tv_row['traffic_volume_id']
+            capacity_data = tv_row['capacity']
+            
+            if tv_id not in self.tv_id_to_idx:
+                continue  # Skip traffic volumes not in indexer
+                
+            # Handle case where capacity might be a string (from JSON parsing)
+            if isinstance(capacity_data, str):
+                try:
+                    capacity_data = json.loads(capacity_data.replace("'", '"'))
+                except (json.JSONDecodeError, AttributeError):
+                    continue  # Skip if can't parse capacity data
+            elif not isinstance(capacity_data, dict):
+                continue  # Skip if capacity data is not in expected format
+                
+            # Initialize capacity array for this traffic volume
+            tv_capacity = np.zeros(num_tvtws)
+            
+            # Process each hourly capacity entry
+            for time_range, hourly_capacity in capacity_data.items():
+                start_hour, end_hour = self._parse_time_range(time_range)
+                
+                if start_hour is None or end_hour is None:
+                    continue
+                
+                # Distribute hourly capacity across time bins
+                # capacity_per_bin = hourly_capacity / bins_per_hour
+                capacity_per_bin = hourly_capacity
+                
+                # Calculate TVTW indices for this time range
+                start_bin = start_hour * bins_per_hour
+                end_bin = end_hour * bins_per_hour
+                
+                # Set capacity for all relevant TVTWs
+                for tv_idx, base_tvtw in self.tv_id_to_idx.items():
+                    if tv_idx == tv_id:
+                        for bin_offset in range(start_bin, end_bin):
+                            tvtw_idx = base_tvtw + bin_offset
+                            if tvtw_idx < num_tvtws:
+                                tv_capacity[tvtw_idx] = capacity_per_bin
+                        break
+            
+            self.capacity_by_tvtw[tv_id] = tv_capacity
+    
+    def _parse_time_range(self, time_range: str) -> Tuple[Optional[int], Optional[int]]:
+        """
+        Parse time range string like "6:00-7:00" into hour integers.
+        
+        Args:
+            time_range: Time range string in format "HH:MM-HH:MM"
+            
+        Returns:
+            Tuple of (start_hour, end_hour) or (None, None) if parsing fails
+        """
+        try:
+            start_time, end_time = time_range.split('-')
+            start_hour = int(start_time.split(':')[0])
+            end_hour = int(end_time.split(':')[0])
+            return start_hour, end_hour
+        except (ValueError, IndexError):
+            return None, None
+    
+    def compute_excess_traffic_vector(self) -> np.ndarray:
+        """
+        Compute excess traffic vector showing overload for each TVTW using a vectorized approach.
+        
+        Returns:
+            1D numpy array where:
+            - 0 indicates no overload
+            - positive values indicate (count - capacity) for overloaded TVTWs
+        """
+        total_occupancy = self.flight_list.get_total_occupancy_by_tvtw()
+        num_tvtws = len(total_occupancy)
+        
+        # Aggregate capacity from all traffic volumes into a single vector
+        total_capacity = np.zeros(num_tvtws)
+        for capacity_array in self.capacity_by_tvtw.values():
+            total_capacity += capacity_array
+            
+        # Calculate excess traffic where occupancy > capacity
+        excess_vector = total_occupancy - total_capacity
+        
+        # Consider only positive excess and where capacity is defined
+        excess_vector[total_capacity == 0] = 0
+        excess_vector = np.maximum(0, excess_vector)
+        
+        return excess_vector
+    
+    def get_overloaded_tvtws(self, threshold: float = 0.0) -> List[Dict[str, Any]]:
+        """
+        Get list of overloaded TVTWs with details using a vectorized approach.
+        
+        Args:
+            threshold: Minimum excess traffic to consider as overloaded
+            
+        Returns:
+            List of dictionaries with overload information
+        """
+        excess_vector = self.compute_excess_traffic_vector()
+        total_occupancy = self.flight_list.get_total_occupancy_by_tvtw()
+        num_tvtws = len(total_occupancy)
+
+        # Aggregate capacity from all traffic volumes into a single vector
+        total_capacity = np.zeros(num_tvtws)
+        for capacity_array in self.capacity_by_tvtw.values():
+            total_capacity += capacity_array
+
+        # Find overloaded TVTWs
+        overloaded_indices = np.where(excess_vector > threshold)[0]
+        
+        # If no overloads, return early
+        if len(overloaded_indices) == 0:
+            return []
+
+        # Build reverse mapping from TVTW index to traffic volume ID
+        tvtw_to_tv_id = np.full(num_tvtws, None, dtype=object)
+        for tv_id, capacity_array in self.capacity_by_tvtw.items():
+            # Get indices where this TV has capacity defined
+            active_indices = np.where(capacity_array > 0)[0]
+            tvtw_to_tv_id[active_indices] = tv_id
+
+        # Collect details for overloaded TVTWs
+        overloaded_tvtws = []
+        for idx in overloaded_indices:
+            capacity = total_capacity[idx]
+            occupancy = total_occupancy[idx]
+            
+            overloaded_tvtws.append({
+                'tvtw_index': int(idx),
+                'traffic_volume_id': tvtw_to_tv_id[idx],
+                'occupancy': float(occupancy),
+                'capacity': float(capacity),
+                'excess': float(excess_vector[idx]),
+                'utilization_ratio': float(occupancy / capacity) if capacity > 0 else float('inf')
+            })
+
+        # Sort by excess traffic (highest first)
+        overloaded_tvtws.sort(key=lambda x: x['excess'], reverse=True)
+        
+        return overloaded_tvtws
+    
+    def compute_horizon_metrics(self, horizon_time_windows: int) -> Dict[str, float]:
+        """
+        Compute z_max and z_sum metrics within a specified horizon.
+        
+        Args:
+            horizon_time_windows: Number of time windows to consider from start
+            
+        Returns:
+            Dictionary with z_max (maximum excess) and z_sum (total excess)
+        """
+        excess_vector = self.compute_excess_traffic_vector()
+        
+        # Limit to horizon
+        if horizon_time_windows > 0:
+            excess_vector = excess_vector[:horizon_time_windows]
+        
+        z_max = float(np.max(excess_vector)) if len(excess_vector) > 0 else 0.0
+        z_sum = float(np.sum(excess_vector))
+        
+        return {
+            'z_max': z_max,
+            'z_sum': z_sum,
+            'horizon_windows': len(excess_vector)
+        }
+    
+    def get_capacity_utilization_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about capacity utilization across all traffic volumes using a vectorized approach.
+        
+        Returns:
+            Dictionary with utilization statistics
+        """
+        total_occupancy = self.flight_list.get_total_occupancy_by_tvtw()
+        excess_vector = self.compute_excess_traffic_vector()
+        num_tvtws = len(total_occupancy)
+        
+        # Aggregate capacity from all traffic volumes into a single vector
+        total_capacity = np.zeros(num_tvtws)
+        for capacity_array in self.capacity_by_tvtw.values():
+            total_capacity += capacity_array
+            
+        # Find indices where capacity is defined
+        active_indices = np.where(total_capacity > 0)[0]
+        
+        # If no active TVTWs with capacity, return zero stats
+        if len(active_indices) == 0:
+            return {
+                'mean_utilization': 0.0,
+                'max_utilization': 0.0,
+                'std_utilization': 0.0,
+                'total_capacity': 0.0,
+                'total_demand': 0.0,
+                'system_utilization': 0.0,
+                'overloaded_tvtws': 0,
+                'total_tvtws_with_capacity': 0,
+                'overload_percentage': 0.0
+            }
+            
+        # Filter data for active TVTWs
+        active_capacity = total_capacity[active_indices]
+        active_demand = total_occupancy[active_indices]
+        
+        # Calculate utilization
+        utilizations = active_demand / active_capacity
+        
+        # Calculate statistics
+        total_system_capacity = float(np.sum(active_capacity))
+        total_system_demand = float(np.sum(active_demand))
+        overloaded_count = int(np.sum(excess_vector > 0))
+        
+        return {
+            'mean_utilization': float(np.mean(utilizations)),
+            'max_utilization': float(np.max(utilizations)),
+            'std_utilization': float(np.std(utilizations)),
+            'total_capacity': total_system_capacity,
+            'total_demand': total_system_demand,
+            'system_utilization': (total_system_demand / total_system_capacity) if total_system_capacity > 0 else 0.0,
+            'overloaded_tvtws': overloaded_count,
+            'total_tvtws_with_capacity': len(utilizations),
+            'overload_percentage': (overloaded_count / len(utilizations) * 100) if len(utilizations) > 0 else 0.0
+        }
+    
+    def export_results(self, filepath: str, horizon_time_windows: Optional[int] = None):
+        """
+        Export overload analysis results to JSON file.
+        
+        Args:
+            filepath: Output file path
+            horizon_time_windows: Optional horizon limit for metrics
+        """
+        results = {
+            'metadata': {
+                'time_bin_minutes': self.time_bin_minutes,
+                'num_flights': self.flight_list.num_flights,
+                'num_tvtws': self.flight_list.num_tvtws,
+                'num_traffic_volumes': len(self.capacity_by_tvtw),
+                'analysis_timestamp': datetime.now().isoformat()
+            },
+            'excess_traffic_vector': self.compute_excess_traffic_vector().tolist(),
+            'overloaded_tvtws': self.get_overloaded_tvtws(),
+            'utilization_stats': self.get_capacity_utilization_stats()
+        }
+        
+        if horizon_time_windows:
+            results['horizon_metrics'] = self.compute_horizon_metrics(horizon_time_windows)
+        
+        with open(filepath, 'w') as f:
+            json.dump(results, f, indent=2)
+    
+    def get_traffic_volume_summary(self) -> pd.DataFrame:
+        """
+        Get summary of traffic volumes with capacity and utilization info.
+        
+        Returns:
+            DataFrame with traffic volume statistics
+        """
+        total_occupancy = self.flight_list.get_total_occupancy_by_tvtw()
+        excess_vector = self.compute_excess_traffic_vector()
+        
+        summary_data = []
+        
+        for tv_id, capacity_array in self.capacity_by_tvtw.items():
+            base_idx = self.tv_id_to_idx[tv_id]
+            
+            tv_capacity = np.sum(capacity_array)
+            tv_demand = 0
+            tv_excess = 0
+            overloaded_bins = 0
+            
+            for i, capacity in enumerate(capacity_array):
+                if capacity > 0:
+                    tvtw_idx = base_idx + i
+                    if tvtw_idx < len(total_occupancy):
+                        occupancy = total_occupancy[tvtw_idx]
+                        tv_demand += occupancy
+                        
+                        if tvtw_idx < len(excess_vector):
+                            excess = excess_vector[tvtw_idx]
+                            tv_excess += excess
+                            if excess > 0:
+                                overloaded_bins += 1
+            
+            summary_data.append({
+                'traffic_volume_id': tv_id,
+                'total_capacity': tv_capacity,
+                'total_demand': tv_demand,
+                'total_excess': tv_excess,
+                'utilization_ratio': tv_demand / tv_capacity if tv_capacity > 0 else 0,
+                'overloaded_bins': overloaded_bins,
+                'active_time_bins': np.count_nonzero(capacity_array)
+            })
+        
+        return pd.DataFrame(summary_data).sort_values('total_excess', ascending=False)

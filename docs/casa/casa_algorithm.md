@@ -45,6 +45,9 @@ This is the core of the simulation where delays are calculated. The algorithm it
   capacity = int(carry) # The whole number of flights allowed
   carry -= capacity     # The remainder is carried to the next window
   ```
+
+  > **ATTENTION:** For CASA, the hourly rate will be redistributed to the windows of smaller length through the formula `hourly_rate * (window_length_min / 60.0)`. This is different from the capacity value, which is **NOT** divided into smaller windows.
+  
 - **Assigning Delays**: The `assign_delays` function is called with the list of `entrants` and the calculated `capacity`.
   - If `len(entrants) <= capacity`, no action is needed. All flights can enter as scheduled.
   - If `len(entrants) > capacity`, the flights are processed in a First-In, First-Out (FIFO) manner. The first `capacity` number of flights are allowed. The remaining (`excess`) flights are delayed.

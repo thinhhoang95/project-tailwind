@@ -17,6 +17,13 @@
             "request": "launch",
             "program": "tests/test_regulation.py",
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Test Network Eval (Debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "src/project_tailwind/optimize/eval/test_network_eval.py",
+            "console": "integratedTerminal"
         }
     ]
 }
