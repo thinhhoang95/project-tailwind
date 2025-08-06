@@ -58,7 +58,7 @@ For this first step of the implementation task, we are going to adapt the `src/p
 
 Note that in `so6` format, the time is given as integer: 71523 means 07:15:23. Same for the date: 230801 means 2023-08-01.
 
-You may consult the documentation for this code in `docs/impact_vector_computation.md` document.
+You may consult the documentation for this code in `docs/impact_eval/impact_vector_computation_with_entry_time.md` document.
 
 The goal of the function is to compute efficiently, effectively, quickly the *occupancy matrix* as a sparse matrix. The output format is a `json` file in `output_path` with the example format:
 
