@@ -41,6 +41,22 @@ class TVTWIndexer:
         self._idx_to_tvtw: Dict[int, Tuple[str, int]] = {}
         self.time_window_map: Dict[int, str] = create_time_window_mapping(self.time_bin_minutes)
 
+    @property
+    def tv_id_to_idx(self) -> Dict[str, int]:
+        return self._tv_id_to_idx
+
+    @property
+    def idx_to_tv_id(self) -> Dict[int, str]:
+        return self._idx_to_tv_id
+
+    @property
+    def tvtw_to_idx(self) -> Dict[Tuple[str, int], int]:
+        return self._tvtw_to_idx
+
+    @property
+    def idx_to_tvtw(self) -> Dict[int, Tuple[str, int]]:
+        return self._idx_to_tvtw
+
     def build_from_tv_geojson(self, tv_geojson_path: str):
         """
         Builds the TVTW index from a traffic volume GeoJSON file.
