@@ -216,6 +216,10 @@ def batch_delay_operator(
 
         # 1 b. collect occupancy intervals if we need to shift them
         bins = delay_min // indexer.time_bin_minutes
+        if delay_min % indexer.time_bin_minutes != 0:
+            bins += 1 
+        
+        # replace computing bins
         if bins:
             ivs = meta["occupancy_intervals"]
             start = len(intervals_flat)
