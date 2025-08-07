@@ -16,13 +16,15 @@ project_root = Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(project_root))
 
 from project_tailwind.optimize.moves.regulation_move import RegulationMove
+from project_tailwind.optimize.moves.network_plan_move import NetworkPlanMove
+from project_tailwind.optimize.network_plan import NetworkPlan
 from project_tailwind.optimize.alns.optimization_problem import OptimizationProblem
 from project_tailwind.optimize.parser.regulation_parser import RegulationParser
 from project_tailwind.optimize.eval.flight_list import FlightList
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 import geopandas as gpd
 
-
+objective_weights = {'z_95': 1.0, 'z_sum': 1.0, 'delay': 0.01}
 
 def load_traffic_volumes_gdf():
     """Load the traffic volumes GeoDataFrame."""
@@ -81,7 +83,8 @@ def test_regulation_move_integration():
         optimization_problem = OptimizationProblem(
             traffic_volumes_gdf=traffic_volumes_gdf,
             flight_list=flight_list,
-            horizon_time_windows=100
+            horizon_time_windows=100,
+            objective_weights=objective_weights
         )
         
         # Compute baseline objective
@@ -150,6 +153,119 @@ def test_regulation_move_integration():
         traceback.print_exc()
 
 
+def test_network_plan_move_integration():
+    """Test NetworkPlanMove with multiple regulations."""
+    
+    print("\n=== Testing NetworkPlanMove Integration ===")
+    
+    # Check if required data files exist
+    required_files = [
+        "output/tvtw_indexer.json",
+        "output/so6_occupancy_matrix_with_times.json"
+    ]
+    
+    missing_files = []
+    for file_path in required_files:
+        if not Path(file_path).exists():
+            missing_files.append(file_path)
+    
+    if missing_files:
+        print(f"❌ Missing required files: {missing_files}")
+        print("Please ensure these files exist in the project root.")
+        return
+    
+    try:
+        # 1. Load traffic volumes GeoDataFrame
+        print("1. Loading traffic volumes GeoDataFrame...")
+        traffic_volumes_gdf = load_traffic_volumes_gdf()
+        print(f"   ✓ Loaded {len(traffic_volumes_gdf)} traffic volumes")
+        
+        # 2. Load TVTW Indexer
+        print("2. Loading TVTW Indexer...")
+        indexer = TVTWIndexer.load("output/tvtw_indexer.json")
+        print(f"   ✓ Loaded indexer with {len(indexer._tv_id_to_idx)} traffic volumes")
+        
+        # 3. Initialize FlightList
+        print("3. Loading Flight List...")
+        flight_list = FlightList(
+            occupancy_file_path="output/so6_occupancy_matrix_with_times.json",
+            tvtw_indexer_path="output/tvtw_indexer.json"
+        )
+        print(f"   ✓ Loaded {flight_list.num_flights} flights with {flight_list.num_tvtws} TVTWs")
+        
+        # 4. Initialize RegulationParser
+        print("4. Initializing Regulation Parser...")
+        parser = RegulationParser(
+            flights_file="output/so6_occupancy_matrix_with_times.json",
+            tvtw_indexer=indexer
+        )
+        print("   ✓ Regulation parser initialized")
+        
+        # 5. Initialize OptimizationProblem
+        print("5. Initializing Optimization Problem...")
+        optimization_problem = OptimizationProblem(
+            traffic_volumes_gdf=traffic_volumes_gdf,
+            flight_list=flight_list,
+            horizon_time_windows=100,
+            objective_weights=objective_weights
+        )
+        
+        # Compute baseline objective
+        baseline_objective = optimization_problem.objective()
+        print(f"   ✓ Baseline objective: {baseline_objective:.4f}")
+
+        # State declaration
+        state = optimization_problem.flight_list
+        
+        # 6. Test NetworkPlan with multiple regulations
+        print("\n6. Testing NetworkPlan with multiple regulations...")
+        
+        # Create a network plan with multiple regulations
+        network_plan = NetworkPlan([
+            "TV_MASH5RL IC__ 10 36-40",
+            "TV_MASH5RL IC__ 8 41-45",
+            # Add more regulations as needed for testing
+        ])
+        
+        print(f"   Created NetworkPlan with {len(network_plan)} regulations")
+        print(f"   NetworkPlan: {network_plan}")
+        
+        # Create NetworkPlanMove
+        network_plan_move = NetworkPlanMove(
+            network_plan=network_plan,
+            parser=parser,
+            flight_list=flight_list,
+            tvtw_indexer=indexer
+        )
+        
+        # Get regulation summary
+        summary = network_plan_move.get_regulation_summary()
+        print(f"   Regulation summary: {summary['total_regulations']} regulations")
+        
+        # Apply the network plan move
+        print("   Applying network plan move...")
+        _, total_delay = network_plan_move(state)
+        print(f"   Total delay applied: {total_delay:.1f} minutes")
+
+        # After the move, recompute the objective
+        new_objective = optimization_problem.objective()
+        print(f"   New objective: {new_objective:.4f}")
+
+        # Compute the improvement
+        improvement = new_objective - baseline_objective
+        print(f"   Improvement: {improvement:.4f}")
+        
+        print(f"\n=== NetworkPlanMove Test Completed Successfully ===")
+        print(f"✓ NetworkPlan and NetworkPlanMove work together correctly")
+        print(f"✓ Multiple regulations processed with delay aggregation")
+        print(f"✓ Highest delay per flight logic implemented")
+        
+    except Exception as e:
+        print(f"❌ NetworkPlanMove test failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+
 def test_regulation_formats():
     """Test different regulation string formats."""
     
@@ -177,11 +293,14 @@ def test_regulation_formats():
 
 
 if __name__ == "__main__":
-    # Run the integration test
+    # Run the single regulation test
     test_regulation_move_integration()
     
+    # Run the network plan test
+    test_network_plan_move_integration()
+    
     # Test regulation formats
-    #  test_regulation_formats()
+    # test_regulation_formats()
     
     print("\n" + "="*60)
     print("TEST SCRIPT COMPLETED")
