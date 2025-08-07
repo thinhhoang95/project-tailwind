@@ -19,6 +19,7 @@ from project_tailwind.optimize.moves.regulation_move import RegulationMove
 from project_tailwind.optimize.moves.network_plan_move import NetworkPlanMove
 from project_tailwind.optimize.network_plan import NetworkPlan
 from project_tailwind.optimize.alns.optimization_problem import OptimizationProblem
+from project_tailwind.optimize.alns.pstate import ProblemState
 from project_tailwind.optimize.parser.regulation_parser import RegulationParser
 from project_tailwind.optimize.eval.flight_list import FlightList
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
@@ -47,7 +48,7 @@ def test_regulation_move_integration():
             missing_files.append(file_path)
     
     if missing_files:
-        print(f"❌ Missing required files: {missing_files}")
+        print(f"X Missing required files: {missing_files}")
         print("Please ensure these files exist in the project root.")
         return
     
@@ -55,12 +56,12 @@ def test_regulation_move_integration():
         # 1. Load traffic volumes GeoDataFrame
         print("1. Loading traffic volumes GeoDataFrame...")
         traffic_volumes_gdf = load_traffic_volumes_gdf()
-        print(f"   ✓ Loaded {len(traffic_volumes_gdf)} traffic volumes")
+        print(f"   OK Loaded {len(traffic_volumes_gdf)} traffic volumes")
         
         # 1. Load TVTW Indexer
         print("1. Loading TVTW Indexer...")
         indexer = TVTWIndexer.load("output/tvtw_indexer.json")
-        print(f"   ✓ Loaded indexer with {len(indexer._tv_id_to_idx)} traffic volumes")
+        print(f"   OK Loaded indexer with {len(indexer._tv_id_to_idx)} traffic volumes")
         
         # 2. Initialize FlightList
         print("2. Loading Flight List...")
@@ -68,7 +69,7 @@ def test_regulation_move_integration():
             occupancy_file_path="output/so6_occupancy_matrix_with_times.json",
             tvtw_indexer_path="output/tvtw_indexer.json"
         )
-        print(f"   ✓ Loaded {flight_list.num_flights} flights with {flight_list.num_tvtws} TVTWs")
+        print(f"   OK Loaded {flight_list.num_flights} flights with {flight_list.num_tvtws} TVTWs")
         
         # 3. Initialize RegulationParser
         print("3. Initializing Regulation Parser...")
@@ -76,7 +77,7 @@ def test_regulation_move_integration():
             flights_file="output/so6_occupancy_matrix_with_times.json",
             tvtw_indexer=indexer
         )
-        print("   ✓ Regulation parser initialized")
+        print("   OK Regulation parser initialized")
         
         # 4. Initialize OptimizationProblem
         print("4. Initializing Optimization Problem...")
@@ -87,12 +88,12 @@ def test_regulation_move_integration():
             objective_weights=objective_weights
         )
         
+        # Create initial state
+        state = optimization_problem.create_initial_state()
+        
         # Compute baseline objective
-        baseline_objective = optimization_problem.objective()
-        print(f"   ✓ Baseline objective: {baseline_objective:.4f}")
-
-        # State declaration
-        state = optimization_problem.flight_list
+        baseline_objective = optimization_problem.objective(state)
+        print(f"   OK Baseline objective: {baseline_objective:.4f}")
         
         # 5. Test various regulation strings
         test_regulations = [
@@ -111,7 +112,7 @@ def test_regulation_move_integration():
                 regulation_move = RegulationMove(
                     regulation_str=regulation_str,
                     parser=parser,
-                    flight_list=flight_list,
+                    flight_list=state.flight_list,
                     tvtw_indexer=indexer
                 )
                 
@@ -119,21 +120,24 @@ def test_regulation_move_integration():
                 explanation = parser.explain_regulation(regulation_move.regulation)
                 print(f"     Explanation: {explanation}")
                 
-                # Apply the regulation move
+                # Apply the regulation move (this should return a new state)
                 print("     Applying regulation move...")
-                _, total_delay = regulation_move(state)  # Apply move in-place (inside the optimization problem state)
+                new_state, total_delay = regulation_move(state.flight_list)  # Apply move to flight_list
                 print(f"     Total delay: {total_delay:.1f} minutes")
+                
+                # Create new state with updated flight_list
+                updated_state = state.with_flight_list(new_state)
 
                 # After the move, recompute the objective
-                new_objective = optimization_problem.objective()
+                new_objective = optimization_problem.objective(updated_state)
                 print(f"     New objective: {new_objective:.4f}")
 
                 # Compute the improvement
                 improvement = new_objective - baseline_objective
-                print(f"     Improvement: {improvement:.4f}")
+                print(f"     Loss change (negative is better): {improvement:.4f}")
                 
             except Exception as e:
-                print(f"     ❌ Error testing regulation {i}: {str(e)}")
+                print(f"     X Error testing regulation {i}: {str(e)}")
                 import traceback
                 traceback.print_exc()
 
@@ -143,12 +147,12 @@ def test_regulation_move_integration():
         
         
         print(f"\n=== Integration Test Completed Successfully ===")
-        print(f"✓ All components work together correctly")
-        print(f"✓ RegulationMove integrates properly with OptimizationProblem")
-        print(f"✓ Flight list updates and objective computation work")
+        print(f"OK All components work together correctly")
+        print(f"OK RegulationMove integrates properly with OptimizationProblem")
+        print(f"OK Flight list updates and objective computation work")
         
     except Exception as e:
-        print(f"❌ Integration test failed: {str(e)}")
+        print(f"X Integration test failed: {str(e)}")
         import traceback
         traceback.print_exc()
 
@@ -170,7 +174,7 @@ def test_network_plan_move_integration():
             missing_files.append(file_path)
     
     if missing_files:
-        print(f"❌ Missing required files: {missing_files}")
+        print(f"X Missing required files: {missing_files}")
         print("Please ensure these files exist in the project root.")
         return
     
@@ -178,12 +182,12 @@ def test_network_plan_move_integration():
         # 1. Load traffic volumes GeoDataFrame
         print("1. Loading traffic volumes GeoDataFrame...")
         traffic_volumes_gdf = load_traffic_volumes_gdf()
-        print(f"   ✓ Loaded {len(traffic_volumes_gdf)} traffic volumes")
+        print(f"   OK Loaded {len(traffic_volumes_gdf)} traffic volumes")
         
         # 2. Load TVTW Indexer
         print("2. Loading TVTW Indexer...")
         indexer = TVTWIndexer.load("output/tvtw_indexer.json")
-        print(f"   ✓ Loaded indexer with {len(indexer._tv_id_to_idx)} traffic volumes")
+        print(f"   OK Loaded indexer with {len(indexer._tv_id_to_idx)} traffic volumes")
         
         # 3. Initialize FlightList
         print("3. Loading Flight List...")
@@ -191,7 +195,7 @@ def test_network_plan_move_integration():
             occupancy_file_path="output/so6_occupancy_matrix_with_times.json",
             tvtw_indexer_path="output/tvtw_indexer.json"
         )
-        print(f"   ✓ Loaded {flight_list.num_flights} flights with {flight_list.num_tvtws} TVTWs")
+        print(f"   OK Loaded {flight_list.num_flights} flights with {flight_list.num_tvtws} TVTWs")
         
         # 4. Initialize RegulationParser
         print("4. Initializing Regulation Parser...")
@@ -199,7 +203,7 @@ def test_network_plan_move_integration():
             flights_file="output/so6_occupancy_matrix_with_times.json",
             tvtw_indexer=indexer
         )
-        print("   ✓ Regulation parser initialized")
+        print("   OK Regulation parser initialized")
         
         # 5. Initialize OptimizationProblem
         print("5. Initializing Optimization Problem...")
@@ -210,12 +214,12 @@ def test_network_plan_move_integration():
             objective_weights=objective_weights
         )
         
+        # Create initial state
+        state = optimization_problem.create_initial_state()
+        
         # Compute baseline objective
-        baseline_objective = optimization_problem.objective()
-        print(f"   ✓ Baseline objective: {baseline_objective:.4f}")
-
-        # State declaration
-        state = optimization_problem.flight_list
+        baseline_objective = optimization_problem.objective(state)
+        print(f"   OK Baseline objective: {baseline_objective:.4f}")
         
         # 6. Test NetworkPlan with multiple regulations
         print("\n6. Testing NetworkPlan with multiple regulations...")
@@ -234,7 +238,7 @@ def test_network_plan_move_integration():
         network_plan_move = NetworkPlanMove(
             network_plan=network_plan,
             parser=parser,
-            flight_list=flight_list,
+            flight_list=state.flight_list,
             tvtw_indexer=indexer
         )
         
@@ -244,24 +248,27 @@ def test_network_plan_move_integration():
         
         # Apply the network plan move
         print("   Applying network plan move...")
-        _, total_delay = network_plan_move(state)
+        new_state, total_delay = network_plan_move(state.flight_list) # here new_state = state.flight_list is also changed because network_plan_move modifies in-place
         print(f"   Total delay applied: {total_delay:.1f} minutes")
+        
+        # Create new state with updated flight_list
+        updated_state = state.with_flight_list(new_state)
 
         # After the move, recompute the objective
-        new_objective = optimization_problem.objective()
+        new_objective = optimization_problem.objective(updated_state)
         print(f"   New objective: {new_objective:.4f}")
 
         # Compute the improvement
         improvement = new_objective - baseline_objective
-        print(f"   Improvement: {improvement:.4f}")
+        print(f"   Loss change (negative is better): {improvement:.4f}")
         
         print(f"\n=== NetworkPlanMove Test Completed Successfully ===")
-        print(f"✓ NetworkPlan and NetworkPlanMove work together correctly")
-        print(f"✓ Multiple regulations processed with delay aggregation")
-        print(f"✓ Highest delay per flight logic implemented")
+        print(f"OK NetworkPlan and NetworkPlanMove work together correctly")
+        print(f"OK Multiple regulations processed with delay aggregation")
+        print(f"OK Highest delay per flight logic implemented")
         
     except Exception as e:
-        print(f"❌ NetworkPlanMove test failed: {str(e)}")
+        print(f"X NetworkPlanMove test failed: {str(e)}")
         import traceback
         traceback.print_exc()
 
@@ -284,17 +291,17 @@ def test_regulation_formats():
         try:
             from project_tailwind.optimize.regulation import Regulation
             regulation = Regulation(regulation_str)
-            print(f"✓ {description}: '{regulation_str}'")
+            print(f"OK {description}: '{regulation_str}'")
             print(f"  Location: {regulation.location}, Rate: {regulation.rate}")
             print(f"  Time windows: {regulation.time_windows}")
             print(f"  Filter: {regulation.filter_type}_{regulation.filter_value}")
         except Exception as e:
-            print(f"❌ {description}: {str(e)}")
+            print(f"X {description}: {str(e)}")
 
 
 if __name__ == "__main__":
     # Run the single regulation test
-    test_regulation_move_integration()
+    # test_regulation_move_integration()
     
     # Run the network plan test
     test_network_plan_move_integration()

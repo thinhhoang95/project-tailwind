@@ -46,6 +46,17 @@ class NetworkEvaluator:
         self.hourly_capacity_by_tv: Dict[str, Dict[int, float]] = {}
         self._process_capacity_data()
 
+    def update_flight_list(self, new_flight_list: FlightList) -> None:
+        """
+        Update the flight_list reference for evaluation with a new state.
+        
+        Args:
+            new_flight_list: Updated FlightList object representing the new state
+        """
+        self.flight_list = new_flight_list
+        # Clear cached results that depend on flight_list
+        self.last_hourly_occupancy_matrix = None
+
     def _process_capacity_data(self):
         """
         Process and store hourly capacity data for each traffic volume.
