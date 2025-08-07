@@ -1,9 +1,12 @@
-from typing import Dict, List
+from typing import Dict, List, Union, TYPE_CHECKING
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.optimize.eval.flight_list import FlightList
 from project_tailwind.optimize.parser.regulation_parser import Regulation, RegulationParser
 from project_tailwind.optimize.network_plan import NetworkPlan
 from project_tailwind.optimize.moves.network_plan_move import NetworkPlanMove
+
+if TYPE_CHECKING:
+    from project_tailwind.optimize.alns.pstate import ProblemState
 
 
 class RegulationMove:
@@ -31,18 +34,18 @@ class RegulationMove:
         self.network_plan_move = NetworkPlanMove(
             network_plan=self.network_plan,
             parser=parser,
-            flight_list=flight_list,
             tvtw_indexer=tvtw_indexer
         )
 
-    def __call__(self, state: FlightList) -> tuple[FlightList, float]:
+    def __call__(self, state: Union[FlightList, "ProblemState"]) -> Union[tuple[FlightList, float], "ProblemState"]:
         """
-        Apply the regulation move to the current state (FlightList) in-place.
+        Apply the regulation move to the current state.
 
         Args:
-            state: The current FlightList to be modified.
+            state: The current FlightList or ProblemState to be modified.
 
         Returns:
-            Tuple of (modified FlightList, total delay applied)
+            If FlightList input: Tuple of (modified FlightList, total delay applied)
+            If ProblemState input: New ProblemState with modified FlightList
         """
         return self.network_plan_move(state)
