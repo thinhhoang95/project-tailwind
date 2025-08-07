@@ -12,11 +12,13 @@ from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.optimize.alns.optimization_problem import OptimizationProblem
 from project_tailwind.optimize.alns.pstate import ProblemState
 from project_tailwind.optimize.eval.flight_list import FlightList
-from project_tailwind.optimize import Regulation
+from project_tailwind.optimize.regulation import Regulation
 from project_tailwind.optimize.parser.regulation_parser import RegulationParser
+import geopandas as gpd
 
 
 DATA_DIR = "output"
+TRAFFIC_VOLUMES_PATH = "/Volumes/CrucialX/project-cirrus/cases/traffic_volumes_simplified.geojson"
 OBJECTIVE_WEIGHTS = {"z_95": 1.0, "z_sum": 1.0, "delay": 0.01}
 HORIZON_TIME_WINDOWS = 100
 DEFAULT_REGULATIONS = [
@@ -65,36 +67,42 @@ class AlnsOrchestrator:
         self.tvtw_indexer = None
         self.regulation_parser = None
         self.optimization_problem = None
+        self.traffic_volumes = None
 
     def setup(self):
         """
         Load all necessary data and initialize components.
         """
         print("1. Loading TVTW Indexer...")
-        self.tvtw_indexer = TVTWIndexer.load(self.data_dir / "tvtw_indexer.json")
+        self.tvtw_indexer = TVTWIndexer.load(self.data_dir + "/tvtw_indexer.json")
         print(f"   OK Loaded indexer with {len(self.tvtw_indexer._tv_id_to_idx)} traffic volumes")
 
         print("2. Loading Flight List...")
         self.flight_list = FlightList(
-            occupancy_file_path=self.data_dir / "so6_occupancy_matrix_with_times.json",
-            tvtw_indexer_path=self.data_dir / "tvtw_indexer.json",
+            occupancy_file_path=self.data_dir + "/so6_occupancy_matrix_with_times.json",
+            tvtw_indexer_path=self.data_dir + "/tvtw_indexer.json",
         )
         print(f"   OK Loaded {self.flight_list.num_flights} flights")
 
         print("3. Initializing Regulation Parser...")
         self.regulation_parser = RegulationParser(
-            flights_file=self.data_dir / "so6_occupancy_matrix_with_times.json",
+            flights_file=self.data_dir + "/so6_occupancy_matrix_with_times.json",
             tvtw_indexer=self.tvtw_indexer,
         )
         print("   OK Regulation parser initialized")
 
-        print("4. Initializing Optimization Problem...")
+        print("4. Loading Traffic Volumes...")
+        self.traffic_volumes = gpd.read_file(TRAFFIC_VOLUMES_PATH)
+        print(f"   OK Loaded {len(self.traffic_volumes)} traffic volumes")
+
+        print("5. Initializing Optimization Problem...")
         self.optimization_problem = OptimizationProblem(
             base_flight_list=self.flight_list,
             regulation_parser=self.regulation_parser,
             tvtw_indexer=self.tvtw_indexer,
             objective_weights=OBJECTIVE_WEIGHTS,
             horizon_time_windows=HORIZON_TIME_WINDOWS,
+            base_traffic_volumes=self.traffic_volumes,
         )
         print("   OK Optimization problem initialized")
 

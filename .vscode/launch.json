@@ -26,10 +26,17 @@
             "console": "integratedTerminal"
         },
         {
-            "name": "Test Regulation Move (Debug)",
+            "name": "Test Regulation and Network Plan Move (Debug)",
             "type": "debugpy",
             "request": "launch",
-            "program": "tests/test_regulation_move_integration.py",
+            "program": "tests/test_regulation_and_network_plan_move.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Test ALNS Orchestra (Debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "src/project_tailwind/optimize/alns/orchestrator.py",
             "console": "integratedTerminal"
         }
     ]

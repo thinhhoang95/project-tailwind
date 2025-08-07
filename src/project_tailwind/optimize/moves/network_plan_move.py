@@ -1,4 +1,4 @@
-from typing import Dict, List
+from typing import Dict, List, Union, TYPE_CHECKING
 from collections import defaultdict
 from project_tailwind.casa.casa_flightlist import run_readapted_casa
 from project_tailwind.impact_eval.operators.delay import batch_delay_operator
@@ -6,6 +6,9 @@ from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.optimize.eval.flight_list import FlightList
 from project_tailwind.optimize.parser.regulation_parser import RegulationParser
 from project_tailwind.optimize.network_plan import NetworkPlan
+
+if TYPE_CHECKING:
+    from project_tailwind.optimize.alns.pstate import ProblemState
 
 
 class NetworkPlanMove:
@@ -18,7 +21,6 @@ class NetworkPlanMove:
         self,
         network_plan: NetworkPlan,
         parser: RegulationParser,
-        flight_list: FlightList,
         tvtw_indexer: TVTWIndexer,
     ):
         """
@@ -27,15 +29,13 @@ class NetworkPlanMove:
         Args:
             network_plan: NetworkPlan containing multiple regulations
             parser: RegulationParser for parsing regulations
-            flight_list: FlightList for reference
             tvtw_indexer: TVTWIndexer for time-volume indexing
         """
         self.network_plan = network_plan
         self.parser = parser
-        self.flight_list = flight_list
         self.tvtw_indexer = tvtw_indexer
     
-    def __call__(self, state: FlightList) -> tuple[FlightList, float]:
+    def __call__(self, state: Union[FlightList, "ProblemState"]) -> Union[tuple[FlightList, float], tuple["ProblemState", float]]:
         """
         Apply all regulations in the network plan to the current state.
         
@@ -43,7 +43,44 @@ class NetworkPlanMove:
         the highest delay value is applied.
         
         Args:
-            state: The current FlightList to be modified.
+            state: The current FlightList or ProblemState to be modified.
+            
+        Returns:
+            If FlightList input: Tuple of (modified FlightList, total delay applied)
+            If ProblemState input: Tuple of (new ProblemState, total delay applied)
+        """
+        # Handle ProblemState input
+        if hasattr(state, 'flight_list'):
+            return self._apply_to_problem_state(state)
+        
+        # Handle FlightList input (original behavior)
+        return self._apply_to_flight_list(state)
+    
+    def _apply_to_problem_state(self, state: "ProblemState") -> tuple["ProblemState", float]:
+        """
+        Apply regulations to a ProblemState and return a new ProblemState.
+        
+        Args:
+            state: The ProblemState to modify
+            
+        Returns:
+            Tuple containing the new ProblemState with modified FlightList and the total delay applied
+        """
+        # Create a copy of the flight_list for modification
+        flight_list_copy = state.flight_list.copy()
+        
+        # Apply regulations using the existing logic
+        modified_flight_list, total_delay = self._apply_to_flight_list(flight_list_copy)
+        
+        # Return the new ProblemState along with the total delay
+        return state.with_flight_list(modified_flight_list), total_delay
+        
+    def _apply_to_flight_list(self, state: FlightList) -> tuple[FlightList, float]:
+        """
+        Apply all regulations to a FlightList (original implementation).
+        
+        Args:
+            state: The FlightList to modify
             
         Returns:
             Tuple of (modified FlightList, total delay applied)
