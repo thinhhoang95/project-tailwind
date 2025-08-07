@@ -23,62 +23,10 @@ from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 import geopandas as gpd
 
 
-# Extended FlightList class with required methods
-class ExtendedFlightList(FlightList):
-    """Extended FlightList with copy and update_flight methods for testing."""
-    
-    def copy(self):
-        """Create a deep copy of the FlightList."""
-        # Create new instance with same file paths
-        new_flight_list = ExtendedFlightList(self.occupancy_file_path, self.tvtw_indexer_path)
-        
-        # Copy the occupancy matrix
-        new_flight_list.occupancy_matrix = self.occupancy_matrix.copy()
-        
-        # Copy flight metadata
-        new_flight_list.flight_metadata = deepcopy(self.flight_metadata)
-        new_flight_list.flight_data = deepcopy(self.flight_data)
-        
-        return new_flight_list
-    
-    def update_flight_occupancy(self, flight_id: str, new_occupancy_vector: np.ndarray):
-        """
-        Update the occupancy vector for a specific flight.
-        Uses LIL format for efficient sparse matrix modification.
-        """
-        if flight_id not in self.flight_id_to_row:
-            raise ValueError(f"Flight ID {flight_id} not found")
-        
-        row_idx = self.flight_id_to_row[flight_id]
-        
-        # For efficiency, convert to LIL format for changing sparsity
-        lil_matrix = self.occupancy_matrix.tolil()
-        lil_matrix[row_idx, :] = new_occupancy_vector
-        self.occupancy_matrix = lil_matrix.tocsr()
-
-    def update_flight(self, flight_id: str, updates: Dict[str, Any]):
-        """Update flight data with new values."""
-        if flight_id not in self.flight_id_to_row:
-            raise ValueError(f"Flight ID {flight_id} not found")
-        
-        # Update occupancy vector if provided
-        if "occupancy_vector" in updates:
-            new_occupancy_vector = updates["occupancy_vector"]
-            if hasattr(new_occupancy_vector, '__len__'):
-                # Convert list to numpy array if needed
-                if not isinstance(new_occupancy_vector, np.ndarray):
-                    new_occupancy_vector = np.array(new_occupancy_vector)
-                self.update_flight_occupancy(flight_id, new_occupancy_vector)
-            
-        # Update metadata if provided
-        if flight_id in self.flight_metadata:
-            for key, value in updates.items():
-                if key != "occupancy_vector":
-                    self.flight_metadata[flight_id][key] = value
 
 def load_traffic_volumes_gdf():
     """Load the traffic volumes GeoDataFrame."""
-    return gpd.read_file("/Volumes/CrucialX/project-cirrus/cases/traffic_volumes_simplified.geojson")
+    return gpd.read_file("D:/project-cirrus/cases/traffic_volumes_simplified.geojson")
 
 def test_regulation_move_integration():
     """Test complete regulation move integration."""
@@ -112,9 +60,9 @@ def test_regulation_move_integration():
         indexer = TVTWIndexer.load("output/tvtw_indexer.json")
         print(f"   ✓ Loaded indexer with {len(indexer._tv_id_to_idx)} traffic volumes")
         
-        # 2. Initialize ExtendedFlightList
+        # 2. Initialize FlightList
         print("2. Loading Flight List...")
-        flight_list = ExtendedFlightList(
+        flight_list = FlightList(
             occupancy_file_path="output/so6_occupancy_matrix_with_times.json",
             tvtw_indexer_path="output/tvtw_indexer.json"
         )
@@ -139,17 +87,14 @@ def test_regulation_move_integration():
         # Compute baseline objective
         baseline_objective = optimization_problem.objective()
         print(f"   ✓ Baseline objective: {baseline_objective:.4f}")
+
+        # State declaration
+        state = optimization_problem.flight_list
         
         # 5. Test various regulation strings
         test_regulations = [
             # Wide-spectrum regulation
-            "TV_MASH5RL IC__ 10 36-45",
-            # # Basic regulation - all flights at EDMTEG during morning hours
-            # "TV_EDMTEG IC__ 10 48-55",
-            # # Country-specific regulation - flights from/to Belgium (BK prefix)
-            # "TV_EDMTEG IC_BK>_> 15 50-52",
-            # # Airport-specific regulation - flights between specific airports
-            # "TV_LFPPLW1 IC_LFPG_EGLL 20 48-50"
+            "TV_MASH5RL IC__ 10 36-45"
         ]
 
         # before_flight_state = flight_list.get_flight_metadata("263867136")
@@ -173,29 +118,16 @@ def test_regulation_move_integration():
                 
                 # Apply the regulation move
                 print("     Applying regulation move...")
-                original_state = flight_list
-                new_state = original_state.copy()  # Create a copy to modify\
-                regulation_move(new_state)  # Apply move in-place
-                
-                # Verify the move was applied to a copy
-                if new_state is original_state:
-                    print("     ❌ ERROR: RegulationMove should have been applied to a copy")
-                else:
-                    print("     ✓ RegulationMove was applied to a new state copy")
-                
-                # Check if any flights were affected
-                affected_flights = 0
-                total_delay = 0.0
-                
-                for flight_id in flight_list.flight_ids:
-                    original_vector = original_state.get_occupancy_vector(flight_id)
-                    new_vector = new_state.get_occupancy_vector(flight_id)
-                    
-                    if not np.array_equal(original_vector, new_vector):
-                        affected_flights += 1
-                        
-                
-                print(f"     ✓ Affected flights: {affected_flights}")
+                _, total_delay = regulation_move(state)  # Apply move in-place (inside the optimization problem state)
+                print(f"     Total delay: {total_delay:.1f} minutes")
+
+                # After the move, recompute the objective
+                new_objective = optimization_problem.objective()
+                print(f"     New objective: {new_objective:.4f}")
+
+                # Compute the improvement
+                improvement = new_objective - baseline_objective
+                print(f"     Improvement: {improvement:.4f}")
                 
             except Exception as e:
                 print(f"     ❌ Error testing regulation {i}: {str(e)}")
@@ -249,7 +181,7 @@ if __name__ == "__main__":
     test_regulation_move_integration()
     
     # Test regulation formats
-    test_regulation_formats()
+    #  test_regulation_formats()
     
     print("\n" + "="*60)
     print("TEST SCRIPT COMPLETED")

@@ -72,6 +72,9 @@ class RegulationMove:
         #         print(f"  Maximum delay: {max_delay:.1f} minutes")
         #     print("=" * 50)
 
+        # Calculate the total delay applied
+        total_delay = sum(delays.values())
+
         # Apply delays to the matched flights in batch for efficiency
         flight_delays = {
             flight_id: int(delay_minutes) 
@@ -86,4 +89,4 @@ class RegulationMove:
                 indexer=self.tvtw_indexer,
             )
         
-        return state
+        return state, total_delay
