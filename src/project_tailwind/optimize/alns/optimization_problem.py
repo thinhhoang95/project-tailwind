@@ -3,6 +3,7 @@ import geopandas as gpd
 
 from project_tailwind.optimize.eval.network_evaluator import NetworkEvaluator
 from project_tailwind.optimize.eval.flight_list import FlightList
+from project_tailwind.optimize.alns.pstate import ProblemState
 
 
 class OptimizationProblem:
@@ -13,22 +14,33 @@ class OptimizationProblem:
         horizon_time_windows: int,
         objective_weights: dict
     ):
-        self.flight_list = flight_list
+        self.initial_flight_list = flight_list
         self.horizon_time_windows = horizon_time_windows
         self.traffic_volumes_gdf = traffic_volumes_gdf
-
-        self.network_evaluator = NetworkEvaluator(
-            traffic_volumes_gdf=self.traffic_volumes_gdf, flight_list=self.flight_list
-        )
 
         self.weight_z95 = objective_weights['z_95']
         self.weight_zsum = objective_weights['z_sum']
         self.weight_delay_min = objective_weights['delay']
 
-    def objective(self, debug: bool = False) -> float:
+        # Create NetworkEvaluator as an instance variable
+        self.network_evaluator = NetworkEvaluator(
+            traffic_volumes_gdf=self.traffic_volumes_gdf,
+            flight_list=self.initial_flight_list
+        )
+
+    def create_initial_state(self) -> ProblemState:
         """
-        Computes the objective function value.
+        Create the initial ProblemState with the original flight_list.
         """
+        return ProblemState(flight_list=self.initial_flight_list)
+    
+    def objective(self, state: ProblemState, debug: bool = False) -> float:
+        """
+        Computes the objective function value for a given state.
+        """
+        # Update the existing network evaluator with the flight_list from the current state
+        self.network_evaluator.update_flight_list(state.flight_list)
+        
         metrics = self.network_evaluator.compute_horizon_metrics(
             self.horizon_time_windows
         )
