@@ -58,6 +58,12 @@ class NetworkPlan:
         """Allow indexing into regulations."""
         return self.regulations[index]
     
+    def copy(self) -> "NetworkPlan":
+        """Create a shallow copy with an independent regulations list."""
+        # Regulations are immutable containers in our workflow, so sharing
+        # instances is fine. We only need to decouple the list object.
+        return NetworkPlan(list(self.regulations))
+
     def __str__(self):
         """String representation of the network plan."""
         if not self.regulations:
