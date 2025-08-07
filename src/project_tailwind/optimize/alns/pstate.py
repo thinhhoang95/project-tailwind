@@ -3,10 +3,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from project_tailwind.optimize.network_plan import NetworkPlan
+from project_tailwind.optimize.debug import console, is_debug_enabled
 
 if TYPE_CHECKING:
     from project_tailwind.optimize.alns.optimization_problem import OptimizationProblem
     from project_tailwind.optimize.eval.flight_list import FlightList
+    from project_tailwind.optimize.eval.delta_flight_list import DeltaFlightList
 
 
 class ProblemState:
@@ -31,9 +33,11 @@ class ProblemState:
         """
         Return a deep copy of the state, as required by ALNS move semantics.
         """
+        # Make copying cheap by keeping a reference to the shared base flight list
+        # and copying only the lightweight network plan and aux.
         return ProblemState(
-            network_plan=self.network_plan.copy(),
-            flight_list=self.flight_list.copy(),
+            network_plan=self.network_plan.copy() if hasattr(self.network_plan, 'copy') else self.network_plan,
+            flight_list=self.flight_list,
             optimization_problem=self.optimization_problem,
             aux=self.aux.copy(),
         )
@@ -45,22 +49,24 @@ class ProblemState:
         """
         from project_tailwind.optimize.moves.network_plan_move import NetworkPlanMove
         from project_tailwind.optimize.eval.network_evaluator import NetworkEvaluator
-        
-        # Create a deep copy of the flight_list for simulation
-        sim_flight_list = self.flight_list.copy()
 
-        # Instantiate and apply a NetworkPlanMove to the copied flight list
+        # Build a delta view to avoid deep-copying the base flight list
         move = NetworkPlanMove(
             network_plan=self.network_plan,
             parser=self.optimization_problem.regulation_parser,
             tvtw_indexer=self.optimization_problem.tvtw_indexer,
         )
-        modified_flight_list, total_delay = move(sim_flight_list)
+        # if is_debug_enabled():
+        #     console.print(
+        #         f"[debug] Objective: building delta view for {len(self.network_plan.regulations)} regulations",
+        #         style="debug",
+        #     )
+        delta_view, total_delay = move.build_delta_view(self.flight_list)
 
-        # Use NetworkEvaluator to compute metrics
+        # Use NetworkEvaluator against the delta view
         network_evaluator = NetworkEvaluator(
             traffic_volumes_gdf=self.optimization_problem.base_traffic_volumes,
-            flight_list=modified_flight_list,
+            flight_list=delta_view,
         )
         metrics = network_evaluator.compute_horizon_metrics(
             self.optimization_problem.horizon_time_windows
@@ -72,6 +78,14 @@ class ProblemState:
             + self.optimization_problem.objective_weights["z_sum"] * metrics["z_sum"]
             + self.optimization_problem.objective_weights["delay"] * total_delay
         )
+        if is_debug_enabled():
+            console.print(
+                (
+                    f"[debug] n_reg = {len(self.network_plan.regulations)}, z_95={metrics['z_95']:.3f}, "
+                    f"z_sum={metrics['z_sum']:.3f}, delay={total_delay} → score={score:.3f}"
+                ),
+                style="debug",
+            )
         return score
 
     def with_flight_list(self, new_flight_list: "FlightList") -> "ProblemState":

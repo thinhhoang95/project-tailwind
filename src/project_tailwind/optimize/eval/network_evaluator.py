@@ -30,9 +30,12 @@ class NetworkEvaluator:
         """
         self.traffic_volumes_gdf = traffic_volumes_gdf
         self.flight_list = flight_list
-        self.original_flight_list = (
-            flight_list.copy()
-        )  # kept as reference to compute the total imposed delay or extra fuel burn...
+        # If we are given a DeltaFlightList, snapshot the original baseline from its base
+        if hasattr(flight_list, "_base"):
+            # Use the immutable base as the baseline to avoid a heavy copy
+            self.original_flight_list = flight_list._base  # type: ignore[attr-defined]
+        else:
+            self.original_flight_list = flight_list.copy()
 
         # Extract time window information
         self.time_bin_minutes = flight_list.time_bin_minutes
@@ -404,7 +407,7 @@ class NetworkEvaluator:
             Dictionary with z_max (maximum excess) and z_sum (total excess)
         """
         excess_vector = self.compute_excess_traffic_vector()
-        delay_vector = self.compute_delay_stats()
+        # delay_vector = self.compute_delay_stats()
 
         # Limit to horizon
         if horizon_time_windows > 0:
@@ -421,8 +424,8 @@ class NetworkEvaluator:
             "z_95": z_95,
             "z_sum": z_sum,
             "horizon_windows": len(excess_vector),
-            "total_delay_seconds": delay_vector["total_delay_seconds"],
-            "max_delay_seconds": delay_vector["max_delay_seconds"],
+            # "total_delay_seconds": delay_vector["total_delay_seconds"],
+            # "max_delay_seconds": delay_vector["max_delay_seconds"],
         }
 
     def get_capacity_utilization_stats(self) -> Dict[str, Any]:
