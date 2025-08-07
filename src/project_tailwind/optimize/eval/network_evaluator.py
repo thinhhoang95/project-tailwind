@@ -30,6 +30,9 @@ class NetworkEvaluator:
         """
         self.traffic_volumes_gdf = traffic_volumes_gdf
         self.flight_list = flight_list
+        self.original_flight_list = (
+            flight_list.copy()
+        )  # kept as reference to compute the total imposed delay or extra fuel burn...
 
         # Extract time window information
         self.time_bin_minutes = flight_list.time_bin_minutes
@@ -51,8 +54,8 @@ class NetworkEvaluator:
         which represents the throughput for that hour.
         """
         for _, tv_row in self.traffic_volumes_gdf.iterrows():
-            tv_id = tv_row['traffic_volume_id']
-            capacity_data = tv_row['capacity']
+            tv_id = tv_row["traffic_volume_id"]
+            capacity_data = tv_row["capacity"]
 
             if tv_id not in self.tv_id_to_idx:
                 continue  # Skip traffic volumes not in indexer
@@ -84,14 +87,14 @@ class NetworkEvaluator:
         num_tvtws = self.flight_list.num_tvtws
         bins_per_hour = 60 // self.time_bin_minutes
         total_capacity = np.zeros(num_tvtws)
-        
+
         num_time_bins_per_tv = num_tvtws // len(self.tv_id_to_idx)
 
         for tv_id, hourly_capacities in self.hourly_capacity_by_tv.items():
             tv_row = self.tv_id_to_idx.get(tv_id)
             if tv_row is None:
                 continue
-            
+
             tv_start = tv_row * num_time_bins_per_tv
             for hour, hourly_capacity in hourly_capacities.items():
                 start_bin = hour * bins_per_hour
@@ -119,9 +122,9 @@ class NetworkEvaluator:
             Tuple of (start_hour, end_hour) or (None, None) if parsing fails
         """
         try:
-            start_time, end_time = time_range.split('-')
-            start_hour = int(start_time.split(':')[0])
-            end_hour = int(end_time.split(':')[0])
+            start_time, end_time = time_range.split("-")
+            start_hour = int(start_time.split(":")[0])
+            end_hour = int(end_time.split(":")[0])
             return start_hour, end_hour
         except (ValueError, IndexError):
             return None, None
@@ -153,8 +156,10 @@ class NetworkEvaluator:
         # Aggregate occupancy into hourly buckets for each traffic volume
         num_time_bins_per_tv = num_tvtws // len(self.tv_id_to_idx)
         if num_time_bins_per_tv != 96:
-            raise ValueError(f"Number of time bins per TVTW is not 96: {num_time_bins_per_tv}")
-        
+            raise ValueError(
+                f"Number of time bins per TVTW is not 96: {num_time_bins_per_tv}"
+            )
+
         for tv_id, tv_row in self.tv_id_to_idx.items():
             row_idx = self.tv_id_to_row_idx[tv_id]
             tv_start = tv_row * num_time_bins_per_tv
@@ -170,7 +175,7 @@ class NetworkEvaluator:
                             hourly_occupancy_for_tv += total_occupancy[tvtw_idx]
 
                 hourly_occupancy_matrix[row_idx, hour] = hourly_occupancy_for_tv
-        
+
         self.last_hourly_occupancy_matrix = hourly_occupancy_matrix
 
         # Compute excess traffic for each traffic volume and hour
@@ -253,30 +258,131 @@ class NetworkEvaluator:
 
             # Get hourly capacity for this tv and hour
             hourly_capacity = self.hourly_capacity_by_tv.get(tv_id, {}).get(hour, -1)
-            capacity_per_bin = hourly_capacity / bins_per_hour if hourly_capacity > -1 else -1
-            
+            capacity_per_bin = (
+                hourly_capacity / bins_per_hour if hourly_capacity > -1 else -1
+            )
+
             row_idx = self.tv_id_to_row_idx[tv_id]
             hourly_occupancy = -1
             if self.last_hourly_occupancy_matrix is not None:
                 hourly_occupancy = self.last_hourly_occupancy_matrix[row_idx, hour]
 
-            overloaded_tvtws.append({
-                'tvtw_index': int(idx),
-                'traffic_volume_id': tv_id,
-                'occupancy': float(occupancy),
-                'capacity_per_bin': float(capacity_per_bin),
-                'hourly_capacity': float(hourly_capacity),
-                'hourly_occupancy': float(hourly_occupancy),
-                'excess': float(excess_vector[idx]),
-                'utilization_ratio': float(occupancy / capacity_per_bin) if capacity_per_bin > 0 else float('inf')
-            })
+            overloaded_tvtws.append(
+                {
+                    "tvtw_index": int(idx),
+                    "traffic_volume_id": tv_id,
+                    "occupancy": float(occupancy),
+                    "capacity_per_bin": float(capacity_per_bin),
+                    "hourly_capacity": float(hourly_capacity),
+                    "hourly_occupancy": float(hourly_occupancy),
+                    "excess": float(excess_vector[idx]),
+                    "utilization_ratio": (
+                        float(occupancy / capacity_per_bin)
+                        if capacity_per_bin > 0
+                        else float("inf")
+                    ),
+                }
+            )
 
         # Sort by excess traffic (highest first)
-        overloaded_tvtws.sort(key=lambda x: x['excess'], reverse=True)
+        overloaded_tvtws.sort(key=lambda x: x["excess"], reverse=True)
 
         return overloaded_tvtws
 
-    def compute_horizon_metrics(self, horizon_time_windows: int, percentile_for_z_max: int = 95) -> Dict[str, float]:
+    def compute_delay_stats(self) -> Dict[str, float]:
+        """
+        Compute delay statistics by comparing current assigned takeoff times
+        against the original takeoff times preserved at initialization.
+
+        Returns:
+            Dictionary with:
+            - total_delay_seconds: Sum of delays over all flights (current - original)
+            - mean_delay_seconds: Mean delay
+            - max_delay_seconds: Maximum delay
+            - min_delay_seconds: Minimum delay
+            - delayed_flights_count: Number of flights with positive delay
+        Notes:
+            Positive values mean delays; negative values mean advances.
+            Implementation is vectorized for efficiency.
+        """
+        # Fast path: both flight lists were loaded from the same sources in the same order.
+        # We rely on identical ordering of flight_ids (copy() preserves order).
+        current_fids = self.flight_list.flight_ids
+        original_fids = self.original_flight_list.flight_ids
+
+        # Optional light sanity check (O(1) + O(n) worst if mismatch); can be disabled for max speed.
+        if len(current_fids) != len(original_fids):
+            raise ValueError(
+                "Flight counts differ between current and original flight lists."
+            )
+
+        # Vectorize extraction of takeoff times as seconds since epoch
+        # Using a list comprehension once is O(n) and then numpy ops are vectorized.
+        # datetime.timestamp() returns float seconds; cast to float64 for safe aggregation.
+        curr_seconds = np.asarray(
+            [
+                self.flight_list.flight_metadata[fid]["takeoff_time"].timestamp()
+                for fid in current_fids
+            ],
+            dtype=np.float64,
+        )
+        orig_seconds = np.asarray(
+            [
+                self.original_flight_list.flight_metadata[fid][
+                    "takeoff_time"
+                ].timestamp()
+                for fid in original_fids
+            ],
+            dtype=np.float64,
+        )
+
+        # If the ordering is guaranteed identical, the above aligns by index.
+        # If you want to be extra safe with minimal overhead, do a quick spot check on a few positions.
+        # Skipped here for maximal performance.
+
+        # Compute per-flight delay in seconds (positive = delayed, negative = advanced)
+        delays = curr_seconds - orig_seconds
+
+        # Aggregate stats (vectorized)
+        total_delay_seconds = float(np.sum(delays))
+        mean_delay_seconds = float(np.mean(delays)) if delays.size > 0 else 0.0
+        max_delay_seconds = float(np.max(delays)) if delays.size > 0 else 0.0
+        min_delay_seconds = float(np.min(delays)) if delays.size > 0 else 0.0
+        delayed_flights_count = int(np.count_nonzero(delays > 0.0))
+
+        # # For debugging: print top 10 most delayed flights (by positive delay)
+        # # Build a list of (flight_id, delay_seconds) and sort descending by delay
+        # try:
+        #     delays_list = list(zip(current_fids, delays.tolist()))
+        #     delayed_only = [(fid, d) for fid, d in delays_list if d > 0]
+        #     delayed_only.sort(key=lambda x: x[1], reverse=True)
+        #     top_n = delayed_only[:10]
+
+        #     if top_n:
+        #         print("\n=== NetworkEvaluator Delay Debug ===")
+        #         print(f"Total flights: {len(current_fids)} | Delayed flights: {delayed_flights_count}")
+        #         print("Top delayed flights (seconds):")
+        #         for i, (fid, dsec) in enumerate(top_n, 1):
+        #             # also show minutes for readability
+        #             dmin = dsec / 60.0
+        #             print(f"  {i:2d}. Flight {fid}: {dsec:.1f}s ({dmin:.1f} min)")
+        #         print("=== End Delay Debug ===\n")
+        # except Exception as _e:
+        #     # Debug printing should never break the evaluator; swallow any unexpected issues.
+        #     pass
+
+        return {
+            "total_delay_seconds": total_delay_seconds,
+            "mean_delay_seconds": mean_delay_seconds,
+            "max_delay_seconds": max_delay_seconds,
+            "min_delay_seconds": min_delay_seconds,
+            "delayed_flights_count": delayed_flights_count,
+            "num_flights": int(delays.size),
+        }
+
+    def compute_horizon_metrics(
+        self, horizon_time_windows: int, percentile_for_z_max: int = 95
+    ) -> Dict[str, float]:
         """
         Compute z_max and z_sum metrics within a specified horizon.
 
@@ -287,18 +393,25 @@ class NetworkEvaluator:
             Dictionary with z_max (maximum excess) and z_sum (total excess)
         """
         excess_vector = self.compute_excess_traffic_vector()
+        delay_vector = self.compute_delay_stats()
 
         # Limit to horizon
         if horizon_time_windows > 0:
             excess_vector = excess_vector[:horizon_time_windows]
 
-        z_max = float(np.percentile(excess_vector, percentile_for_z_max)) if len(excess_vector) > 0 else 0.0
+        z_95 = (
+            float(np.percentile(excess_vector, percentile_for_z_max))
+            if len(excess_vector) > 0
+            else 0.0
+        )
         z_sum = float(np.sum(excess_vector))
 
         return {
-            'z_max': z_max,
-            'z_sum': z_sum,
-            'horizon_windows': len(excess_vector)
+            "z_95": z_95,
+            "z_sum": z_sum,
+            "horizon_windows": len(excess_vector),
+            "total_delay_seconds": delay_vector["total_delay_seconds"],
+            "max_delay_seconds": delay_vector["max_delay_seconds"],
         }
 
     def get_capacity_utilization_stats(self) -> Dict[str, Any]:
@@ -320,15 +433,15 @@ class NetworkEvaluator:
         # If no active TVTWs with capacity, return zero stats
         if len(active_indices) == 0:
             return {
-                'mean_utilization': 0.0,
-                'max_utilization': 0.0,
-                'std_utilization': 0.0,
-                'total_capacity': 0.0,
-                'total_demand': 0.0,
-                'system_utilization': 0.0,
-                'overloaded_tvtws': 0,
-                'total_tvtws_with_capacity': 0,
-                'overload_percentage': 0.0
+                "mean_utilization": 0.0,
+                "max_utilization": 0.0,
+                "std_utilization": 0.0,
+                "total_capacity": 0.0,
+                "total_demand": 0.0,
+                "system_utilization": 0.0,
+                "overloaded_tvtws": 0,
+                "total_tvtws_with_capacity": 0,
+                "overload_percentage": 0.0,
             }
 
         # Filter data for active TVTWs
@@ -340,20 +453,30 @@ class NetworkEvaluator:
 
         # Calculate statistics
         # Note: total_system_capacity is hourly, so we need to sum hourly capacities
-        total_system_capacity = sum(sum(h.values()) for h in self.hourly_capacity_by_tv.values())
+        total_system_capacity = sum(
+            sum(h.values()) for h in self.hourly_capacity_by_tv.values()
+        )
         total_system_demand = float(np.sum(total_occupancy[active_indices]))
         overloaded_count = int(np.sum(excess_vector > 0))
 
         return {
-            'mean_utilization': float(np.mean(utilizations)),
-            'max_utilization': float(np.max(utilizations)),
-            'std_utilization': float(np.std(utilizations)),
-            'total_capacity': total_system_capacity,
-            'total_demand': total_system_demand,
-            'system_utilization': (total_system_demand / total_system_capacity) if total_system_capacity > 0 else 0.0,
-            'overloaded_tvtws': overloaded_count,
-            'total_tvtws_with_capacity': len(utilizations),
-            'overload_percentage': (overloaded_count / len(utilizations) * 100) if len(utilizations) > 0 else 0.0
+            "mean_utilization": float(np.mean(utilizations)),
+            "max_utilization": float(np.max(utilizations)),
+            "std_utilization": float(np.std(utilizations)),
+            "total_capacity": total_system_capacity,
+            "total_demand": total_system_demand,
+            "system_utilization": (
+                (total_system_demand / total_system_capacity)
+                if total_system_capacity > 0
+                else 0.0
+            ),
+            "overloaded_tvtws": overloaded_count,
+            "total_tvtws_with_capacity": len(utilizations),
+            "overload_percentage": (
+                (overloaded_count / len(utilizations) * 100)
+                if len(utilizations) > 0
+                else 0.0
+            ),
         }
 
     def export_results(self, filepath: str, horizon_time_windows: Optional[int] = None):
@@ -365,22 +488,24 @@ class NetworkEvaluator:
             horizon_time_windows: Optional horizon limit for metrics
         """
         results = {
-            'metadata': {
-                'time_bin_minutes': self.time_bin_minutes,
-                'num_flights': self.flight_list.num_flights,
-                'num_tvtws': self.flight_list.num_tvtws,
-                'num_traffic_volumes': len(self.hourly_capacity_by_tv),
-                'analysis_timestamp': datetime.now().isoformat()
+            "metadata": {
+                "time_bin_minutes": self.time_bin_minutes,
+                "num_flights": self.flight_list.num_flights,
+                "num_tvtws": self.flight_list.num_tvtws,
+                "num_traffic_volumes": len(self.hourly_capacity_by_tv),
+                "analysis_timestamp": datetime.now().isoformat(),
             },
-            'excess_traffic_vector': self.compute_excess_traffic_vector().tolist(),
-            'overloaded_tvtws': self.get_overloaded_tvtws(),
-            'utilization_stats': self.get_capacity_utilization_stats()
+            "excess_traffic_vector": self.compute_excess_traffic_vector().tolist(),
+            "overloaded_tvtws": self.get_overloaded_tvtws(),
+            "utilization_stats": self.get_capacity_utilization_stats(),
         }
 
         if horizon_time_windows:
-            results['horizon_metrics'] = self.compute_horizon_metrics(horizon_time_windows)
+            results["horizon_metrics"] = self.compute_horizon_metrics(
+                horizon_time_windows
+            )
 
-        with open(filepath, 'w', encoding='utf-8') as f:
+        with open(filepath, "w", encoding="utf-8") as f:
             json.dump(results, f, indent=2)
 
     def get_traffic_volume_summary(self) -> pd.DataFrame:
@@ -417,14 +542,18 @@ class NetworkEvaluator:
 
             overloaded_bins = np.count_nonzero(excess_vector[tv_indices] > 0)
 
-            summary_data.append({
-                'traffic_volume_id': tv_id,
-                'total_capacity': total_tv_capacity,
-                'total_demand': tv_demand,
-                'total_excess': tv_excess,
-                'utilization_ratio': tv_demand / total_tv_capacity if total_tv_capacity > 0 else 0,
-                'overloaded_bins': overloaded_bins,
-                'active_time_bins': active_bins_count
-            })
+            summary_data.append(
+                {
+                    "traffic_volume_id": tv_id,
+                    "total_capacity": total_tv_capacity,
+                    "total_demand": tv_demand,
+                    "total_excess": tv_excess,
+                    "utilization_ratio": (
+                        tv_demand / total_tv_capacity if total_tv_capacity > 0 else 0
+                    ),
+                    "overloaded_bins": overloaded_bins,
+                    "active_time_bins": active_bins_count,
+                }
+            )
 
-        return pd.DataFrame(summary_data).sort_values('total_excess', ascending=False)
+        return pd.DataFrame(summary_data).sort_values("total_excess", ascending=False)

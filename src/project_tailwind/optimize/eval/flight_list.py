@@ -7,6 +7,7 @@ from typing import Dict, List, Any, Optional
 import numpy as np
 from scipy import sparse
 from datetime import datetime, timedelta
+from copy import deepcopy
 
 
 class FlightList:
@@ -303,6 +304,40 @@ class FlightList:
         Call this method after batch updates for optimal performance.
         """
         self._sync_occupancy_matrix()
+    
+    def copy(self):
+        """Create a deep copy of the FlightList."""
+        # Create new instance with same file paths
+        new_flight_list = FlightList(self.occupancy_file_path, self.tvtw_indexer_path)
+        
+        # Copy the occupancy matrix
+        new_flight_list.occupancy_matrix = self.occupancy_matrix.copy()
+        
+        # Copy flight metadata
+        new_flight_list.flight_metadata = deepcopy(self.flight_metadata)
+        new_flight_list.flight_data = deepcopy(self.flight_data)
+        
+        return new_flight_list
+    
+    def update_flight(self, flight_id: str, updates: Dict[str, Any]):
+        """Update flight data with new values."""
+        if flight_id not in self.flight_id_to_row:
+            raise ValueError(f"Flight ID {flight_id} not found")
+        
+        # Update occupancy vector if provided
+        if "occupancy_vector" in updates:
+            new_occupancy_vector = updates["occupancy_vector"]
+            if hasattr(new_occupancy_vector, '__len__'):
+                # Convert list to numpy array if needed
+                if not isinstance(new_occupancy_vector, np.ndarray):
+                    new_occupancy_vector = np.array(new_occupancy_vector)
+                self.update_flight_occupancy(flight_id, new_occupancy_vector)
+            
+        # Update metadata if provided
+        if flight_id in self.flight_metadata:
+            for key, value in updates.items():
+                if key != "occupancy_vector":
+                    self.flight_metadata[flight_id][key] = value
     
     def get_summary_stats(self) -> Dict[str, Any]:
         """Get summary statistics about the flight data."""
