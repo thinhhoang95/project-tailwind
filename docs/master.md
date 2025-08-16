@@ -42,3 +42,7 @@ It is also capable of getting the raw count for each traffic volume time window 
 ## Flow Extraction
 The flow extraction script is `flow_x/flow_extractor.py`. You can check out the docs in `flow_extractor.md`. A complete example can be found in `tests/test_network_evaluator.py`.
 
+# Scenarios
+From project-cirrus, we launch the scenario_gen module `main.py` to generate multiple scenarios from the original `geojson` file. The outputs are scenario geojson files, such as summer good wx well staffed low/medium/high. Low/medium/high indicate the cut levels: low is easier to solve than medium, and medium is easier to solve than high. It requires a traffic_volumes_with_capacity.geojson file.
+
+There is absolutely no need to recompute the occupancy vectors for each flight: the scenarios just change the capacity values, and do NOT tamper with the indexing system (tvtw_indexer.json) as well as the time bins nor the definition of the traffic volumes. 

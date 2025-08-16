@@ -96,7 +96,8 @@ def _render_group_pretty(name: str, result):
 def load_traffic_volumes_gdf():
     """Load the traffic volumes GeoDataFrame."""
     return gpd.read_file(
-        "/Volumes/CrucialX/project-cirrus/cases/traffic_volumes_with_capacity.geojson"
+        "/Volumes/CrucialX/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
+        # "D:/project-cirrus/output/scenarios/summer_good_wx_well_staffed_low.geojson"
     )
 
 
@@ -155,6 +156,20 @@ def test_hotspot_flight_retrieval():
         print("5. Retrieving hotspot flights (per TV hour)...")
         per_hour = evaluator.get_hotspot_flights(threshold=0.0, mode="hour")
         print(f"   Found {len(per_hour)} (tv, hour) hotspots")
+        
+        # List all hotspot IDs and their row index
+        for item in per_hour:
+            tv_id = item.get("traffic_volume_id")
+            hour = item.get("hour")
+            if tv_id in flight_list.tv_id_to_idx:
+                tv_row_idx = flight_list.tv_id_to_idx[tv_id]
+                print(f"   Hotspot: {tv_id} (row index: {tv_row_idx}), hour: {hour}, "
+                    f"unique_flights: {item.get('unique_flights', 'N/A')}, "
+                    f"hourly_occupancy: {item.get('hourly_occupancy', 'N/A')}, "
+                    f"hourly_capacity: {item.get('hourly_capacity', 'N/A')}, "
+                    f"is_overloaded: {item.get('is_overloaded', 'N/A')}")
+            else:
+                print(f"   Hotspot: {tv_id} (row index: NOT FOUND), hour: {hour}, flights: {len(item['flight_ids'])}, hourly_capacity: {item.get('hourly_capacity', 'N/A')}")
 
         # Locate the designated hotspot (hour or bin) instead of defaulting to the first bin
         bins_per_hour = 60 // flight_list.time_bin_minutes
@@ -184,11 +199,11 @@ def test_hotspot_flight_retrieval():
 
         if selected_hour_item:
             print(
-                f"   Selected hotspot (hour): tv={selected_hour_item['traffic_volume_id']}, hour={selected_hour_item['hour']}, flights={len(selected_hour_item['flight_ids'])}"
+                f"   Selected hotspot (hour): tv={selected_hour_item['traffic_volume_id']}, hour={selected_hour_item['hour']}, flights={len(selected_hour_item['flight_ids'])}, hourly_capacity={selected_hour_item.get('hourly_capacity', 'N/A')}"
             )
         elif selected_bin_item:
             print(
-                f"   Selected hotspot (bin): tvtw_index={selected_bin_item['tvtw_index']}, flights={len(selected_bin_item['flight_ids'])}"
+                f"   Selected hotspot (bin): tvtw_index={selected_bin_item['tvtw_index']}, flights={len(selected_bin_item['flight_ids'])}, hourly_capacity={selected_bin_item.get('hourly_capacity', 'N/A')}"
             )
         # elif per_bin:
         #     # Fallback if the designated hotspot isn't overloaded
@@ -215,8 +230,15 @@ def test_hotspot_flight_retrieval():
             assert "traffic_volume_id" in sample and "hour" in sample and "flight_ids" in sample
             assert isinstance(sample["flight_ids"], list)
             print(
-                f"   Selected hour: tv={sample['traffic_volume_id']}, hour={sample['hour']}, flights={len(sample['flight_ids'])}"
+                f"   Selected hour: tv={sample['traffic_volume_id']}, hour={sample['hour']}, flights={len(sample['flight_ids'])}, hourly_capacity={sample.get('hourly_capacity', 'N/A')}"
             )
+
+
+        
+
+
+
+
 
         # Flow extraction tests
         print("6. Extracting groups from hotspots using FlowXExtractor (spectral)...")

@@ -321,13 +321,17 @@ class NetworkEvaluator:
 
         Returns:
             If mode == "bin": list of {"tvtw_index": int, "flight_ids": List[str]}.
-            If mode == "hour": list of {"traffic_volume_id": str, "hour": int, "flight_ids": List[str]}.
+            If mode == "hour": list of {"traffic_volume_id": str, "hour": int, "flight_ids": List[str], 
+                                        "hourly_occupancy": float, "unique_flights": int}.
         """
         # Compute excess once and determine overloaded indices
         excess_vector = self.compute_excess_traffic_vector()
         overloaded_indices = np.where(excess_vector > threshold)[0]
         if overloaded_indices.size == 0:
             return []
+
+        # Get total occupancy for reporting
+        total_occupancy = self.flight_list.get_total_occupancy_by_tvtw()
 
         # Ensure the CSR is up-to-date, then convert to CSC for fast column accesses
         try:
@@ -351,6 +355,7 @@ class NetworkEvaluator:
             tvtw_to_tv_id[start_idx:end_idx] = tv_id
 
         if mode == "bin":
+            # ... (bin mode code remains the same) ...
             # Slice once to a compact submatrix with only hotspot columns
             sub = occ_csc[:, overloaded_indices]
             rows, sub_cols = sub.nonzero()
@@ -401,21 +406,33 @@ class NetworkEvaluator:
                 start_bin = tv_start + hour * bins_per_hour
                 end_bin = min(start_bin + bins_per_hour, tv_start + num_time_bins_per_tv)
 
-                # Slice CSC once for the hour range and extract unique flight rows
+                # Calculate the ACTUAL hourly occupancy (sum of bin occupancies)
+                # This is what's used in excess calculation
+                hourly_occupancy_sum = 0
+                for bin_idx in range(start_bin, end_bin):
+                    if bin_idx < num_tvtws:
+                        hourly_occupancy_sum += total_occupancy[bin_idx]
+
+                # Get unique flights for this hour
                 sub = occ_csc[:, start_bin:end_bin]
                 hour_rows = np.unique(sub.nonzero()[0])
                 flight_ids = [self.flight_list.flight_ids[r] for r in hour_rows.tolist()]
+                
                 hourly_capacity = self.hourly_capacity_by_tv.get(tv_id, {}).get(int(hour), -1)
                 capacity_per_bin = (
                     float(hourly_capacity) / float(bins_per_hour) if hourly_capacity > -1 else -1
                 )
+                
                 results.append(
                     {
                         "traffic_volume_id": tv_id,
                         "hour": int(hour),
                         "flight_ids": flight_ids,
+                        "unique_flights": len(flight_ids),  # Add unique flight count
+                        "hourly_occupancy": float(hourly_occupancy_sum),  # This is the sum used in excess calc
                         "hourly_capacity": float(hourly_capacity),
                         "capacity_per_bin": float(capacity_per_bin),
+                        "is_overloaded": hourly_occupancy_sum > hourly_capacity,  # Add explicit flag
                     }
                 )
             # Optional: sort by tv_id then hour for stability
@@ -423,6 +440,8 @@ class NetworkEvaluator:
             return results
 
         raise ValueError("mode must be either 'bin' or 'hour'")
+
+
 
     def compute_delay_stats(self) -> Dict[str, float]:
         """
