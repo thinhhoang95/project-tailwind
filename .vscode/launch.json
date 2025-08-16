@@ -38,6 +38,13 @@
             "request": "launch",
             "program": "src/project_tailwind/optimize/alns/orchestrator.py",
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Test Hotspot Flow Retrieval (Debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "tests/test_hotspot_flow_retrieval.py",
+            "console": "integratedTerminal"
         }
     ]
 }

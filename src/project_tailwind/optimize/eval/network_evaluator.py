@@ -1,5 +1,8 @@
 """
 NetworkEvaluator class for computing excess traffic vectors from flight occupancy data.
+
+Some implementation notes:
+_get_total_capacity_vector() also “distributes capacity per bin,” but it is only for reporting; it is not used in excess calculation. Excess uses hourly capacity vs hourly occupancy, then spreads excess across the bins.
 """
 
 import json
@@ -8,6 +11,7 @@ import geopandas as gpd
 from typing import Dict, List, Any, Optional, Tuple
 from datetime import datetime
 import pandas as pd
+from pathlib import Path
 
 from .flight_list import FlightList
 
@@ -303,6 +307,123 @@ class NetworkEvaluator:
 
         return overloaded_tvtws
 
+    def get_hotspot_flights(
+        self,
+        threshold: float = 0.0,
+        mode: str = "bin",
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve flight identifiers for each hotspot.
+
+        Args:
+            threshold: Minimum excess traffic to consider as overloaded.
+            mode: "bin" to return per-TVTW flights; "hour" to return per (traffic_volume_id, hour).
+
+        Returns:
+            If mode == "bin": list of {"tvtw_index": int, "flight_ids": List[str]}.
+            If mode == "hour": list of {"traffic_volume_id": str, "hour": int, "flight_ids": List[str]}.
+        """
+        # Compute excess once and determine overloaded indices
+        excess_vector = self.compute_excess_traffic_vector()
+        overloaded_indices = np.where(excess_vector > threshold)[0]
+        if overloaded_indices.size == 0:
+            return []
+
+        # Ensure the CSR is up-to-date, then convert to CSC for fast column accesses
+        try:
+            # Finalize any pending updates (no-op if none)
+            self.flight_list.finalize_occupancy_updates()
+        except Exception:
+            pass
+
+        occ_csc = self.flight_list.occupancy_matrix.tocsc(copy=False)
+        num_tvtws = self.flight_list.num_tvtws
+
+        # Precompute TVTW -> (tv_id, hour) mapping helpers
+        num_time_bins_per_tv = num_tvtws // len(self.tv_id_to_idx)
+        bins_per_hour = 60 // self.time_bin_minutes
+
+        # Build reverse mapping from contiguous TVTW ranges to tv_id for vectorized math
+        tvtw_to_tv_id = np.full(num_tvtws, None, dtype=object)
+        for tv_id, tv_row in self.tv_id_to_idx.items():
+            start_idx = tv_row * num_time_bins_per_tv
+            end_idx = start_idx + num_time_bins_per_tv
+            tvtw_to_tv_id[start_idx:end_idx] = tv_id
+
+        if mode == "bin":
+            # Slice once to a compact submatrix with only hotspot columns
+            sub = occ_csc[:, overloaded_indices]
+            rows, sub_cols = sub.nonzero()
+            # Group rows by sub-column index (within the submatrix)
+            flights_by_subcol: Dict[int, List[str]] = {}
+            for r, c in zip(rows.tolist(), sub_cols.tolist()):
+                flights_by_subcol.setdefault(c, []).append(self.flight_list.flight_ids[r])
+
+            # Map back to original TVTW indices
+            results: List[Dict[str, Any]] = []
+            for local_col_idx, tvtw_idx in enumerate(overloaded_indices.tolist()):
+                # Derive tv/hour to compute capacity
+                tv_id = tvtw_to_tv_id[tvtw_idx]
+                tv_row = self.tv_id_to_idx[tv_id]
+                tv_start = tv_row * num_time_bins_per_tv
+                bin_offset = int(tvtw_idx - tv_start)
+                hour = int(bin_offset // bins_per_hour)
+                hourly_capacity = self.hourly_capacity_by_tv.get(tv_id, {}).get(hour, -1)
+                capacity_per_bin = (
+                    float(hourly_capacity) / float(bins_per_hour) if hourly_capacity > -1 else -1
+                )
+                results.append(
+                    {
+                        "tvtw_index": int(tvtw_idx),
+                        "flight_ids": flights_by_subcol.get(local_col_idx, []),
+                        "hourly_capacity": float(hourly_capacity),
+                        "capacity_per_bin": float(capacity_per_bin),
+                    }
+                )
+            return results
+
+        if mode == "hour":
+            # Group overloaded indices by (tv_id, hour)
+            groups: Dict[Tuple[str, int], None] = {}
+            for idx in overloaded_indices.tolist():
+                tv_id = tvtw_to_tv_id[idx]
+                tv_row = self.tv_id_to_idx[tv_id]
+                tv_start = tv_row * num_time_bins_per_tv
+                bin_offset = idx - tv_start
+                hour = int(bin_offset // bins_per_hour)
+                groups[(tv_id, hour)] = None
+
+            # For each (tv, hour), take union of flights over all bins in the hour
+            results: List[Dict[str, Any]] = []
+            for (tv_id, hour) in groups.keys():
+                tv_row = self.tv_id_to_idx[tv_id]
+                tv_start = tv_row * num_time_bins_per_tv
+                start_bin = tv_start + hour * bins_per_hour
+                end_bin = min(start_bin + bins_per_hour, tv_start + num_time_bins_per_tv)
+
+                # Slice CSC once for the hour range and extract unique flight rows
+                sub = occ_csc[:, start_bin:end_bin]
+                hour_rows = np.unique(sub.nonzero()[0])
+                flight_ids = [self.flight_list.flight_ids[r] for r in hour_rows.tolist()]
+                hourly_capacity = self.hourly_capacity_by_tv.get(tv_id, {}).get(int(hour), -1)
+                capacity_per_bin = (
+                    float(hourly_capacity) / float(bins_per_hour) if hourly_capacity > -1 else -1
+                )
+                results.append(
+                    {
+                        "traffic_volume_id": tv_id,
+                        "hour": int(hour),
+                        "flight_ids": flight_ids,
+                        "hourly_capacity": float(hourly_capacity),
+                        "capacity_per_bin": float(capacity_per_bin),
+                    }
+                )
+            # Optional: sort by tv_id then hour for stability
+            results.sort(key=lambda x: (x["traffic_volume_id"], x["hour"]))
+            return results
+
+        raise ValueError("mode must be either 'bin' or 'hour'")
+
     def compute_delay_stats(self) -> Dict[str, float]:
         """
         Compute delay statistics by comparing current assigned takeoff times
@@ -571,3 +692,75 @@ class NetworkEvaluator:
             )
 
         return pd.DataFrame(summary_data).sort_values("total_excess", ascending=False)
+
+    def get_raw_tvtw_counts_df(self) -> pd.DataFrame:
+        """
+        Build a DataFrame with the raw flight count for every Traffic-Volume-Time-Window (TVTW).
+
+        Returns:
+            DataFrame with columns: traffic_volume_id, time_window, raw_count
+        """
+        total_occupancy = self.flight_list.get_total_occupancy_by_tvtw()
+        num_tvtws = self.flight_list.num_tvtws
+
+        # Dimensions
+        num_traffic_volumes = len(self.tv_id_to_idx)
+        if num_traffic_volumes == 0:
+            return pd.DataFrame(columns=["traffic_volume_id", "time_window", "raw_count"])
+
+        num_time_bins_per_tv = num_tvtws // num_traffic_volumes
+        bins_per_hour = 60 // self.time_bin_minutes
+
+        def _format_time_window(bin_offset: int) -> str:
+            # Start time (minutes from 00:00)
+            start_total_min = int(bin_offset * self.time_bin_minutes)
+            start_hour = start_total_min // 60
+            start_min = start_total_min % 60
+
+            # End time
+            end_total_min = start_total_min + self.time_bin_minutes
+            if end_total_min == 24 * 60:
+                end_str = "24:00"
+            else:
+                end_hour = (end_total_min // 60) % 24
+                end_min = end_total_min % 60
+                end_str = f"{end_hour:02d}:{end_min:02d}"
+
+            start_str = f"{start_hour:02d}:{start_min:02d}"
+            return f"{start_str}-{end_str}"
+
+        rows: List[Dict[str, Any]] = []
+        for tv_id, tv_row in self.tv_id_to_idx.items():
+            tv_start = tv_row * num_time_bins_per_tv
+            tv_end = tv_start + num_time_bins_per_tv
+
+            for bin_offset in range(num_time_bins_per_tv):
+                tvtw_idx = tv_start + bin_offset
+                if tvtw_idx >= num_tvtws:
+                    break
+                rows.append(
+                    {
+                        "traffic_volume_id": tv_id,
+                        "time_window": _format_time_window(bin_offset),
+                        "raw_count": int(total_occupancy[tvtw_idx]),
+                    }
+                )
+
+        df = pd.DataFrame(rows, columns=["traffic_volume_id", "time_window", "raw_count"])
+        # Stable sort by TV then by time window label
+        if not df.empty:
+            df.sort_values(["traffic_volume_id", "time_window"], inplace=True)
+            df.reset_index(drop=True, inplace=True)
+        return df
+
+    def export_raw_tvtw_counts_csv(self, filepath: str) -> None:
+        """
+        Export a CSV with the raw flight count for every TVTW.
+
+        Args:
+            filepath: Destination CSV path.
+        """
+        df = self.get_raw_tvtw_counts_df()
+        out_path = Path(filepath)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out_path, index=False)

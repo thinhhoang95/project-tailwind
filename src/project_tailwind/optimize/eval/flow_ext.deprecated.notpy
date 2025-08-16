@@ -1,0 +1,559 @@
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+from scipy import sparse
+
+from .flight_list import FlightList
+
+
+class FlowExtractor:
+    """
+    Extract upstream "flows" for a hotspot using the occupancy matrix and per-interval metadata.
+
+    New methodology:
+    - For a given hotspot (traffic_volume_id + hour, or a TVTW bin), compute, for each flight,
+      the upstream TV footprint (TV-level, not TVTW) prior to the hotspot entry time.
+    - Build a Jaccard-similarity graph over these binary footprints and retain edges whose
+      similarity >= edge_threshold.
+    - Cluster the graph using Leiden (RBConfiguration) with a resolution parameter.
+    """
+
+    def __init__(self, flight_list: FlightList):
+        self.flight_list = flight_list
+
+        # Precompute mapping helpers
+        self.time_bin_minutes: int = self.flight_list.time_bin_minutes
+        self.bins_per_hour: int = 60 // self.time_bin_minutes
+        self.num_tvtws: int = self.flight_list.num_tvtws
+        self.num_tvs: int = len(self.flight_list.tv_id_to_idx)
+        self.num_time_bins_per_tv: int = self.num_tvtws // self.num_tvs
+
+        # tv_id -> row and inverse row -> tv_id
+        self.tv_id_to_row: Dict[str, int] = self.flight_list.tv_id_to_idx
+        self.row_to_tv_id: List[Optional[str]] = [None] * self.num_tvs
+        for tv_id, row in self.tv_id_to_row.items():
+            if 0 <= row < self.num_tvs:
+                self.row_to_tv_id[row] = tv_id
+
+    def _tvtw_to_tv_row_and_hour(self, tvtw_index: int) -> Tuple[int, int]:
+        tv_row = tvtw_index // self.num_time_bins_per_tv
+        bin_offset = tvtw_index % self.num_time_bins_per_tv
+        hour = bin_offset // self.bins_per_hour
+        return tv_row, hour
+
+    def _tv_row_to_id(self, tv_row: int) -> str:
+        tv_id = self.row_to_tv_id[tv_row]
+        if tv_id is None:
+            raise ValueError(f"Unknown tv_row {tv_row}")
+        return tv_id
+
+    def _prepare_intervals_for_flights(
+        self, flight_ids: List[str]
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Build flattened arrays over intervals of the selected flights:
+        - flight_rows_per_interval
+        - tvtw_indices_per_interval
+        - entry_time_seconds_per_interval
+        """
+        flight_id_to_row = self.flight_list.flight_id_to_row
+        rows: List[int] = []
+        tvtw_indices: List[int] = []
+        entry_times: List[float] = []
+
+        for fid in flight_ids:
+            row = flight_id_to_row.get(fid)
+            if row is None:
+                continue
+            intervals = self.flight_list.flight_metadata[fid]["occupancy_intervals"]
+            for interval in intervals:
+                rows.append(row)
+                tvtw_indices.append(int(interval["tvtw_index"]))
+                entry_times.append(float(interval["entry_time_s"]))
+
+        if not rows:
+            return (
+                np.empty((0,), dtype=np.int64),
+                np.empty((0,), dtype=np.int64),
+                np.empty((0,), dtype=np.float64),
+            )
+
+        return (
+            np.asarray(rows, dtype=np.int64),
+            np.asarray(tvtw_indices, dtype=np.int64),
+            np.asarray(entry_times, dtype=np.float64),
+        )
+
+    def _compute_reference_times(
+        self,
+        flight_rows: np.ndarray,
+        tvtw_indices: np.ndarray,
+        entry_times: np.ndarray,
+        hotspot_tv_row: int,
+        hotspot_hour: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        For each flight, compute the earliest entry_time among intervals that fall into the
+        hotspot TV row and hour. Returns (unique_flight_rows, t0_times_by_unique_flight, mask_for_intervals_with_valid_t0).
+        """
+        if flight_rows.size == 0:
+            return (
+                np.empty((0,), dtype=np.int64),
+                np.empty((0,), dtype=np.float64),
+                np.zeros((0,), dtype=bool),
+            )
+
+        tv_rows_all = tvtw_indices // self.num_time_bins_per_tv
+        bin_offsets_all = tvtw_indices % self.num_time_bins_per_tv
+        hours_all = bin_offsets_all // self.bins_per_hour
+
+        is_target = (tv_rows_all == hotspot_tv_row) & (hours_all == hotspot_hour)
+        if not np.any(is_target):
+            return (
+                np.empty((0,), dtype=np.int64),
+                np.empty((0,), dtype=np.float64),
+                np.zeros(flight_rows.shape, dtype=bool),
+            )
+
+        fr_target = flight_rows[is_target]
+        et_target = entry_times[is_target]
+
+        # Compute per-flight min entry time at the hotspot hour
+        order = np.argsort(fr_target, kind="mergesort")
+        fr_sorted = fr_target[order]
+        et_sorted = et_target[order]
+        unique_fr, idx_start, counts = np.unique(fr_sorted, return_index=True, return_counts=True)
+        # Use ufunc.reduceat for minimums per group
+        t0_times = np.minimum.reduceat(et_sorted, idx_start)
+
+        # Map interval flight_rows -> t0_time (inf if missing)
+        # unique_fr is sorted ascending
+        pos = np.searchsorted(unique_fr, flight_rows)
+        found = (pos < unique_fr.size) & (unique_fr[pos] == flight_rows)
+        t0_by_interval = np.full(flight_rows.shape, np.inf, dtype=np.float64)
+        valid_pos = pos[found]
+        t0_by_interval[found] = t0_times[valid_pos]
+
+        has_valid_t0_mask = found
+        return unique_fr, t0_times, has_valid_t0_mask & (entry_times < t0_by_interval)
+
+    def _build_upstream_sequences(
+        self,
+        flight_rows: np.ndarray,
+        tvtw_indices: np.ndarray,
+        entry_times: np.ndarray,
+        upstream_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Build per-flight upstream sequences of TV rows (nearest first), collapsing consecutive
+        repeats within a TV. Returns (seq_flight_rows, seq_tv_rows) where the arrays are sorted
+        by flight row and entry time descending, and already deduplicated for consecutive TVs.
+        """
+        if not np.any(upstream_mask):
+            return (
+                np.empty((0,), dtype=np.int64),
+                np.empty((0,), dtype=np.int64),
+            )
+
+        fr_u = flight_rows[upstream_mask]
+        tvtw_u = tvtw_indices[upstream_mask]
+        et_u = entry_times[upstream_mask]
+
+        tv_row_u = tvtw_u // self.num_time_bins_per_tv
+
+        # Sort by flight row asc, entry time desc
+        # lexsort uses last key first, so ( -et_u, fr_u ) yields fr asc then entry desc
+        order = np.lexsort(( -et_u, fr_u ))
+        fr_s = fr_u[order]
+        tv_s = tv_row_u[order]
+
+        # Collapse consecutive identical TVs within each flight
+        keep = np.ones(fr_s.shape[0], dtype=bool)
+        if keep.size > 1:
+            same_flight = fr_s[1:] == fr_s[:-1]
+            same_tv = tv_s[1:] == tv_s[:-1]
+            keep[1:] = ~(same_flight & same_tv)
+
+        return fr_s[keep], tv_s[keep]
+
+    # Removed old stepwise grouping utilities in favor of similarity-based clustering
+
+    # --- New similarity + clustering pipeline based on upstream TV footprints ---
+    def _build_upstream_tv_footprint_matrix(
+        self,
+        flight_rows: np.ndarray,
+        tvtw_indices: np.ndarray,
+        entry_times: np.ndarray,
+        unique_fr: np.ndarray,
+        upstream_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, sparse.csr_matrix]:
+        """
+        Build a binary footprint matrix of shape (num_unique_flights, num_tvs) where
+        [i, j] = 1 if flight i occupies TV-row j upstream of its hotspot entry time.
+
+        The mapping of global flight rows to compact [0..num_unique_flights-1] indices
+        follows the sorted order in unique_fr.
+        """
+        if unique_fr.size == 0:
+            return unique_fr, sparse.csr_matrix((0, self.num_tvs), dtype=np.float32)
+
+        if not np.any(upstream_mask):
+            # No upstream intervals (all flights start at hotspot)
+            return unique_fr, sparse.csr_matrix((unique_fr.size, self.num_tvs), dtype=np.float32)
+
+        # Select upstream intervals only
+        fr_u = flight_rows[upstream_mask]
+        tvtw_u = tvtw_indices[upstream_mask]
+
+        # Map TVTWs to TV rows and deduplicate per-flight
+        tv_rows_u = tvtw_u // self.num_time_bins_per_tv
+
+        # Unique (flight_row, tv_row) pairs
+        combined = fr_u.astype(np.int64) * np.int64(self.num_tvs) + tv_rows_u.astype(np.int64)
+        combined_unique = np.unique(combined)
+        global_fr_vals = (combined_unique // np.int64(self.num_tvs)).astype(np.int64)
+        tv_row_vals = (combined_unique % np.int64(self.num_tvs)).astype(np.int64)
+
+        # Map global flight rows -> compact indices via searchsorted (unique_fr is sorted)
+        row_pos = np.searchsorted(unique_fr, global_fr_vals)
+        # Safety mask in case of any unexpected mismatch
+        valid_mask = (row_pos < unique_fr.size) & (unique_fr[row_pos] == global_fr_vals)
+        if not np.all(valid_mask):
+            row_pos = row_pos[valid_mask]
+            tv_row_vals = tv_row_vals[valid_mask]
+
+        data = np.ones(row_pos.shape[0], dtype=np.float32)
+        footprint = sparse.csr_matrix(
+            (data, (row_pos, tv_row_vals)), shape=(unique_fr.size, self.num_tvs), dtype=np.float32
+        )
+
+        # Binarize explicitly (in case duplicates slipped through)
+        footprint.data[:] = 1.0
+        footprint.eliminate_zeros()
+        return unique_fr, footprint
+
+    def _pairwise_jaccard_edges(
+        self,
+        footprint: sparse.csr_matrix,
+        min_similarity_for_edge: float,
+    ) -> Tuple[List[Tuple[int, int]], List[float]]:
+        """
+        Compute pairwise Jaccard similarities between rows of the binary footprint matrix.
+        Return undirected edges (i, j) with weight = similarity, keeping only those with
+        similarity >= min_similarity_for_edge.
+        """
+        num_rows = footprint.shape[0]
+        if num_rows == 0:
+            return [], []
+
+        # Intersection counts via sparse dot product (binary footprints)
+        intersections = footprint @ footprint.T  # csr @ csr -> csr
+        intersections = intersections.tocoo()
+
+        # Row degrees (# of TVs in each flight's upstream footprint)
+        degrees = np.asarray(footprint.getnnz(axis=1)).astype(np.int64)
+
+        edges: List[Tuple[int, int]] = []
+        weights: List[float] = []
+
+        # Consider only upper triangle (i < j)
+        i_idx = intersections.row
+        j_idx = intersections.col
+        vals = intersections.data
+
+        upper_mask = i_idx < j_idx
+        i_idx = i_idx[upper_mask]
+        j_idx = j_idx[upper_mask]
+        vals = vals[upper_mask]
+
+        if i_idx.size == 0:
+            return [], []
+
+        deg_i = degrees[i_idx]
+        deg_j = degrees[j_idx]
+        union = (deg_i + deg_j - vals).astype(np.float32)
+        # Avoid divide-by-zero; where union == 0, similarity = 0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sim = np.where(union > 0.0, (vals.astype(np.float32) / union), 0.0)
+
+        keep = sim >= float(min_similarity_for_edge)
+        if np.any(keep):
+            edges = list(zip(i_idx[keep].tolist(), j_idx[keep].tolist()))
+            weights = sim[keep].astype(float).tolist()
+        else:
+            edges, weights = [], []
+
+        return edges, weights
+
+    def cluster_upstream_from_hotspot_hour(
+        self,
+        hotspot_tv_id: str,
+        hotspot_hour: int,
+        candidate_flight_ids: List[str],
+        edge_threshold: float = 0.3,
+        resolution: float = 1.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Cluster candidate flights by similarity of their upstream TV footprints relative to a
+        hotspot (traffic_volume_id, hour).
+
+        - Build binary upstream TV footprints per flight (TV-level, not TVTW)
+        - Form graph edges where Jaccard similarity >= edge_threshold
+        - Run Leiden clustering (RBConfiguration) with configurable resolution
+        """
+        if not candidate_flight_ids:
+            return []
+
+        if hotspot_tv_id not in self.tv_id_to_row:
+            raise ValueError(f"Unknown traffic_volume_id: {hotspot_tv_id}")
+
+        hotspot_tv_row = self.tv_id_to_row[hotspot_tv_id]
+
+        # Build flattened intervals for the subset of flights
+        flight_rows_all, tvtw_indices_all, entry_times_all = self._prepare_intervals_for_flights(
+            candidate_flight_ids
+        )
+
+        if flight_rows_all.size == 0:
+            return []
+
+        # Compute per-flight reference time at hotspot tv/hour and upstream mask
+        unique_fr, _t0_times, upstream_mask = self._compute_reference_times(
+            flight_rows_all,
+            tvtw_indices_all,
+            entry_times_all,
+            hotspot_tv_row,
+            int(hotspot_hour),
+        )
+
+        if unique_fr.size == 0:
+            return []
+
+        # Build binary upstream TV footprint matrix
+        unique_fr, footprint = self._build_upstream_tv_footprint_matrix(
+            flight_rows_all, tvtw_indices_all, entry_times_all, unique_fr, upstream_mask
+        )
+
+        # Build similarity graph (edges >= threshold)
+        edges, weights = self._pairwise_jaccard_edges(footprint, edge_threshold)
+
+        # Map rows back to flight_ids for output
+        row_to_fid: Dict[int, str] = {}
+        # Build reverse mapping once for all candidates
+        fid_to_row = self.flight_list.flight_id_to_row
+        for fid in candidate_flight_ids:
+            if fid in fid_to_row:
+                row_to_fid[fid_to_row[fid]] = fid
+
+        # Convert compact row indices -> flight_ids
+        compact_idx_to_fid: List[Optional[str]] = [None] * unique_fr.size
+        for idx, fr in enumerate(unique_fr.tolist()):
+            compact_idx_to_fid[idx] = row_to_fid.get(int(fr))
+
+        # If no edges but we have vertices, return singleton clusters
+        if unique_fr.size > 0 and len(edges) == 0:
+            results: List[Dict[str, Any]] = []
+            # Keep order stable by original compact index
+            membership = list(range(unique_fr.size))
+            # Group singletons
+            for idx in range(unique_fr.size):
+                fid = compact_idx_to_fid[idx]
+                if fid is None:
+                    continue
+                results.append(
+                    {
+                        "cluster_rank": len(results) + 1,
+                        "cluster_size": 1,
+                        "flight_ids": [fid],
+                        "hotspot": {
+                            "traffic_volume_id": hotspot_tv_id,
+                            "hour": int(hotspot_hour),
+                        },
+                        "edge_threshold": float(edge_threshold),
+                    }
+                )
+            return results
+
+        # Build igraph and run Leiden (lazy import to avoid hard dependency unless used)
+        try:
+            import igraph as ig  # type: ignore
+            import leidenalg as la  # type: ignore
+        except Exception as e:
+            raise ImportError(
+                "Clustering requires python-igraph and leidenalg to be installed."
+            ) from e
+
+        g = ig.Graph(n=unique_fr.size, edges=edges, directed=False)
+        if len(weights) > 0:
+            partition = la.find_partition(
+                g,
+                la.RBConfigurationVertexPartition,
+                weights=weights,
+                resolution_parameter=float(resolution),
+            )
+        else:
+            partition = la.find_partition(
+                g,
+                la.RBConfigurationVertexPartition,
+                resolution_parameter=float(resolution),
+            )
+
+        membership = partition.membership  # List[int] of length n
+
+        # Group flights by community
+        community_to_indices: Dict[int, List[int]] = {}
+        for idx, comm in enumerate(membership):
+            community_to_indices.setdefault(int(comm), []).append(idx)
+
+        # Sort communities by size desc
+        communities_sorted = sorted(
+            community_to_indices.items(), key=lambda kv: len(kv[1]), reverse=True
+        )
+
+        results: List[Dict[str, Any]] = []
+        for rank, (_comm, idxs) in enumerate(communities_sorted, start=1):
+            fids = [compact_idx_to_fid[i] for i in idxs]
+            fids = [fid for fid in fids if fid is not None]
+            results.append(
+                {
+                    "cluster_rank": rank,
+                    "cluster_size": len(fids),
+                    "flight_ids": fids,
+                    "hotspot": {
+                        "traffic_volume_id": hotspot_tv_id,
+                        "hour": int(hotspot_hour),
+                    },
+                    "edge_threshold": float(edge_threshold),
+                }
+            )
+
+        return results
+
+    def cluster_upstream_from_hotspot_bin(
+        self,
+        hotspot_tvtw_index: int,
+        candidate_flight_ids: List[str],
+        edge_threshold: float = 0.3,
+        resolution: float = 1.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Convenience wrapper when the hotspot is specified as a TVTW index. The hour is derived
+        from the TVTW index.
+        """
+        tv_row, hour = self._tvtw_to_tv_row_and_hour(int(hotspot_tvtw_index))
+        tv_id = self._tv_row_to_id(tv_row)
+        return self.cluster_upstream_from_hotspot_hour(
+            tv_id, int(hour), candidate_flight_ids, edge_threshold=edge_threshold, resolution=resolution
+        )
+
+    def cluster_from_evaluator_item(
+        self,
+        hotspot_item: Dict[str, Any],
+        edge_threshold: float = 0.3,
+        resolution: float = 1.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Accepts one item returned from NetworkEvaluator.get_hotspot_flights(...):
+        - If the item contains {"traffic_volume_id", "hour", "flight_ids"}, uses hour-mode.
+        - If the item contains {"tvtw_index", "flight_ids"}, uses bin-mode.
+        Clusters by upstream TV footprint similarity with a Jaccard threshold.
+        """
+        if not hotspot_item or "flight_ids" not in hotspot_item:
+            return []
+
+        flight_ids = hotspot_item.get("flight_ids", [])
+        if "traffic_volume_id" in hotspot_item and "hour" in hotspot_item:
+            return self.cluster_upstream_from_hotspot_hour(
+                hotspot_item["traffic_volume_id"],
+                int(hotspot_item["hour"]),
+                flight_ids,
+                edge_threshold=edge_threshold,
+                resolution=resolution,
+            )
+
+        if "tvtw_index" in hotspot_item:
+            return self.cluster_upstream_from_hotspot_bin(
+                int(hotspot_item["tvtw_index"]),
+                flight_ids,
+                edge_threshold=edge_threshold,
+                resolution=resolution,
+            )
+
+        raise ValueError("Unsupported hotspot item format")
+
+    def extract_from_hotspot_hour(
+        self,
+        hotspot_tv_id: str,
+        hotspot_hour: int,
+        candidate_flight_ids: List[str],
+        edge_threshold: float = 0.3,
+        resolution: float = 1.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Cluster candidate flights by upstream TV-footprint similarity for a hotspot
+        defined by (traffic_volume_id, hour).
+
+        Args:
+            hotspot_tv_id: Traffic volume identifier of the hotspot
+            hotspot_hour: Hour index within the day
+            candidate_flight_ids: Flights to consider
+            edge_threshold: Minimum Jaccard similarity to form an edge
+            resolution: Leiden resolution parameter
+        """
+        return self.cluster_upstream_from_hotspot_hour(
+            hotspot_tv_id,
+            int(hotspot_hour),
+            candidate_flight_ids,
+            edge_threshold=edge_threshold,
+            resolution=resolution,
+        )
+
+    def extract_from_hotspot_bin(
+        self,
+        hotspot_tvtw_index: int,
+        candidate_flight_ids: List[str],
+        edge_threshold: float = 0.3,
+        resolution: float = 1.0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Convenience wrapper when the hotspot is specified as a TVTW index. The hour is derived
+        from the TVTW index.
+        """
+        return self.cluster_upstream_from_hotspot_bin(
+            int(hotspot_tvtw_index),
+            candidate_flight_ids,
+            edge_threshold=edge_threshold,
+            resolution=resolution,
+        )
+
+    def extract_from_evaluator_item(
+        self,
+        hotspot_item: Dict[str, Any],
+        keep_top_n_groups: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Accepts one item returned from NetworkEvaluator.get_hotspot_flights(...):
+        - If the item contains {"traffic_volume_id", "hour", "flight_ids"}, uses hour-mode.
+        - If the item contains {"tvtw_index", "flight_ids"}, uses bin-mode.
+        """
+        if not hotspot_item or "flight_ids" not in hotspot_item:
+            return []
+
+        flight_ids = hotspot_item.get("flight_ids", [])
+        if "traffic_volume_id" in hotspot_item and "hour" in hotspot_item:
+            return self.extract_from_hotspot_hour(
+                hotspot_item["traffic_volume_id"],
+                int(hotspot_item["hour"]),
+                flight_ids,
+                keep_top_n_groups,
+            )
+
+        if "tvtw_index" in hotspot_item:
+            return self.extract_from_hotspot_bin(
+                int(hotspot_item["tvtw_index"]),
+                flight_ids,
+                keep_top_n_groups,
+            )
+
+        raise ValueError("Unsupported hotspot item format")
+
