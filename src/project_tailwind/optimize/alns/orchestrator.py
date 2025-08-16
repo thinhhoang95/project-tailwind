@@ -19,7 +19,7 @@ from project_tailwind.optimize.debug import console, is_debug_enabled, set_debug
 
 
 DATA_DIR = "output"
-TRAFFIC_VOLUMES_PATH = "/Volumes/CrucialX/project-cirrus/cases/traffic_volumes_simplified.geojson"
+TRAFFIC_VOLUMES_PATH = "D:/project-cirrus/cases/traffic_volumes_simplified.geojson"
 OBJECTIVE_WEIGHTS = {"z_95": 1.0, "z_sum": 1.0, "delay": 0.01}
 HORIZON_TIME_WINDOWS = 100
 DEFAULT_REGULATIONS = [

@@ -192,14 +192,15 @@ def compute_occupancy_for_flight(
 def main():
     parser = argparse.ArgumentParser(description="Compute occupancy matrix from SO6 flight data.")
     parser.add_argument("--so6_path", type=str, required=False, default="D:/project-cirrus/cases/flights_20230801.csv", help="Path to the SO6 flight data CSV file.")
-    parser.add_argument("--tv_path", type=str, required=False, default="D:/project-cirrus/cases/traffic_volumes_simplified.geojson", help="Path to the traffic volumes GeoJSON file.")
+    # Attention: this code currently uses full traffic volumes, not simplified!
+    parser.add_argument("--tv_path", type=str, required=False, default="D:/project-cirrus/cases/traffic_volumes_with_capacity.geojson", help="Path to the traffic volumes GeoJSON file.") 
     parser.add_argument("--output_path", type=str, required=False, default="output/so6_occupancy_matrix_with_times.json", help="Path to save the output JSON file with occupancy intervals.")
     parser.add_argument("--tvtw_indexer_path", type=str, required=False, default="output/tvtw_indexer.json", help="Path to save or load the TVTW indexer. If not provided, defaults to a path next to the output.")
     parser.add_argument("--n_jobs", type=int, default=None, help="Number of parallel jobs. Defaults to CPU count.")
     parser.add_argument("--time_bin_minutes", type=int, default=15, help="Time bin duration in minutes for TVTWs.")
     args = parser.parse_args()
 
-    n_jobs = args.n_jobs if args.n_jobs is not None else (cpu_count() - 3)
+    n_jobs = args.n_jobs if args.n_jobs is not None else (cpu_count())
     tvtw_indexer_path = args.tvtw_indexer_path or os.path.join(os.path.dirname(args.output_path), "tvtw_indexer.json")
 
 

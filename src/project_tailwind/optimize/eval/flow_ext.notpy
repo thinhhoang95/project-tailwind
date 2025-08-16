@@ -1,0 +1,442 @@
+# This version will allow some flexibility when the traffic volumes do not 
+# necessarily match in order.
+
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+from .flight_list import FlightList
+
+
+class FlowExtractor:
+    """
+    Extract upstream "flows" for a hotspot using the occupancy matrix and per-interval metadata.
+
+    The extractor starts at a hotspot (traffic_volume_id + hour, or a TVTW bin) and traces
+    upstream along each flight's occupied TVs (ordered by entry_time) to form groups of flights
+    that share similar upstream TV footprints. As the upstream depth increases, groups split; if
+    the number of groups exceeds keep_top_n_groups, the smallest groups are pruned. Tracing
+    continues until the origin (or no more upstream TVs) for the surviving groups.
+    """
+
+    def __init__(self, flight_list: FlightList):
+        self.flight_list = flight_list
+
+        # Precompute mapping helpers
+        self.time_bin_minutes: int = self.flight_list.time_bin_minutes
+        self.bins_per_hour: int = 60 // self.time_bin_minutes
+        self.num_tvtws: int = self.flight_list.num_tvtws
+        self.num_tvs: int = len(self.flight_list.tv_id_to_idx)
+        self.num_time_bins_per_tv: int = self.num_tvtws // self.num_tvs
+
+        # tv_id -> row and inverse row -> tv_id
+        self.tv_id_to_row: Dict[str, int] = self.flight_list.tv_id_to_idx
+        self.row_to_tv_id: List[Optional[str]] = [None] * self.num_tvs
+        for tv_id, row in self.tv_id_to_row.items():
+            if 0 <= row < self.num_tvs:
+                self.row_to_tv_id[row] = tv_id
+
+    def _tvtw_to_tv_row_and_hour(self, tvtw_index: int) -> Tuple[int, int]:
+        tv_row = tvtw_index // self.num_time_bins_per_tv
+        bin_offset = tvtw_index % self.num_time_bins_per_tv
+        hour = bin_offset // self.bins_per_hour
+        return tv_row, hour
+
+    def _tv_row_to_id(self, tv_row: int) -> str:
+        tv_id = self.row_to_tv_id[tv_row]
+        if tv_id is None:
+            raise ValueError(f"Unknown tv_row {tv_row}")
+        return tv_id
+
+    def _prepare_intervals_for_flights(
+        self, flight_ids: List[str]
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Build flattened arrays over intervals of the selected flights:
+        - flight_rows_per_interval
+        - tvtw_indices_per_interval
+        - entry_time_seconds_per_interval
+        """
+        flight_id_to_row = self.flight_list.flight_id_to_row
+        rows: List[int] = []
+        tvtw_indices: List[int] = []
+        entry_times: List[float] = []
+
+        for fid in flight_ids:
+            row = flight_id_to_row.get(fid)
+            if row is None:
+                continue
+            intervals = self.flight_list.flight_metadata[fid]["occupancy_intervals"]
+            for interval in intervals:
+                rows.append(row)
+                tvtw_indices.append(int(interval["tvtw_index"]))
+                entry_times.append(float(interval["entry_time_s"]))
+
+        if not rows:
+            return (
+                np.empty((0,), dtype=np.int64),
+                np.empty((0,), dtype=np.int64),
+                np.empty((0,), dtype=np.float64),
+            )
+
+        return (
+            np.asarray(rows, dtype=np.int64),
+            np.asarray(tvtw_indices, dtype=np.int64),
+            np.asarray(entry_times, dtype=np.float64),
+        )
+
+    def _compute_reference_times(
+        self,
+        flight_rows: np.ndarray,
+        tvtw_indices: np.ndarray,
+        entry_times: np.ndarray,
+        hotspot_tv_row: int,
+        hotspot_hour: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        For each flight, compute the earliest entry_time among intervals that fall into the
+        hotspot TV row and hour. Returns (unique_flight_rows, t0_times_by_unique_flight, mask_for_intervals_with_valid_t0).
+        """
+        if flight_rows.size == 0:
+            return (
+                np.empty((0,), dtype=np.int64),
+                np.empty((0,), dtype=np.float64),
+                np.zeros((0,), dtype=bool),
+            )
+
+        tv_rows_all = tvtw_indices // self.num_time_bins_per_tv
+        bin_offsets_all = tvtw_indices % self.num_time_bins_per_tv
+        hours_all = bin_offsets_all // self.bins_per_hour
+
+        is_target = (tv_rows_all == hotspot_tv_row) & (hours_all == hotspot_hour)
+        if not np.any(is_target):
+            return (
+                np.empty((0,), dtype=np.int64),
+                np.empty((0,), dtype=np.float64),
+                np.zeros(flight_rows.shape, dtype=bool),
+            )
+
+        fr_target = flight_rows[is_target]
+        et_target = entry_times[is_target]
+
+        # Compute per-flight min entry time at the hotspot hour
+        order = np.argsort(fr_target, kind="mergesort")
+        fr_sorted = fr_target[order]
+        et_sorted = et_target[order]
+        unique_fr, idx_start, counts = np.unique(fr_sorted, return_index=True, return_counts=True)
+        # Use ufunc.reduceat for minimums per group
+        t0_times = np.minimum.reduceat(et_sorted, idx_start)
+
+        # Map interval flight_rows -> t0_time (inf if missing)
+        # unique_fr is sorted ascending
+        pos = np.searchsorted(unique_fr, flight_rows)
+        found = (pos < unique_fr.size) & (unique_fr[pos] == flight_rows)
+        t0_by_interval = np.full(flight_rows.shape, np.inf, dtype=np.float64)
+        valid_pos = pos[found]
+        t0_by_interval[found] = t0_times[valid_pos]
+
+        has_valid_t0_mask = found
+        return unique_fr, t0_times, has_valid_t0_mask & (entry_times < t0_by_interval)
+
+    def _build_upstream_sequences(
+        self,
+        flight_rows: np.ndarray,
+        tvtw_indices: np.ndarray,
+        entry_times: np.ndarray,
+        upstream_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Build per-flight upstream sequences of TV rows (nearest first), collapsing consecutive
+        repeats within a TV. Returns (seq_flight_rows, seq_tv_rows) where the arrays are sorted
+        by flight row and entry time descending, and already deduplicated for consecutive TVs.
+        """
+        if not np.any(upstream_mask):
+            return (
+                np.empty((0,), dtype=np.int64),
+                np.empty((0,), dtype=np.int64),
+            )
+
+        fr_u = flight_rows[upstream_mask]
+        tvtw_u = tvtw_indices[upstream_mask]
+        et_u = entry_times[upstream_mask]
+
+        tv_row_u = tvtw_u // self.num_time_bins_per_tv
+
+        # Sort by flight row asc, entry time desc
+        # lexsort uses last key first, so ( -et_u, fr_u ) yields fr asc then entry desc
+        order = np.lexsort(( -et_u, fr_u ))
+        fr_s = fr_u[order]
+        tv_s = tv_row_u[order]
+
+        # Collapse consecutive identical TVs within each flight
+        keep = np.ones(fr_s.shape[0], dtype=bool)
+        if keep.size > 1:
+            same_flight = fr_s[1:] == fr_s[:-1]
+            same_tv = tv_s[1:] == tv_s[:-1]
+            keep[1:] = ~(same_flight & same_tv)
+
+        return fr_s[keep], tv_s[keep]
+
+    def _assemble_padded_sequences(
+        self,
+        seq_flight_rows: np.ndarray,
+        seq_tv_rows: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+        """
+        Convert ragged sequences into a padded 2D array of shape (num_flights, max_len), filled with -1.
+        Returns (unique_flights, padded_sequences, flight_row_to_index_map) where padded_sequences[i]
+        is the upstream TV row sequence for unique_flights[i] (nearest first).
+        """
+        if seq_flight_rows.size == 0:
+            return (
+                np.empty((0,), dtype=np.int64),
+                np.empty((0, 0), dtype=np.int64),
+                [],
+            )
+
+        # Identify contiguous blocks per flight (already sorted by flight)
+        starts = np.r_[0, np.where(seq_flight_rows[1:] != seq_flight_rows[:-1])[0] + 1]
+        ends = np.r_[starts[1:], seq_flight_rows.size]
+        unique_flights = seq_flight_rows[starts]
+        lengths = ends - starts
+        max_len = int(lengths.max()) if lengths.size > 0 else 0
+
+        padded = np.full((unique_flights.size, max_len), -1, dtype=np.int64)
+        # Fill per flight block
+        for i, (s, e) in enumerate(zip(starts, ends)):
+            if s < e:
+                padded[i, : e - s] = seq_tv_rows[s:e]
+
+        # Build mapping from flight row to its row index in padded array
+        flight_row_to_index: List[int] = []
+        fr_to_idx: Dict[int, int] = {int(fr): i for i, fr in enumerate(unique_flights.tolist())}
+        # Keep same order as unique_flights in mapping list
+        flight_row_to_index = [fr_to_idx[int(fr)] for fr in unique_flights.tolist()]
+
+        return unique_flights, padded, flight_row_to_index
+
+    def _group_stepwise_top_n(
+        self,
+        unique_flights: np.ndarray,
+        padded_seq: np.ndarray,
+        keep_top_n_groups: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Iteratively grow upstream prefixes and prune to top N groups by size.
+        Returns a list of group dicts with flight indices and upstream TV row path (nearest->farthest).
+        """
+        if padded_seq.size == 0:
+            return []
+
+        num_flights, max_len = padded_seq.shape
+        # Active set: indices 0..num_flights-1
+        active_indices = np.arange(num_flights, dtype=np.int64)
+        # Each group maps to list of active indices
+        groups: Dict[Tuple[int, ...], np.ndarray] = {tuple(): active_indices}
+
+        depth = 0
+        while depth < max_len and groups:
+            depth += 1
+            new_groups: Dict[Tuple[int, ...], List[int]] = {}
+
+            for key, idxs in groups.items():
+                # Gather next tv_row value (or -1 if exhausted)
+                next_vals = padded_seq[idxs, depth - 1]
+                # Build sub-keys
+                # Group by value
+                vals = next_vals.tolist()
+                # Collect indices per value
+                bucket: Dict[int, List[int]] = {}
+                for local_i, v in zip(idxs.tolist(), vals):
+                    bucket.setdefault(int(v), []).append(local_i)
+                for v, members in bucket.items():
+                    sub_key = key + (int(v),)
+                    if members:
+                        if sub_key in new_groups:
+                            new_groups[sub_key].extend(members)
+                        else:
+                            new_groups[sub_key] = list(members)
+
+            # Prune to top N by size
+            if not new_groups:
+                break
+            items = [(k, np.array(v, dtype=np.int64)) for k, v in new_groups.items()]
+            items.sort(key=lambda x: x[1].size, reverse=True)
+            if len(items) > keep_top_n_groups:
+                items = items[:keep_top_n_groups]
+
+            groups = {k: v for k, v in items}
+
+        # Convert final groups to summaries
+        results: List[Dict[str, Any]] = []
+        # Sort by size desc for stable output
+        final_items = [(k, v) for k, v in groups.items()]
+        final_items.sort(key=lambda x: x[1].size, reverse=True)
+
+        for rank, (key, idxs) in enumerate(final_items, start=1):
+            # Strip trailing -1s from key for readability
+            path_rows = [int(x) for x in key if int(x) != -1]
+            results.append(
+                {
+                    "group_rank": rank,
+                    "group_size": int(idxs.size),
+                    "upstream_tv_rows": path_rows,
+                    "flight_row_indices": idxs.tolist(),
+                }
+            )
+
+        return results
+
+    def extract_from_hotspot_hour(
+        self,
+        hotspot_tv_id: str,
+        hotspot_hour: int,
+        candidate_flight_ids: List[str],
+        keep_top_n_groups: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Extract top-N upstream flows for a hotspot defined by (traffic_volume_id, hour).
+
+        Returns list of groups with fields:
+        - group_rank
+        - group_size
+        - upstream_tv_ids: nearest->farthest list of TV IDs
+        - flight_ids: member flights
+        - hotspot: {traffic_volume_id, hour}
+        """
+        if not candidate_flight_ids:
+            return []
+
+        if hotspot_tv_id not in self.tv_id_to_row:
+            raise ValueError(f"Unknown traffic_volume_id: {hotspot_tv_id}")
+
+        hotspot_tv_row = self.tv_id_to_row[hotspot_tv_id]
+
+        # Build flattened intervals for the subset of flights
+        flight_rows_all, tvtw_indices_all, entry_times_all = self._prepare_intervals_for_flights(
+            candidate_flight_ids
+        )
+
+        if flight_rows_all.size == 0:
+            return []
+
+        # Compute per-flight reference time at hotspot tv/hour
+        unique_fr, t0_times, upstream_mask = self._compute_reference_times(
+            flight_rows_all,
+            tvtw_indices_all,
+            entry_times_all,
+            hotspot_tv_row,
+            hotspot_hour,
+        )
+
+        if unique_fr.size == 0:
+            return []
+
+        # Build upstream sequences (nearest first), deduplicated for consecutive TVs
+        seq_fr, seq_tv_rows = self._build_upstream_sequences(
+            flight_rows_all,
+            tvtw_indices_all,
+            entry_times_all,
+            upstream_mask,
+        )
+
+        if seq_fr.size == 0:
+            # All flights start at the hotspot; single group with no upstream TVs
+            return [
+                {
+                    "group_rank": 1,
+                    "group_size": len(candidate_flight_ids),
+                    "upstream_tv_ids": [],
+                    "flight_ids": candidate_flight_ids,
+                    "hotspot": {
+                        "traffic_volume_id": hotspot_tv_id,
+                        "hour": int(hotspot_hour),
+                    },
+                }
+            ]
+
+        # Assemble padded sequences per flight
+        unique_flights, padded_seq, _ = self._assemble_padded_sequences(seq_fr, seq_tv_rows)
+
+        if unique_flights.size == 0:
+            return []
+
+        # Map unique_flights (global row indices) -> flight_ids used by caller.
+        # Build reverse mapping once.
+        row_to_fid: Dict[int, str] = {
+            self.flight_list.flight_id_to_row[fid]: fid for fid in candidate_flight_ids if fid in self.flight_list.flight_id_to_row
+        }
+
+        # Perform iterative grouping with pruning
+        grouped = self._group_stepwise_top_n(unique_flights, padded_seq, keep_top_n_groups)
+
+        # Convert tv rows and flight row indices to readable outputs
+        results: List[Dict[str, Any]] = []
+        for g in grouped:
+            tv_ids_path = [self._tv_row_to_id(r) for r in g["upstream_tv_rows"]]
+
+            # Convert member indices (row indices in padded array) back to global rows then flight_ids
+            member_rows = unique_flights[np.asarray(g["flight_row_indices"], dtype=np.int64)]
+            member_fids = [row_to_fid.get(int(r)) for r in member_rows.tolist()]
+            member_fids = [fid for fid in member_fids if fid is not None]
+
+            results.append(
+                {
+                    "group_rank": g["group_rank"],
+                    "group_size": g["group_size"],
+                    "upstream_tv_ids": tv_ids_path,
+                    "flight_ids": member_fids,
+                    "hotspot": {
+                        "traffic_volume_id": hotspot_tv_id,
+                        "hour": int(hotspot_hour),
+                    },
+                }
+            )
+
+        return results
+
+    def extract_from_hotspot_bin(
+        self,
+        hotspot_tvtw_index: int,
+        candidate_flight_ids: List[str],
+        keep_top_n_groups: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Convenience wrapper when the hotspot is specified as a TVTW index. The hour is derived
+        from the TVTW index.
+        """
+        tv_row, hour = self._tvtw_to_tv_row_and_hour(int(hotspot_tvtw_index))
+        tv_id = self._tv_row_to_id(tv_row)
+        return self.extract_from_hotspot_hour(tv_id, int(hour), candidate_flight_ids, keep_top_n_groups)
+
+    def extract_from_evaluator_item(
+        self,
+        hotspot_item: Dict[str, Any],
+        keep_top_n_groups: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Accepts one item returned from NetworkEvaluator.get_hotspot_flights(...):
+        - If the item contains {"traffic_volume_id", "hour", "flight_ids"}, uses hour-mode.
+        - If the item contains {"tvtw_index", "flight_ids"}, uses bin-mode.
+        """
+        if not hotspot_item or "flight_ids" not in hotspot_item:
+            return []
+
+        flight_ids = hotspot_item.get("flight_ids", [])
+        if "traffic_volume_id" in hotspot_item and "hour" in hotspot_item:
+            return self.extract_from_hotspot_hour(
+                hotspot_item["traffic_volume_id"],
+                int(hotspot_item["hour"]),
+                flight_ids,
+                keep_top_n_groups,
+            )
+
+        if "tvtw_index" in hotspot_item:
+            return self.extract_from_hotspot_bin(
+                int(hotspot_item["tvtw_index"]),
+                flight_ids,
+                keep_top_n_groups,
+            )
+
+        raise ValueError("Unsupported hotspot item format")
+
