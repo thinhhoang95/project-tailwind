@@ -407,7 +407,7 @@ def precompute_cache_context(evaluator: NetworkEvaluator) -> Dict[str, Any]:
     for tv_id, tv_row in evaluator.tv_id_to_idx.items():
         start_idx = tv_row * num_time_bins_per_tv
         for hour in range(24):
-            hourly_cap = evaluator.hourly_capacity_by_tv.get(tv_id, {}).get(hour, 0)
+            hourly_cap = evaluator.hourly_capacity_by_tv.get(tv_id, {}).get(hour, 999)
             if hourly_cap > 0:
                 hour_start = start_idx + hour * bins_per_hour
                 hour_end = min(hour_start + bins_per_hour, start_idx + num_time_bins_per_tv)
@@ -417,7 +417,7 @@ def precompute_cache_context(evaluator: NetworkEvaluator) -> Dict[str, Any]:
     hourly_capacity_matrix = np.zeros((num_tvs, 24))
     for tv_id, tv_row in evaluator.tv_id_to_idx.items():
         for hour in range(24):
-            hourly_capacity_matrix[tv_row, hour] = evaluator.hourly_capacity_by_tv.get(tv_id, {}).get(hour, 0)
+            hourly_capacity_matrix[tv_row, hour] = evaluator.hourly_capacity_by_tv.get(tv_id, {}).get(hour, 999)
     
     # Precompute hourly occupancy base
     hourly_occ_base = np.zeros((num_tvs, 24))
@@ -516,10 +516,17 @@ def compute_cache_metrics_vectorized(
         if t == 0:
             g_t = g0.copy()
         else:
-            # Shift right by t bins, zero-fill on the left
+            # Shift right by t bins, zero-fill on the left (within each TV)
             g_t = np.zeros_like(g0)
-            if t < len(g0):
-                g_t[t:] = g0[:-t]
+            n_bins_per_tv = cache_context['num_time_bins_per_tv']
+            for tv_row in range(num_tvs):
+                start = tv_row * n_bins_per_tv
+                end = start + n_bins_per_tv
+                
+                block = g0[start:end]
+                
+                if t < n_bins_per_tv:
+                    g_t[start + t:end] = block[:-t]
         
         # Compute shifted occupancy
         occ_t = occ_base + g_t - g0
