@@ -45,6 +45,13 @@
             "request": "launch",
             "program": "tests/test_hotspot_flow_retrieval.py",
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Test Flow Cache Extraction (Debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "examples/run_flow_cache_extraction_basic_debug.py",
+            "console": "integratedTerminal"
         }
     ]
 }

@@ -17,12 +17,8 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 import sys
 import logging
-import multiprocessing as mp
-import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from rich.console import Console
 from rich.table import Table
-from rich.progress import Progress, TaskID
 
 # Import the required classes
 from project_tailwind.optimize.eval.flight_list import FlightList
@@ -201,23 +197,6 @@ def parse_args():
         action="store_true",
         help="Enable debug logging"
     )
-    parser.add_argument(
-        "--multiprocessing",
-        action="store_true",
-        default=True,
-        help="Enable multiprocessing for flow extraction (default: True)"
-    )
-    parser.add_argument(
-        "--no-multiprocessing",
-        action="store_true",
-        help="Disable multiprocessing and use single-threaded flow extraction"
-    )
-    parser.add_argument(
-        "--n-processes",
-        type=int,
-        default=None,
-        help="Number of processes to use for multiprocessing (default: cpu_count - 3)"
-    )
     
     return parser.parse_args()
 
@@ -283,24 +262,28 @@ def create_output_directory(output_dir: str) -> Path:
 
 
 def export_hotspots_csv(
-    evaluator: NetworkEvaluator, 
-    output_path: Path, 
+    evaluator: NetworkEvaluator,
+    flow_extractor: FlowXExtractor,
+    flowx_kwargs: Dict[str, Any],
+    output_path: Path,
     threshold: float,
     only_tv: Optional[str] = None,
     only_hour: Optional[int] = None,
     only_tvtw: Optional[int] = None,
-    limit_hotspots: Optional[int] = None
+    limit_hotspots: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Export hotspots CSV (bin mode) and return hotspot list."""
     logging.info("Discovering hotspots in bin mode...")
-    
+
     # Get hotspots in bin mode
     hotspots = evaluator.get_hotspot_flights(threshold=threshold, mode="bin")
-    
+
     # Apply scoping filters
     if only_tv:
         # Need to map tvtw_index back to traffic_volume_id
-        num_time_bins_per_tv = evaluator.flight_list.num_tvtws // len(evaluator.tv_id_to_idx)
+        num_time_bins_per_tv = evaluator.flight_list.num_tvtws // len(
+            evaluator.tv_id_to_idx
+        )
         filtered_hotspots = []
         for hotspot in hotspots:
             tvtw_idx = hotspot["tvtw_index"]
@@ -314,13 +297,15 @@ def export_hotspots_csv(
             if tv_id == only_tv:
                 filtered_hotspots.append(hotspot)
         hotspots = filtered_hotspots
-    
+
     if only_tvtw is not None:
         hotspots = [h for h in hotspots if h["tvtw_index"] == only_tvtw]
-    
+
     if only_hour is not None:
         # Convert tvtw to hour and filter
-        num_time_bins_per_tv = evaluator.flight_list.num_tvtws // len(evaluator.tv_id_to_idx)
+        num_time_bins_per_tv = evaluator.flight_list.num_tvtws // len(
+            evaluator.tv_id_to_idx
+        )
         bins_per_hour = 60 // evaluator.time_bin_minutes
         filtered_hotspots = []
         for hotspot in hotspots:
@@ -332,37 +317,63 @@ def export_hotspots_csv(
             if hour == only_hour:
                 filtered_hotspots.append(hotspot)
         hotspots = filtered_hotspots
-    
+
     if limit_hotspots:
         hotspots = hotspots[:limit_hotspots]
+
+    logging.info(f"Found {len(hotspots)} hotspots after filtering. Analyzing flows for each...")
     
-    logging.info(f"Found {len(hotspots)} hotspots after filtering")
-    
+    for hotspot in hotspots:
+        groups = flow_extractor.find_groups_from_evaluator_item(hotspot, **flowx_kwargs)
+        candidate_flights = set(hotspot.get("flight_ids", []))
+        all_group_flights = []
+        if groups:
+            for group in groups:
+                group_flight_ids = group.get("group_flights", [])
+                if group_flight_ids:
+                    all_group_flights.extend(group_flight_ids)
+
+        flights_in_flows_set = set(all_group_flights)
+        non_flow_flights = candidate_flights - flights_in_flows_set
+
+        hotspot["n_flow_flights"] = len(flights_in_flows_set)
+        hotspot["n_non_flow_flights"] = len(non_flow_flights)
+
+
     if not hotspots:
         logging.warning("No hotspots found with current filters")
         return hotspots
-    
+
     # Export CSV 1: hotspots.csv
     hotspots_csv_path = output_path / "hotspots.csv"
-    
+
     # Compute additional derived fields
-    num_time_bins_per_tv = evaluator.flight_list.num_tvtws // len(evaluator.tv_id_to_idx)
+    num_time_bins_per_tv = evaluator.flight_list.num_tvtws // len(
+        evaluator.tv_id_to_idx
+    )
     bins_per_hour = 60 // evaluator.time_bin_minutes
-    
+
     # Get total occupancy for reporting
     total_occupancy = evaluator.flight_list.get_total_occupancy_by_tvtw()
-    
-    with open(hotspots_csv_path, 'w', newline='') as csvfile:
+
+    with open(hotspots_csv_path, "w", newline="") as csvfile:
         fieldnames = [
-            'tvtw_index', 'traffic_volume_id', 'time_bin', 'hour', 
-            'hourly_capacity', 'hourly_occupancy', 'capacity_per_bin', 'num_flights'
+            "tvtw_index",
+            "traffic_volume_id",
+            "time_bin",
+            "hour",
+            "hourly_capacity",
+            "hourly_occupancy",
+            "capacity_per_bin",
+            "n_flow_flights",
+            "n_non_flow_flights",
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
-        
+
         for hotspot in hotspots:
             tvtw_idx = hotspot["tvtw_index"]
-            
+
             # Derive traffic_volume_id and time_bin from tvtw_index
             tv_row = tvtw_idx // num_time_bins_per_tv
             tv_id = None
@@ -370,29 +381,32 @@ def export_hotspots_csv(
                 if row == tv_row:
                     tv_id = tid
                     break
-            
+
             tv_start = tv_row * num_time_bins_per_tv
             bin_offset = tvtw_idx - tv_start
             hour = bin_offset // bins_per_hour
             time_bin = bin_offset % bins_per_hour
-            
+
             # Get hourly occupancy from total occupancy
             hour_start_idx = tv_start + hour * bins_per_hour
             hour_end_idx = hour_start_idx + bins_per_hour
-            hourly_occupancy = float(np.sum(total_occupancy[hour_start_idx:hour_end_idx]))
-            
+            hourly_occupancy = float(
+                np.sum(total_occupancy[hour_start_idx:hour_end_idx])
+            )
+
             row_data = {
-                'tvtw_index': tvtw_idx,
-                'traffic_volume_id': tv_id,
-                'time_bin': time_bin,
-                'hour': hour,
-                'hourly_capacity': hotspot["hourly_capacity"],
-                'hourly_occupancy': hourly_occupancy,
-                'capacity_per_bin': hotspot["capacity_per_bin"],
-                'num_flights': len(hotspot["flight_ids"])
+                "tvtw_index": tvtw_idx,
+                "traffic_volume_id": tv_id,
+                "time_bin": time_bin,
+                "hour": hour,
+                "hourly_capacity": hotspot["hourly_capacity"],
+                "hourly_occupancy": hourly_occupancy,
+                "capacity_per_bin": hotspot["capacity_per_bin"],
+                "n_flow_flights": hotspot["n_flow_flights"],
+                "n_non_flow_flights": hotspot["n_non_flow_flights"],
             }
             writer.writerow(row_data)
-    
+
     logging.info(f"Exported hotspots to {hotspots_csv_path}")
     return hotspots
 
@@ -409,6 +423,8 @@ def precompute_cache_context(evaluator: NetworkEvaluator) -> Dict[str, Any]:
     num_tvs = len(evaluator.tv_id_to_idx)
     num_time_bins_per_tv = num_tvtws // num_tvs
     bins_per_hour = 60 // evaluator.time_bin_minutes
+    
+    tv_row_to_id = {v: k for k, v in evaluator.tv_id_to_idx.items()}
     
     # Build mapping arrays for vectorized computation
     tv_row_of_tvtw = np.zeros(num_tvtws, dtype=int)
@@ -459,7 +475,8 @@ def precompute_cache_context(evaluator: NetworkEvaluator) -> Dict[str, Any]:
         'hour_of_tvtw': hour_of_tvtw,
         'cap_per_bin': cap_per_bin,
         'hourly_capacity_matrix': hourly_capacity_matrix,
-        'hourly_occ_base': hourly_occ_base
+        'hourly_occ_base': hourly_occ_base,
+        'tv_row_to_id': tv_row_to_id,
     }
 
 
@@ -516,6 +533,7 @@ def compute_cache_metrics_vectorized(
     hour_of_tvtw = cache_context['hour_of_tvtw']
     bins_per_hour = cache_context['bins_per_hour']
     num_tvs = cache_context['num_tvs']
+    tv_row_to_id = cache_context['tv_row_to_id']
     
     # Validate dimensions
     if len(g0) != len(occ_base):
@@ -532,7 +550,7 @@ def compute_cache_metrics_vectorized(
             group_hourly_counts_base[tv_row, hour] += g0[tvtw_idx]
     
     # Compute metrics for each time shift t
-    for t in range(16):  # t=0..15
+    for t in range(0, 16):  # t = 0..15
         # Compute shifted group occupancy g_t
         if t == 0:
             g_t = g0.copy()
@@ -578,6 +596,14 @@ def compute_cache_metrics_vectorized(
                     for bin_idx in range(hour_start, hour_end):
                         if bin_idx < len(g_t) and g_t[bin_idx] > 0:
                             present_bins += 1
+                            logging.debug(f"    Group present in hour {hour} time_bin {bin_idx - hour_start} (contributes to count_over)")
+                    
+                    if present_bins > 0:
+                        tv_id = tv_row_to_id.get(tv_row, "UNKNOWN_TV")
+                        logging.debug(
+                            f"  Adding {present_bins} to count_over_t for TV {tv_id} at hour {hour}"
+                        )
+
                     count_over_t += present_bins
         
         # SumOver(t): weighted sum of excess per bin
@@ -609,14 +635,15 @@ def compute_cache_metrics_vectorized(
             min_slack_t = np.nan
         
         # Store results
+        logging.debug(f"Final count_over for t={t}: {count_over_t}")
         count_over.append(float(count_over_t))
         sum_over.append(float(sum_over_t))
         min_slack.append(float(min_slack_t))
-    
+        
     return {
         'count_over': count_over,
         'sum_over': sum_over,
-        'min_slack': min_slack
+        'min_slack': min_slack,
     }
 
 
@@ -636,178 +663,6 @@ def compute_cache_metrics_slow(
     }
 
 
-def process_hotspot_worker(
-    hotspot_data: Tuple[int, Dict[str, Any]], 
-    flight_list_data: Tuple[str, str],  # (occupancy_matrix_path, tvtw_indexer_path)
-    cache_context: Dict[str, Any],
-    flowx_kwargs: Dict[str, Any],
-    use_slow: bool = False
-) -> Tuple[int, List[Dict[str, Any]]]:
-    """
-    Worker function to process a single hotspot and extract flows.
-    
-    Args:
-        hotspot_data: Tuple of (hotspot_index, hotspot_dict)
-        flight_list_data: Tuple of paths to recreate FlightList
-        cache_context: Precomputed cache context
-        flowx_kwargs: FlowX parameters
-        use_slow: Whether to use slow cache computation
-        
-    Returns:
-        Tuple of (hotspot_index, list_of_flow_rows)
-    """
-    hotspot_idx, hotspot = hotspot_data
-    occupancy_matrix_path, tvtw_indexer_path = flight_list_data
-    
-    try:
-        # Recreate FlightList in worker process
-        flight_list = FlightList(occupancy_matrix_path, tvtw_indexer_path)
-        
-        # Create FlowXExtractor
-        from project_tailwind.flow_x.flow_extractor import FlowXExtractor
-        flow_extractor = FlowXExtractor(flight_list)
-        
-        # Extract groups using FlowXExtractor
-        groups = flow_extractor.find_groups_from_evaluator_item(hotspot, **flowx_kwargs)
-        
-        flow_rows = []
-        
-        if groups:
-            for group in groups:
-                # Skip groups with size < 2 (already enforced by extractor)
-                if group.get('group_size', 0) < 2:
-                    continue
-                
-                # Get flight IDs from group
-                group_flight_ids = group.get('group_flights', [])
-                if not group_flight_ids:
-                    continue
-                
-                # Compute cache metrics
-                if use_slow:
-                    cache_metrics = compute_cache_metrics_slow(
-                        flight_list, 
-                        None,  # Would need evaluator reference
-                        group_flight_ids
-                    )
-                else:
-                    # Compute group occupancy vector
-                    g0 = compute_group_occupancy_vector(flight_list, group_flight_ids)
-                    cache_metrics = compute_cache_metrics_vectorized(g0, cache_context)
-                
-                # Prepare row data
-                row_data = {
-                    'hotspot_traffic_volume_id': hotspot.get('traffic_volume_id', ''),
-                    'hotspot_hour': hotspot.get('hour', ''),
-                    'hotspot_tvtw_index': hotspot.get('tvtw_index', ''),
-                    'reference_sector': group.get('reference_sector', ''),
-                    'group_size': group.get('group_size', 0),
-                    'avg_pairwise_similarity': group.get('avg_pairwise_similarity', 0.0),
-                    'score': group.get('score', 0.0),
-                    'mean_path_length': group.get('mean_path_length', 0.0),
-                    'flight_ids': ' '.join(group_flight_ids)
-                }
-                
-                # Add cache metrics
-                for t in range(16):
-                    row_data[f'count_over_{t}'] = cache_metrics['count_over'][t]
-                    row_data[f'sum_over_{t}'] = cache_metrics['sum_over'][t]
-                    row_data[f'min_slack_{t}'] = cache_metrics['min_slack'][t]
-                
-                flow_rows.append(row_data)
-        
-        return hotspot_idx, flow_rows
-        
-    except Exception as e:
-        # Convert numpy types to Python types for safe logging
-        safe_hotspot = {}
-        for k, v in hotspot.items():
-            if hasattr(v, 'item'):  # numpy scalar
-                safe_hotspot[k] = v.item()
-            else:
-                safe_hotspot[k] = v
-        logging.error(f"Error processing hotspot {safe_hotspot}: {e}")
-        return hotspot_idx, []
-
-
-def extract_flows_with_cache_mp(
-    flight_list_paths: Tuple[str, str],  # (occupancy_matrix_path, tvtw_indexer_path)
-    hotspots: List[Dict[str, Any]],
-    cache_context: Dict[str, Any],
-    output_path: Path,
-    mode: str,
-    flowx_kwargs: Dict[str, Any],
-    use_slow: bool = False,
-    n_processes: Optional[int] = None
-) -> None:
-    """Extract flows and compute cache metrics using multiprocessing, writing to CSV."""
-    
-    if n_processes is None:
-        n_processes = max(1, mp.cpu_count())
-    
-    logging.info(f"Extracting flows for {len(hotspots)} hotspots using {n_processes} processes...")
-    
-    fieldnames = [
-        'hotspot_traffic_volume_id', 'hotspot_hour', 'hotspot_tvtw_index',
-        'reference_sector', 'group_size', 'avg_pairwise_similarity', 
-        'score', 'mean_path_length', 'flight_ids'
-    ] + [f'count_over_{t}' for t in range(16)] + \
-      [f'sum_over_{t}' for t in range(16)] + \
-      [f'min_slack_{t}' for t in range(16)]
-    
-    total_flows = 0
-    
-    # Prepare hotspot data with indices for tracking progress
-    hotspot_data = [(i, hotspot) for i, hotspot in enumerate(hotspots)]
-    
-    # Open CSV file for writing
-    with open(output_path, 'w', newline='') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        
-        # Use ProcessPoolExecutor for multiprocessing
-        with ProcessPoolExecutor(max_workers=n_processes) as executor:
-            # Create a progress bar
-            console = Console()
-            with Progress(console=console) as progress:
-                task = progress.add_task(f"[green]Processing {len(hotspots)} hotspots...", total=len(hotspots))
-                
-                # Submit all jobs
-                future_to_hotspot = {
-                    executor.submit(
-                        process_hotspot_worker,
-                        hotspot_item,
-                        flight_list_paths,
-                        cache_context,
-                        flowx_kwargs,
-                        use_slow
-                    ): hotspot_item[0] for hotspot_item in hotspot_data
-                }
-                
-                # Collect results as they complete
-                hotspot_results = {}
-                for future in as_completed(future_to_hotspot):
-                    hotspot_idx = future_to_hotspot[future]
-                    try:
-                        hotspot_idx_result, flow_rows = future.result()
-                        hotspot_results[hotspot_idx_result] = flow_rows
-                        progress.advance(task)
-                        logging.debug(f"Completed hotspot {hotspot_idx_result + 1}/{len(hotspots)}, found {len(flow_rows)} flows")
-                    except Exception as e:
-                        logging.error(f"Error processing hotspot {hotspot_idx}: {e}")
-                        hotspot_results[hotspot_idx] = []
-                        progress.advance(task)
-                
-                # Write results in original order
-                for hotspot_idx in sorted(hotspot_results.keys()):
-                    flow_rows = hotspot_results[hotspot_idx]
-                    for row_data in flow_rows:
-                        writer.writerow(row_data)
-                        total_flows += 1
-    
-    logging.info(f"Extracted {total_flows} flows and wrote to {output_path}")
-
-
 def extract_flows_with_cache(
     flow_extractor: FlowXExtractor,
     hotspots: List[Dict[str, Any]],
@@ -815,95 +670,126 @@ def extract_flows_with_cache(
     output_path: Path,
     mode: str,
     flowx_kwargs: Dict[str, Any],
-    use_slow: bool = False
-) -> None:
-    """Extract flows and compute cache metrics, writing to CSV. (Legacy single-threaded version)"""
-    
+    use_slow: bool = False,
+) -> List[Dict[str, Any]]:
+    """Extract flows and compute cache metrics, writing to CSV."""
+
     logging.info(f"Extracting flows for {len(hotspots)} hotspots...")
-    
+
     fieldnames = [
-        'hotspot_traffic_volume_id', 'hotspot_hour', 'hotspot_tvtw_index',
-        'reference_sector', 'group_size', 'avg_pairwise_similarity', 
-        'score', 'mean_path_length', 'flight_ids'
-    ] + [f'count_over_{t}' for t in range(16)] + \
-      [f'sum_over_{t}' for t in range(16)] + \
-      [f'min_slack_{t}' for t in range(16)]
-    
+        "hotspot_traffic_volume_id",
+        "hotspot_hour",
+        "hotspot_tvtw_index",
+        "reference_sector",
+        "group_size",
+        "avg_pairwise_similarity",
+        "score",
+        "mean_path_length",
+        "flight_ids",
+    ] + [f"count_over_{t}" for t in range(16)] + [f"sum_over_{t}" for t in range(16)] + [f"min_slack_{t}" for t in range(16)]
+
     total_flows = 0
-    
-    with open(output_path, 'w', newline='') as csvfile:
+    non_flow_flights_data = []
+
+    with open(output_path, "w", newline="") as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
-        
-        for i, hotspot in enumerate(hotspots):
-            logging.info(f"Processing hotspot {i+1}/{len(hotspots)}")
-            
+
+        for hotspot in hotspots:
             try:
-                # Extract groups using FlowXExtractor
-                groups = flow_extractor.find_groups_from_evaluator_item(hotspot, **flowx_kwargs)
-                
+                candidate_flights = set(hotspot.get("flight_ids", []))
+                groups = flow_extractor.find_groups_from_evaluator_item(
+                    hotspot, **flowx_kwargs
+                )
+                all_group_flights = []
                 if not groups:
                     logging.debug(f"No groups found for hotspot {hotspot}")
-                    continue
-                
-                logging.debug(f"Found {len(groups)} groups for hotspot")
-                
-                for group in groups:
-                    # Skip groups with size < 2 (already enforced by extractor)
-                    if group.get('group_size', 0) < 2:
-                        continue
-                    
-                    # Get flight IDs from group
-                    group_flight_ids = group.get('group_flights', [])
-                    if not group_flight_ids:
-                        continue
-                    
-                    # Compute cache metrics
-                    if use_slow:
-                        cache_metrics = compute_cache_metrics_slow(
-                            flow_extractor.flight_list, 
-                            None,  # Would need evaluator reference
-                            group_flight_ids
-                        )
-                    else:
-                        # Compute group occupancy vector
-                        g0 = compute_group_occupancy_vector(flow_extractor.flight_list, group_flight_ids)
-                        cache_metrics = compute_cache_metrics_vectorized(g0, cache_context)
-                    
-                    # Prepare row data
-                    row_data = {
-                        'hotspot_traffic_volume_id': hotspot.get('traffic_volume_id', ''),
-                        'hotspot_hour': hotspot.get('hour', ''),
-                        'hotspot_tvtw_index': hotspot.get('tvtw_index', ''),
-                        'reference_sector': group.get('reference_sector', ''),
-                        'group_size': group.get('group_size', 0),
-                        'avg_pairwise_similarity': group.get('avg_pairwise_similarity', 0.0),
-                        'score': group.get('score', 0.0),
-                        'mean_path_length': group.get('mean_path_length', 0.0),
-                        'flight_ids': ' '.join(group_flight_ids)
-                    }
-                    
-                    # Add cache metrics
-                    for t in range(16):
-                        row_data[f'count_over_{t}'] = cache_metrics['count_over'][t]
-                        row_data[f'sum_over_{t}'] = cache_metrics['sum_over'][t]
-                        row_data[f'min_slack_{t}'] = cache_metrics['min_slack'][t]
-                    
-                    writer.writerow(row_data)
-                    total_flows += 1
-                    
+                else:
+                    logging.debug(f"Found {len(groups)} groups for hotspot")
+
+                    for group in groups:
+                        group_flight_ids = group.get("group_flights", [])
+                        if not group_flight_ids:
+                            continue
+
+                        all_group_flights.extend(group_flight_ids)
+
+                        # Compute cache metrics
+                        if use_slow:
+                            cache_metrics = compute_cache_metrics_slow(
+                                flow_extractor.flight_list,
+                                None,  # Would need evaluator reference
+                                group_flight_ids,
+                            )
+                        else:
+                            # Compute group occupancy vector
+                            g0 = compute_group_occupancy_vector(
+                                flow_extractor.flight_list, group_flight_ids
+                            )
+                            cache_metrics = compute_cache_metrics_vectorized(
+                                g0, cache_context
+                            )
+
+                        # Prepare row data
+                        row_data = {
+                            "hotspot_traffic_volume_id": hotspot.get(
+                                "traffic_volume_id", ""
+                            ),
+                            "hotspot_hour": hotspot.get("hour", ""),
+                            "hotspot_tvtw_index": hotspot.get("tvtw_index", ""),
+                            "reference_sector": group.get("reference_sector", ""),
+                            "group_size": group.get("group_size", 0),
+                            "avg_pairwise_similarity": group.get(
+                                "avg_pairwise_similarity", 0.0
+                            ),
+                            "score": group.get("score", 0.0),
+                            "mean_path_length": group.get("mean_path_length", 0.0),
+                            "flight_ids": " ".join(group_flight_ids),
+                        }
+
+                        # Add cache metrics
+                        for t in range(16):
+                            row_data[f"count_over_{t}"] = cache_metrics["count_over"][t]
+                            row_data[f"sum_over_{t}"] = cache_metrics["sum_over"][t]
+                            row_data[f"min_slack_{t}"] = cache_metrics["min_slack"][t]
+
+                        writer.writerow(row_data)
+                        total_flows += 1
+
+                flights_in_flows_set = set(all_group_flights)
+                non_flow_flights = candidate_flights - flights_in_flows_set
+
+                logging.info(
+                    f"Hotspot {hotspot.get('traffic_volume_id')} at hour {hotspot.get('hour')}:"
+                )
+                logging.info(
+                    f"  Flights in flows: {len(all_group_flights)} (duplicates included), {len(flights_in_flows_set)} unique flights."
+                )
+                logging.info(f"  Flights not in any flow: {len(non_flow_flights)}")
+
+                if non_flow_flights:
+                    non_flow_flights_data.append(
+                        {
+                            "traffic_volume_id": hotspot.get("traffic_volume_id", ""),
+                            "hour": hotspot.get("hour", ""),
+                            "non_flow_flights": " ".join(
+                                sorted(list(non_flow_flights))
+                            ),
+                        }
+                    )
+
             except Exception as e:
                 # Convert numpy types to Python types for safe logging
                 safe_hotspot = {}
                 for k, v in hotspot.items():
-                    if hasattr(v, 'item'):  # numpy scalar
+                    if hasattr(v, "item"):  # numpy scalar
                         safe_hotspot[k] = v.item()
                     else:
                         safe_hotspot[k] = v
                 logging.error(f"Error processing hotspot {safe_hotspot}: {e}")
-                continue
-    
+
     logging.info(f"Extracted {total_flows} flows and wrote to {output_path}")
+    return non_flow_flights_data
 
 
 def main():
@@ -929,46 +815,52 @@ def main():
         if len(evaluator.tv_id_to_idx) == 0:
             raise ValueError("No traffic volumes found in evaluator mapping")
         
-        # Export hotspots CSV (bin mode)
-        logging.info("Discovering and exporting hotspots...")
-        hotspots = export_hotspots_csv(
-            evaluator, output_path, args.threshold,
-            only_tv=args.only_tv,
-            only_hour=args.only_hour, 
-            only_tvtw=args.only_tvtw,
-            limit_hotspots=args.limit_hotspots
-        )
-        
-        if not hotspots:
-            logging.info("No hotspots found matching criteria, exiting")
-            return
-        
         # Initialize FlowXExtractor
         logging.info("Initializing FlowXExtractor...")
         try:
             flow_extractor = FlowXExtractor(flight_list)
         except Exception as e:
             raise RuntimeError(f"Failed to initialize FlowXExtractor: {e}")
-        
+
         # Prepare FlowX kwargs (only overrides passed to extractor)
         flowx_kwargs: Dict[str, Any] = {}
         if args.max_groups is not None:
-            flowx_kwargs['max_groups'] = args.max_groups
+            flowx_kwargs["max_groups"] = args.max_groups
         if args.k_max is not None:
-            flowx_kwargs['k_max_trajectories_per_group'] = args.k_max
+            flowx_kwargs["k_max_trajectories_per_group"] = args.k_max
         if args.alpha is not None:
-            flowx_kwargs['sparsification_alpha'] = args.alpha
+            flowx_kwargs["sparsification_alpha"] = args.alpha
         if args.avg_objective:
-            flowx_kwargs['average_objective'] = True
+            flowx_kwargs["average_objective"] = True
         if args.group_size_lam is not None:
-            flowx_kwargs['group_size_lam'] = args.group_size_lam
+            flowx_kwargs["group_size_lam"] = args.group_size_lam
         if args.path_length_gamma is not None:
-            flowx_kwargs['path_length_gamma'] = args.path_length_gamma
+            flowx_kwargs["path_length_gamma"] = args.path_length_gamma
+
+        # Export hotspots CSV (bin mode)
+        logging.info("Discovering and exporting hotspots...")
+        hotspots = export_hotspots_csv(
+            evaluator,
+            flow_extractor,
+            flowx_kwargs,
+            output_path,
+            args.threshold,
+            only_tv=args.only_tv,
+            only_hour=args.only_hour,
+            only_tvtw=args.only_tvtw,
+            limit_hotspots=args.limit_hotspots,
+        )
+
+        if not hotspots:
+            logging.info("No hotspots found matching criteria, exiting")
+            return
 
         # Compute and print effective parameters table (defaults overlaid with overrides)
         effective_params = _build_effective_flowx_params(flowx_kwargs)
-        _print_flowx_params_table(effective_params, title="FlowX Parameters (Effective)")
-        
+        _print_flowx_params_table(
+            effective_params, title="FlowX Parameters (Effective)"
+        )
+
         # Precompute global structures for cache computation
         logging.info("Precomputing global structures for cache computation...")
         try:
@@ -1027,25 +919,18 @@ def main():
         # Extract flows and compute cache metrics
         flows_csv_path = output_path / "flows_with_cache.csv"
         try:
-            # Determine whether to use multiprocessing
-            use_multiprocessing = args.multiprocessing and not args.no_multiprocessing
-            
-            if use_multiprocessing:
-                logging.info("Using multiprocessing for flow extraction")
-                flight_list_paths = (str(args.occupancy_matrix), str(args.tvtw_indexer))
-                extract_flows_with_cache_mp(
-                    flight_list_paths, flow_hotspots, cache_context, flows_csv_path, 
-                    args.mode, flowx_kwargs, args.slow, args.n_processes
-                )
-            else:
-                logging.info("Using single-threaded flow extraction")
-                extract_flows_with_cache(
-                    flow_extractor, flow_hotspots, cache_context, flows_csv_path, 
-                    args.mode, flowx_kwargs, args.slow
-                )
+            extract_flows_with_cache(
+                flow_extractor,
+                flow_hotspots,
+                cache_context,
+                flows_csv_path,
+                args.mode,
+                flowx_kwargs,
+                args.slow,
+            )
         except Exception as e:
             raise RuntimeError(f"Failed during flow extraction: {e}")
-        
+
         logging.info("Flow extraction completed successfully")
         logging.info(f"Output files:")
         logging.info(f"  Hotspots: {output_path / 'hotspots.csv'}")
@@ -1083,7 +968,7 @@ def run_flow_cache_extraction(
     slow: bool = False,
     debug: bool = False,
     use_multiprocessing: bool = True,
-    n_processes: int = None
+    n_processes: int = None,
 ) -> bool:
     """
     Wrapper function to run flow cache extraction programmatically.
@@ -1107,8 +992,6 @@ def run_flow_cache_extraction(
         limit_hotspots: Limit to first N hotspots
         slow: Use slow but simple fallback implementation for cache computation
         debug: Enable debug logging
-        use_multiprocessing: Whether to use multiprocessing for flow extraction
-        n_processes: Number of processes to use (default: cpu_count - 3)
         
     Returns:
         bool: True if successful, False otherwise
@@ -1139,21 +1022,7 @@ def run_flow_cache_extraction(
         if len(evaluator.tv_id_to_idx) == 0:
             logging.error("No traffic volumes found in evaluator mapping")
             return False
-        
-        # Export hotspots CSV (bin mode)
-        logging.info("Discovering and exporting hotspots...")
-        hotspots = export_hotspots_csv(
-            evaluator, output_path, threshold,
-            only_tv=only_tv,
-            only_hour=only_hour,
-            only_tvtw=only_tvtw,
-            limit_hotspots=limit_hotspots
-        )
-        
-        if not hotspots:
-            logging.info("No hotspots found matching criteria, exiting")
-            return True
-        
+
         # Initialize FlowXExtractor
         logging.info("Initializing FlowXExtractor...")
         try:
@@ -1161,26 +1030,46 @@ def run_flow_cache_extraction(
         except Exception as e:
             logging.error(f"Failed to initialize FlowXExtractor: {e}")
             return False
-        
+
         # Prepare FlowX kwargs (only overrides passed to extractor)
         flowx_kwargs: Dict[str, Any] = {}
         if max_groups is not None:
-            flowx_kwargs['max_groups'] = max_groups
+            flowx_kwargs["max_groups"] = max_groups
         if k_max is not None:
-            flowx_kwargs['k_max_trajectories_per_group'] = k_max
+            flowx_kwargs["k_max_trajectories_per_group"] = k_max
         if alpha is not None:
-            flowx_kwargs['sparsification_alpha'] = alpha
+            flowx_kwargs["sparsification_alpha"] = alpha
         if avg_objective:
-            flowx_kwargs['average_objective'] = True
+            flowx_kwargs["average_objective"] = True
         if group_size_lam is not None:
-            flowx_kwargs['group_size_lam'] = group_size_lam
+            flowx_kwargs["group_size_lam"] = group_size_lam
         if path_length_gamma is not None:
-            flowx_kwargs['path_length_gamma'] = path_length_gamma
+            flowx_kwargs["path_length_gamma"] = path_length_gamma
+
+        # Export hotspots CSV (bin mode)
+        logging.info("Discovering and exporting hotspots...")
+        hotspots = export_hotspots_csv(
+            evaluator,
+            flow_extractor,
+            flowx_kwargs,
+            output_path,
+            threshold,
+            only_tv=only_tv,
+            only_hour=only_hour,
+            only_tvtw=only_tvtw,
+            limit_hotspots=limit_hotspots,
+        )
+
+        if not hotspots:
+            logging.info("No hotspots found matching criteria, exiting")
+            return True
 
         # Compute and print effective parameters table (defaults overlaid with overrides)
         effective_params = _build_effective_flowx_params(flowx_kwargs)
-        _print_flowx_params_table(effective_params, title="FlowX Parameters (Effective)")
-        
+        _print_flowx_params_table(
+            effective_params, title="FlowX Parameters (Effective)"
+        )
+
         # Precompute global structures for cache computation
         logging.info("Precomputing global structures for cache computation...")
         try:
@@ -1240,31 +1129,42 @@ def run_flow_cache_extraction(
         
         # Extract flows and compute cache metrics
         flows_csv_path = output_path / "flows_with_cache.csv"
+        non_flow_flights_data = None
         try:
-            if use_multiprocessing:
-                logging.info("Using multiprocessing for flow extraction")
-                flight_list_paths = (occupancy_matrix, tvtw_indexer)
-                extract_flows_with_cache_mp(
-                    flight_list_paths, flow_hotspots, cache_context, flows_csv_path,
-                    mode, flowx_kwargs, slow, n_processes
+            non_flow_flights_data = extract_flows_with_cache(
+                flow_extractor,
+                flow_hotspots,
+                cache_context,
+                flows_csv_path,
+                mode,
+                flowx_kwargs,
+                slow,
+            )
+
+            if non_flow_flights_data:
+                non_flow_flights_csv_path = output_path / "non_flow_flights.csv"
+                logging.info(
+                    f"Writing non-flow flights to {non_flow_flights_csv_path}..."
                 )
-            else:
-                logging.info("Using single-threaded flow extraction")
-                extract_flows_with_cache(
-                    flow_extractor, flow_hotspots, cache_context, flows_csv_path,
-                    mode, flowx_kwargs, slow
-                )
+                with open(non_flow_flights_csv_path, "w", newline="") as csvfile:
+                    fieldnames = ["traffic_volume_id", "hour", "non_flow_flights"]
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(non_flow_flights_data)
+
         except Exception as e:
             logging.error(f"Failed during flow extraction: {e}")
             return False
-        
+
         logging.info("Flow extraction completed successfully")
         logging.info(f"Output files:")
         logging.info(f"  Hotspots: {output_path / 'hotspots.csv'}")
         logging.info(f"  Flows: {flows_csv_path}")
-        
+        if non_flow_flights_data:
+            logging.info(f"  Non-flow flights: {output_path / 'non_flow_flights.csv'}")
+
         return True
-        
+
     except KeyboardInterrupt:
         logging.info("Process interrupted by user")
         return False
@@ -1277,6 +1177,4 @@ def run_flow_cache_extraction(
 
 
 if __name__ == "__main__":
-    # Ensure multiprocessing works correctly on Windows
-    mp.set_start_method('spawn', force=True)
     main()
