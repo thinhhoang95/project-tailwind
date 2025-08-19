@@ -2,7 +2,7 @@
 
 From the historical data, the idea is that we will find a more consolidated list of routes, which we can use later for rapid lookup when it comes to finding **rerouting** solutions.
 
-1. We run group_by_city_pairs_mp.py to obtain a list of CSV files: for example: LFLF contains all flights originating and landing inside the French airspace. This will help us build a look up system more efficienty later.
+1. We run `group_by_city_pairs_mp.py` to obtain a list of CSV files: for example: LFLF contains all flights originating and landing inside the French airspace. This will help us build a look up system more efficienty later.
 
 2. We then run grouper_auto.py to perform clustering. It is based on Leiden alg for community detection. It helps slim down the set of all historical routes to key routes to help computing the impact vector.
 
@@ -28,10 +28,10 @@ Given an *occupancy* (or impact) vector of a flight, the amount of delay given i
 Likewise the *reroute* or impact vector of a flight in `reroute.py`, same folder.
 
 ---
-# The DeepFlow Regulation Plan using ALNS
-After theoretical study, the goal is to adopt ALNS to optimize over regulations rather than flights. To do this, we need flow extraction.
+# The DeepFlow Regulation Plan using Tabu Search
+After theoretical study, the goal is to adopt Tabu Search to optimize over regulations rather than flights. To do this, we need flow extraction.
 
-## ALNS
+## Tabu Search
 See `docs/walkthrough.md` for complete description of the framework. The script can be fired off from `orchestrator.py`.
 
 ## Network Evaluator
@@ -46,3 +46,9 @@ The flow extraction script is `flow_x/flow_extractor.py`. You can check out the 
 From project-cirrus, we launch the scenario_gen module `main.py` to generate multiple scenarios from the original `geojson` file. The outputs are scenario geojson files, such as summer good wx well staffed low/medium/high. Low/medium/high indicate the cut levels: low is easier to solve than medium, and medium is easier to solve than high. It requires a traffic_volumes_with_capacity.geojson file.
 
 There is absolutely no need to recompute the occupancy vectors for each flight: the scenarios just change the capacity values, and do NOT tamper with the indexing system (tvtw_indexer.json) as well as the time bins nor the definition of the traffic volumes. 
+
+# Flow Extraction to a File
+We can run the file `run_flow_cache_extraction_basic_debugmp.py` to generate the list of flows, as well as several cached statistics such as number of overloaded sectors, total overloads, and the slack when delay t time bins. This code relies on the NetworkEvaluator.
+
+Then we can visualize the flows with the help of the notebook `interactive_sector_trajectory_visualization.ipynb`.
+
