@@ -9,8 +9,8 @@ with different configurations and parameters.
 import sys
 from pathlib import Path
 
-# Import the wrapper function from cache_flow_extract_mp
-from project_tailwind.flow_x.cache_flow_extract_debug1 import run_flow_cache_extraction
+# Import the wrapper function from cache_flow_extract_debug1mp
+from project_tailwind.flow_x.cache_flow_extract_debug1mp import run_flow_cache_extraction
 
 def run_extraction(description, **kwargs):
     """Run flow cache extraction with given parameters."""
@@ -67,12 +67,12 @@ def main():
         threshold=0.0,
         # limit_hotspots=1,
         output_dir="output/examples/basic_run",
-        alpha=0.05,
+        alpha=0.0, # similarity cutoff threshold, below this will be zeroed out in the similarity matrix
         max_groups=128,
-        k_max=20,
+        k_max=12,
         avg_objective=False,
-        group_size_lam=-0.05,
-        path_length_gamma=2.0,
+        group_size_lam=-0.2, # larger = smaller groups
+        path_length_gamma=6.0, 
         debug=True
     ):
         success_count += 1

@@ -534,6 +534,10 @@ def compute_cache_metrics_vectorized(
     bins_per_hour = cache_context['bins_per_hour']
     num_tvs = cache_context['num_tvs']
     tv_row_to_id = cache_context['tv_row_to_id']
+
+    # occ_base is an array representing the total traffic count (from all flights) in every single time-volume window.
+    # g0 is an array of the exact same size, but it only contains the counts for the specific group of flights you are currently analyzing.
+    # g_t is a new array that represents the g0 occupancy values shifted forward in time by t intervals. 
     
     # Validate dimensions
     if len(g0) != len(occ_base):
@@ -569,6 +573,9 @@ def compute_cache_metrics_vectorized(
         
         # Compute shifted occupancy
         occ_t = occ_base + g_t - g0
+
+        if np.max(g0) < 1e-6:
+            raise Exception("g0 is zero")
         
         # Compute group hourly counts for shifted occupancy
         group_hourly_counts_t = np.zeros((num_tvs, 24))
@@ -596,13 +603,13 @@ def compute_cache_metrics_vectorized(
                     for bin_idx in range(hour_start, hour_end):
                         if bin_idx < len(g_t) and g_t[bin_idx] > 0:
                             present_bins += 1
-                            logging.debug(f"    Group present in hour {hour} time_bin {bin_idx - hour_start} (contributes to count_over)")
+                            # logging.debug(f"    Group present in hour {hour} time_bin {bin_idx - hour_start} (contributes to count_over)")
                     
                     if present_bins > 0:
                         tv_id = tv_row_to_id.get(tv_row, "UNKNOWN_TV")
-                        logging.debug(
-                            f"  Adding {present_bins} to count_over_t for TV {tv_id} at hour {hour}"
-                        )
+                        # logging.debug(
+                        #     f"  Adding {present_bins} to count_over_t for TV {tv_id} at hour {hour}"
+                        # )
 
                     count_over_t += present_bins
         
@@ -626,13 +633,51 @@ def compute_cache_metrics_vectorized(
                     sum_over_t += present_bins * excess_per_bin
         
         # MinSlack(t): minimum slack among group-occupied bins
-        slack_per_bin = np.maximum(cap_per_bin - occ_t, 0)
+        # Correctly compute slack based on hourly throughput, not per-bin presence.
+        # slack_per_bin = np.maximum(cap_per_bin - occ_t, 0)
+        # occ_t = occ_base - g0 + g_t
+        hourly_slack_t = hourly_capacity_matrix - hourly_occ_t
+        slack_per_bin = hourly_slack_t[tv_row_of_tvtw, hour_of_tvtw] / bins_per_hour
+        slack_per_bin = np.maximum(slack_per_bin, 0)
+
         mask_t = g_t > 0
         
+        # Define indices_to_show for logging/debugging, fixing prior scope issue.
+        indices_to_show = np.array([], dtype=int)
         if np.any(mask_t):
             min_slack_t = np.min(slack_per_bin[mask_t])
+            present_indices = np.where(mask_t)[0]
+            if len(present_indices) > 10:
+                sorted_indices = present_indices[np.argsort(slack_per_bin[mask_t])]
+                indices_to_show = sorted_indices[:10]
+            else:
+                indices_to_show = present_indices
         else:
             min_slack_t = np.nan
+
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            if np.any(mask_t):
+                present_indices = np.where(mask_t)[0]
+                logging.debug(f"--- Slack details for t={t} (group in {len(present_indices)} bins) ---")
+                if len(present_indices) > 10:
+                    logging.debug("  (showing 10 bins with lowest slack)")
+
+                for i in indices_to_show:
+                    logging.debug(
+                        f"  bin {i:4d}: cap={cap_per_bin[i]:5.2f}, occ_t={occ_t[i]:5.2f} "
+                        f"(occ_base={occ_base[i]:5.2f} - g0={g0[i]:5.2f} + g_t={g_t[i]:5.2f}), "
+                        f"slack={slack_per_bin[i]:5.2f}"
+                    )
+        
+        # if t == 15 and min_slack_t < 20:
+        #     print(f"t={t}, min_slack_t={min_slack_t}")
+        #     for i in indices_to_show:
+        #         logging.debug(
+        #             f"  bin {i:4d}: cap={cap_per_bin[i]:5.2f}, occ_t={occ_t[i]:5.2f} "
+        #             f"(occ_base={occ_base[i]:5.2f} - g0={g0[i]:5.2f} + g_t={g_t[i]:5.2f}), "
+        #             f"slack={slack_per_bin[i]:5.2f}"
+        #         )
+        #     raise Exception("Stop here")
         
         # Store results
         logging.debug(f"Final count_over for t={t}: {count_over_t}")
@@ -1125,6 +1170,10 @@ def run_flow_cache_extraction(
             logging.info(f"Created empty flows CSV at {flows_csv_path}")
             return True
         
+        # for debugging
+        # flow_hotspots = flow_hotspots[-1:] # for debugging
+        # print(f"flow_hotspots: {flow_hotspots}")
+        # logging.warning(f"Processing only {len(flow_hotspots)} hotspots for flow extraction in {mode} mode")
         logging.info(f"Processing {len(flow_hotspots)} hotspots for flow extraction in {mode} mode")
         
         # Extract flows and compute cache metrics
