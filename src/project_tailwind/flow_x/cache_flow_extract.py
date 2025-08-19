@@ -579,7 +579,10 @@ def compute_cache_metrics_vectorized(
                     sum_over_t += present_bins * excess_per_bin
         
         # MinSlack(t): minimum slack among group-occupied bins
-        slack_per_bin = np.maximum(cap_per_bin - occ_t, 0)
+        hourly_slack_t = hourly_capacity_matrix - hourly_occ_t
+        slack_per_bin = hourly_slack_t[tv_row_of_tvtw, hour_of_tvtw] / bins_per_hour
+        slack_per_bin = np.maximum(slack_per_bin, 0)
+
         mask_t = g_t > 0
         
         if np.any(mask_t):

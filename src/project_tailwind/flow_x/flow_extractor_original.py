@@ -206,24 +206,16 @@ class FlowXExtractor:
     @staticmethod
     def _spectral_group(
         W: np.ndarray,
-        lam: float = None,  # group size control parameter: higher lam means smaller groups
+        lam: float = None, # group size control parameter: higher lam means smaller groups
         normalize_by_degree: bool = False,
         average_objective: bool = True,
         k_max: Optional[int] = None,
-        tv_id: Optional[str] = None,
-        time_bin_start: Optional[str] = None,
-        log_file: Optional[str] = None,
     ) -> Tuple[np.ndarray, float]:
         """
         Spectral relaxation: take the top eigenvector of W (or D^{-1/2} W D^{-1/2}),
         order vertices by it, then perform a one-pass threshold sweep to pick a subset.
         Returns (indices_selected, best_score).
         """
-
-
-        if average_objective:
-            raise Exception("Average objective is not yet supported. It has been deprecated.")
-        
         m = int(W.shape[0])
         if m == 0:
             return np.zeros((0,), dtype=np.int64), float("-inf")
@@ -241,7 +233,6 @@ class FlowXExtractor:
             vals, vecs = np.linalg.eigh(Wn)
             v = vecs[:, -1]
         except np.linalg.LinAlgError:
-            raise Exception("Singular matrix")
             # Fallback: use power iteration
             v = np.random.default_rng(0).normal(size=m).astype(np.float64)
             v /= np.linalg.norm(v) + 1e-12
@@ -267,50 +258,22 @@ class FlowXExtractor:
         # It then calculates the objective score for that entire candidate group.
         # It compares this score to the best_score seen so far. If the current group's score is better, it updates best_score and remembers the current size k as the new best_k.
 
-        debug_info = []
-        for k in range(1, kcap + 1):  # k: group size
+        for k in range(1, kcap + 1): # k: group size
             i = int(order[k - 1])
             # sum weights to current set
             if in_set.any():
                 pair_sum += float(W[i, in_set].sum())
             in_set[i] = True
 
-            score = float("nan")
             if k >= 2:
                 if average_objective:
                     denom = (k * (k - 1)) / 2.0
                     score = pair_sum / denom if denom > 0 else 0.0
                 else:
-                    score = pair_sum - float(
-                        lam
-                    ) * k  # k controls the size of the group: higher lam means smaller groups
+                    score = pair_sum - float(lam) * k # k controls the size of the group: higher lam means smaller groups
                 if score > best_score:
                     best_score = score
                     best_k = k
-            
-            if log_file and k <= 10:
-                debug_info.append({"k": k, "pair_sum": pair_sum, "score": score})
-
-
-        if log_file and tv_id and time_bin_start:
-            with open(log_file, "a") as f:
-                f.write(
-                    f"--- Processing traffic_volume_id: {tv_id}, time_bin: {time_bin_start}, kcap: {kcap}, m = {m}, matrix_size: {W.shape} ---\n"
-                )
-                if m > 1:
-                    upper_tri_indices = np.triu_indices(m, k=1)
-                    top_10_sim = sorted(W[upper_tri_indices], reverse=True)[:10]
-                    f.write(f"Top 10 similarity values in W: {top_10_sim}\n")
-
-                for info in debug_info:
-                    f.write(
-                        f"k={info['k']}, pair_sum={info['pair_sum']:.4f}, score={info['score']:.4f}\n"
-                    )
-                
-                f.write(f"Best k: {best_k}, Best score: {best_score}\n")
-                f.write(
-                    f"--- End of processing for {tv_id}, {time_bin_start} ---\n\n"
-                )
 
         if best_k < 2:
             best_k = min(2, m)
@@ -410,7 +373,6 @@ class FlowXExtractor:
             t_r: Optional[int] = None
             # Allow r to occur at tH due to bin quantization
             for t in range(0, tH + 1):
-            # for t in range(tH, -1, -1):
                 if r_tv_row in seq[t]:
                     t_r = t
                     break
@@ -432,7 +394,7 @@ class FlowXExtractor:
                 if not last:
                     continue
                 aligned = [last]
-            if len(aligned) < min_aligned_bins:
+            if len(aligned) == 0:
                 continue
             eligible.append(fid)
             A_r[fid] = aligned
@@ -687,14 +649,6 @@ class FlowXExtractor:
                 # print(f"🪂 Debugging reference TV: {self._tv_row_to_id(r_tv_row)} as row {r_tv_row}")
 
                 # Align sequences from r to H over the full, fixed set
-                # Iterates through flights: The method loops through each flight in candidate_flight_ids.
-                # Checks for hotspot entry: It first checks if a flight enters the hotspot H_tv_row by looking up its entry time in the H_entry dictionary.
-                # Finds reference point: If the flight enters the hotspot, the code then looks for the time it passed through the reference traffic volume r_tv_row, ensuring this happens on or before it reaches the hotspot.
-                # Filters by duration: The method makes sure there's a minimum number of time steps between passing the reference point and reaching the hotspot.
-                # Extracts trajectory: For flights that meet all these criteria, it extracts the portion of their trajectory between the reference point and the hotspot.
-                # Returns results: The method returns two things:
-                # flights_r: A list of the flight IDs that met the criteria.
-                # A_r: A dictionary where keys are the eligible flight IDs and values are their extracted trajectory segments.
                 flights_r, A_r = self._align_from_reference_to_H(
                     r_tv_row, H_tv_row, candidate_flight_ids, A, H_entry
                 )
@@ -731,9 +685,6 @@ class FlowXExtractor:
                     normalize_by_degree=bool(normalize_by_degree),
                     average_objective=bool(average_objective),
                     k_max=k_max_trajectories_per_group,
-                    tv_id=hotspot_tv_id,
-                    time_bin_start=str(hotspot_hour),
-                    log_file="spectral_group_debug.txt",
                 )
                 if len(selected_idx) < W.shape[0]:
                     # print(f"✅ Looks like what it should be: selected {len(selected_idx)} < {W.shape[0]}")
