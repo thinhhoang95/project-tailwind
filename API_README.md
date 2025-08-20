@@ -8,6 +8,7 @@ This FastAPI server provides endpoints for analyzing traffic volume occupancy da
 - **`/tv_flights`** - Get flight identifiers grouped by time window for a specific traffic volume
 - **`/tv_flights_ordered`** - Get all flights for a traffic volume ordered by proximity to a reference time
 - **`/traffic_volumes`** - List all available traffic volume IDs
+- **`/tv_count_with_capacity`** - Get occupancy counts along with hourly capacity for a traffic volume
 - **Data Science Integration** - Uses `NetworkEvaluator` for computational analysis
 - **Network Abstraction** - `AirspaceAPIWrapper` handles network layer and JSON serialization
 
@@ -49,6 +50,33 @@ Returns occupancy counts for all time windows of a specific traffic volume.
     "06:15-06:30": 35,
     "06:30-06:45": 28,
     ...
+  },
+  "metadata": {
+    "time_bin_minutes": 15,
+    "total_time_windows": 96,
+    "total_flights_in_tv": 1234
+  }
+}
+```
+
+### GET `/tv_count_with_capacity?traffic_volume_id={id}`
+
+Returns occupancy counts for all time windows of a specific traffic volume, plus hourly capacity sourced from the traffic volumes GeoJSON.
+
+**Parameters:**
+- `traffic_volume_id` (string): The traffic volume ID to analyze
+
+**Response:**
+```json
+{
+  "traffic_volume_id": "MASB5KL",
+  "occupancy_counts": {
+    "06:00-06:15": 42,
+    "06:15-06:30": 35
+  },
+  "hourly_capacity": {
+    "06:00-07:00": 23,
+    "07:00-08:00": 25
   },
   "metadata": {
     "time_bin_minutes": 15,

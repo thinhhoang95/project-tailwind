@@ -37,6 +37,26 @@ async def get_tv_count(traffic_volume_id: str) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+@app.get("/tv_count_with_capacity")
+async def get_tv_count_with_capacity(traffic_volume_id: str) -> Dict[str, Any]:
+    """
+    Get occupancy counts for all time windows of a specific traffic volume,
+    along with the hourly capacity from the GeoJSON.
+    
+    Returns a dictionary with keys:
+    - traffic_volume_id
+    - occupancy_counts: {"HH:MM-HH:MM": int}
+    - hourly_capacity: {"HH:00-HH+1:00": float}
+    - metadata
+    """
+    try:
+        result = await airspace_wrapper.get_traffic_volume_occupancy_with_capacity(traffic_volume_id)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
 @app.get("/traffic_volumes")
 async def get_traffic_volumes() -> Dict[str, Any]:
     """
