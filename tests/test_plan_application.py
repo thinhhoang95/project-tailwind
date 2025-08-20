@@ -138,6 +138,7 @@ def test_plan_evaluator_builds_delta_and_metrics():
     base = _MiniFlightList(time_bin_minutes=15, tv_ids=tv_ids, flight_metadata=meta)
 
     parser = _make_parser(indexer, flights_json)
+    # 1) String-parsed regulation
     plan = NetworkPlan([f"TV_TVA IC__ 3 {win}"])
 
     evaluator = PlanEvaluator(traffic_volumes_gdf=gdf, parser=parser, tvtw_indexer=indexer)
@@ -151,6 +152,21 @@ def test_plan_evaluator_builds_delta_and_metrics():
     assert hasattr(result["excess_vector"], "shape")
     # Delay stats include total_delay_seconds
     assert "total_delay_seconds" in result["delay_stats"]
+
+    # 2) Explicit target_flight_ids without relying on parser
+    from project_tailwind.optimize.regulation import Regulation
+    reg2 = Regulation.from_components(
+        location="TVA",
+        rate=3,
+        time_windows=[win],
+        filter_type="IC",
+        filter_value="__",
+        target_flight_ids=["F1", "F2"],
+    )
+    plan2 = NetworkPlan([reg2])
+    result2 = evaluator.evaluate_plan(plan2, base)
+    delays2 = result2["delays_by_flight"]
+    assert set(delays2.keys()) <= {"F1", "F2"}
 
 
 def test_network_plan_move_builds_delta_view():
@@ -190,11 +206,95 @@ def test_network_plan_move_builds_delta_view():
     base = _MiniFlightList(time_bin_minutes=15, tv_ids=tv_ids, flight_metadata=meta)
 
     parser = _make_parser(indexer, flights_json)
-    plan = NetworkPlan([f"TV_TVA IC__ 3 {win}"])
+    # Also test explicit flight list path for NetworkPlanMove
+    from project_tailwind.optimize.regulation import Regulation
+    reg = Regulation.from_components(location="TVA", rate=3, time_windows=[win], target_flight_ids=["F1", "F2"])
+    plan = NetworkPlan([reg])
     move = NetworkPlanMove(network_plan=plan, parser=parser, tvtw_indexer=indexer)
 
     delta_view, total_delay = move.build_delta_view(base)
     assert isinstance(delta_view, DeltaFlightList)
     assert total_delay >= 0
 
+
+def test_objective_decreases_with_regulation_when_weighted_for_z_sum_only():
+    tv_ids = ["TVA"]
+    indexer = _make_indexer(tv_ids, time_bin_minutes=15)
+
+    t0 = datetime(2024, 1, 1, 8, 0, 0)
+    win = 32
+    # Three flights in the same early hour to create overload vs capacity=1/h
+    flights_json = {
+        "F1": {
+            "takeoff_time": t0.isoformat(sep=" "),
+            "origin": "AAA",
+            "destination": "BBB",
+            "distance": 100.0,
+            "occupancy_intervals": [
+                {"tvtw_index": indexer.get_tvtw_index("TVA", win), "entry_time_s": 0, "exit_time_s": 60}
+            ],
+        },
+        "F2": {
+            "takeoff_time": t0.isoformat(sep=" "),
+            "origin": "AAA",
+            "destination": "BBB",
+            "distance": 120.0,
+            "occupancy_intervals": [
+                {"tvtw_index": indexer.get_tvtw_index("TVA", win), "entry_time_s": 300, "exit_time_s": 360}
+            ],
+        },
+        "F3": {
+            "takeoff_time": t0.isoformat(sep=" "),
+            "origin": "AAA",
+            "destination": "BBB",
+            "distance": 140.0,
+            "occupancy_intervals": [
+                {"tvtw_index": indexer.get_tvtw_index("TVA", win), "entry_time_s": 600, "exit_time_s": 660}
+            ],
+        },
+    }
+
+    # Capacity only defined for 08:00-09:00 hour, forcing excess there if >1 flight
+    gdf = gpd.GeoDataFrame({
+        "traffic_volume_id": ["TVA"],
+        "capacity": [
+            {"08:00-09:00": 1}
+        ],
+        "geometry": [None],
+    })
+
+    meta = {
+        fid: {
+            "takeoff_time": datetime.fromisoformat(v["takeoff_time"]),
+            "occupancy_intervals": v["occupancy_intervals"],
+        }
+        for fid, v in flights_json.items()
+    }
+    base = _MiniFlightList(time_bin_minutes=15, tv_ids=tv_ids, flight_metadata=meta)
+
+    parser = _make_parser(indexer, flights_json)
+    evaluator = PlanEvaluator(traffic_volumes_gdf=gdf, parser=parser, tvtw_indexer=indexer)
+
+    # Baseline objective with no regulation
+    empty_plan = NetworkPlan([])
+    weights = {"alpha": 1.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0}
+    res0 = evaluator.evaluate_plan(empty_plan, base, weights=weights)
+    obj0 = res0["objective"]
+
+    # Apply a tight regulation (1 flight/hour) on the same window and flights to queue them across hours
+    from project_tailwind.optimize.regulation import Regulation
+    reg = Regulation.from_components(
+        location="TVA",
+        rate=1,
+        time_windows=[win],
+        filter_type="IC",
+        filter_value="__",
+        target_flight_ids=["F1", "F2", "F3"],
+    )
+    plan1 = NetworkPlan([reg])
+    res1 = evaluator.evaluate_plan(plan1, base, weights=weights)
+    obj1 = res1["objective"]
+
+    # The objective should decrease when overload is reduced
+    assert obj1 < obj0, f"Expected regulated objective < baseline (got {obj1} vs {obj0})"
 

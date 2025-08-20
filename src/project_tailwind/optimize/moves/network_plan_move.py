@@ -98,7 +98,12 @@ class NetworkPlanMove:
         flight_delays_by_regulation: Dict[str, List[float]] = defaultdict(list)
 
         for regulation in self.network_plan.regulations:
-            matched_flights = self.parser.parse(regulation)
+            # Prefer explicit targets if provided
+            matched_flights = (
+                regulation.target_flight_ids
+                if getattr(regulation, "target_flight_ids", None) is not None
+                else self.parser.parse(regulation)
+            )
             if not matched_flights:
                 continue
 
