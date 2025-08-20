@@ -40,7 +40,7 @@ class AirspaceAPIWrapper:
         try:
             # Load traffic volumes GeoDataFrame
             # Update this path based on your actual data location
-            traffic_volumes_path = "D:/project-cirrus/cases/traffic_volumes_with_capacity.geojson"
+            traffic_volumes_path = "D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
             
             if not Path(traffic_volumes_path).exists():
                 # Fallback to a relative path if absolute doesn't exist
@@ -107,6 +107,54 @@ class AirspaceAPIWrapper:
         except Exception as e:
             # Log the error and re-raise as a generic exception
             print(f"Error computing occupancy for {traffic_volume_id}: {e}")
+            raise e
+
+    async def get_traffic_volume_occupancy_with_capacity(self, traffic_volume_id: str) -> Dict[str, Any]:
+        """
+        Get occupancy counts for all time windows of a specific traffic volume,
+        along with the hourly capacity from the GeoJSON.
+        
+        Returns a JSON-serializable dictionary including:
+        - occupancy_counts: {"HH:MM-HH:MM": count}
+        - hourly_capacity: {"HH:00-HH+1:00": capacity}
+        """
+        self._ensure_evaluator_ready()
+
+        loop = asyncio.get_event_loop()
+        try:
+            # Compute occupancy counts as in the base method
+            occupancy_counts = await loop.run_in_executor(
+                self._executor,
+                self._evaluator.get_traffic_volume_occupancy_counts,
+                traffic_volume_id,
+            )
+
+            # Retrieve hourly capacity map for this traffic volume
+            hourly_caps_raw = self._evaluator.hourly_capacity_by_tv.get(traffic_volume_id)
+            if hourly_caps_raw is None:
+                raise ValueError(f"Traffic volume ID '{traffic_volume_id}' not found or has no capacity data")
+
+            def _format_hour_label(h: int) -> str:
+                start = f"{h:02d}:00"
+                end = f"{(h + 1) % 24:02d}:00"
+                return f"{start}-{end}"
+
+            hourly_capacity = { _format_hour_label(int(h)): float(c) for h, c in hourly_caps_raw.items() }
+
+            return {
+                "traffic_volume_id": traffic_volume_id,
+                "occupancy_counts": occupancy_counts,
+                "hourly_capacity": hourly_capacity,
+                "metadata": {
+                    "time_bin_minutes": self._evaluator.time_bin_minutes,
+                    "total_time_windows": len(occupancy_counts),
+                    "total_flights_in_tv": sum(occupancy_counts.values()),
+                },
+            }
+        except ValueError:
+            raise
+        except Exception as e:
+            print(f"Error computing occupancy with capacity for {traffic_volume_id}: {e}")
             raise e
 
     async def get_traffic_volume_flight_ids(self, traffic_volume_id: str) -> Dict[str, Any]:
