@@ -7,6 +7,7 @@ This FastAPI server provides endpoints for analyzing traffic volume occupancy da
 - **`/tv_count`** - Get occupancy counts for all time windows of a specific traffic volume
 - **`/tv_flights`** - Get flight identifiers grouped by time window for a specific traffic volume
 - **`/tv_flights_ordered`** - Get all flights for a traffic volume ordered by proximity to a reference time
+- **`/regulation_ranking_tv_flights_ordered`** - Rank ordered TV flights by heuristic features with scores and components
 - **`/traffic_volumes`** - List all available traffic volume IDs
 - **`/tv_count_with_capacity`** - Get occupancy counts along with hourly capacity for a traffic volume
 - **`/hotspots`** - Get list of hotspots where traffic volume exceeds capacity with detailed statistics
@@ -143,6 +144,58 @@ Use `ref_time_str` in numeric `HHMMSS` format (e.g., `084510` for 08:45:10). `HH
 }
 ```
 
+### GET `/regulation_ranking_tv_flights_ordered?traffic_volume_id={id}&ref_time_str={HHMMSS}&seed_flight_ids={csv}&top_k={n}`
+
+Ranks flights that pass through the specified traffic volume near a reference time using heuristic features from `FlightFeatures`. It reuses the ordered flights list and augments with a score and component breakdown.
+
+Use `ref_time_str` in numeric `HHMMSS` format (e.g., `084510` for 08:45:10). `HHMM` is also accepted (seconds assumed 00). Provide `seed_flight_ids` as a comma-separated list.
+
+**Parameters:**
+- `traffic_volume_id` (string): The traffic volume ID to analyze
+- `ref_time_str` (string): Reference time for ordering flights by proximity
+- `seed_flight_ids` (string): Comma-separated seed flight IDs used to build the footprint
+- `top_k` (integer, optional): Limit number of ranked flights returned
+
+**Response:**
+```json
+{
+  "traffic_volume_id": "MASB5KL",
+  "ref_time_str": "080010",
+  "seed_flight_ids": ["0200AFRAM650E", "3944E1AFR96RF"],
+  "ranked_flights": [
+    {
+      "flight_id": "0200AFRAM650E",
+      "arrival_time": "08:00:12",
+      "time_window": "08:00-08:15",
+      "delta_seconds": 2,
+      "score": 0.873,
+      "components": {
+        "multiplicity": 1.0,
+        "similarity": 0.75,
+        "slack": 0.62
+      }
+    },
+    {
+      "flight_id": "1234XYZZY",
+      "arrival_time": "08:02:30",
+      "time_window": "08:00-08:15",
+      "delta_seconds": 140,
+      "score": 0.721,
+      "components": {
+        "multiplicity": 0.6,
+        "similarity": 0.50,
+        "slack": 0.58
+      }
+    }
+  ],
+  "metadata": {
+    "num_candidates": 120,
+    "num_ranked": 20,
+    "time_bin_minutes": 15
+  }
+}
+```
+
 ### GET `/traffic_volumes`
 
 Returns list of available traffic volume IDs.
@@ -241,6 +294,10 @@ curl "http://localhost:8000/tv_flights?traffic_volume_id=MASB5KL"
 
 ```bash
 curl "http://localhost:8000/tv_flights_ordered?traffic_volume_id=MASB5KL&ref_time_str=080010"
+```
+
+```bash
+curl "http://localhost:8000/regulation_ranking_tv_flights_ordered?traffic_volume_id=MASB5KL&ref_time_str=080010&seed_flight_ids=0200AFRAM650E,3944E1AFR96RF&top_k=20"
 ```
 
 ```bash

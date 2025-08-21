@@ -4,7 +4,7 @@ Provides endpoints for traffic volume occupancy analysis.
 """
 
 from fastapi import FastAPI, HTTPException
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from .airspace.airspace_api_wrapper import AirspaceAPIWrapper
 
 app = FastAPI(title="Airspace Traffic Analysis API", version="1.0.0")
@@ -116,6 +116,37 @@ async def get_hotspots(threshold: float = 0.0) -> Dict[str, Any]:
     try:
         result = await airspace_wrapper.get_hotspots(threshold)
         return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.get("/regulation_ranking_tv_flights_ordered")
+async def get_regulation_ranking_tv_flights_ordered(
+    traffic_volume_id: str,
+    ref_time_str: str,
+    seed_flight_ids: str,
+    top_k: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Rank flights passing a traffic volume near a reference time using heuristic features.
+
+    Parameters:
+    - traffic_volume_id: TV identifier
+    - ref_time_str: reference time in HHMMSS (or HHMM) format
+    - seed_flight_ids: comma-separated seed flight IDs
+    - top_k: optional limit on number of results
+
+    Returns ranked flights with arrival time, score and component breakdown.
+    """
+    try:
+        result = await airspace_wrapper.get_regulation_ranking_tv_flights_ordered(
+            traffic_volume_id=traffic_volume_id,
+            ref_time_str=ref_time_str,
+            seed_flight_ids=seed_flight_ids,
+            top_k=top_k,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 

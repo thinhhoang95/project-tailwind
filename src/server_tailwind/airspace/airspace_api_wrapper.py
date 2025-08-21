@@ -6,11 +6,13 @@ and the data science logic in NetworkEvaluator.
 """
 
 import json
-from typing import Dict, Any, Optional
+import time
+from typing import Dict, Any, Optional, List
 from pathlib import Path
 import geopandas as gpd
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import threading
 
 # Import relative to the project structure
 import sys
@@ -18,6 +20,7 @@ project_root = Path(__file__).parent.parent.parent.parent / "src"
 sys.path.insert(0, str(project_root))
 
 from project_tailwind.optimize.eval.flight_list import FlightList
+from project_tailwind.optimize.features.flight_features import FlightFeatures
 from .network_evaluator_for_api import NetworkEvaluator
 
 
@@ -33,6 +36,8 @@ class AirspaceAPIWrapper:
         """Initialize the API wrapper with data loading."""
         self._evaluator: Optional[NetworkEvaluator] = None
         self._executor = ThreadPoolExecutor(max_workers=2)
+        self._flight_features: Optional[FlightFeatures] = None
+        self._features_lock = threading.Lock()
         self._initialize_data()
     
     def _initialize_data(self):
@@ -264,6 +269,109 @@ class AirspaceAPIWrapper:
         except Exception as e:
             print(f"Error computing hotspots: {e}")
             raise e
+
+    async def get_regulation_ranking_tv_flights_ordered(
+        self,
+        traffic_volume_id: str,
+        ref_time_str: str,
+        seed_flight_ids: str,
+        top_k: Optional[int] = None,
+        *,
+        normalize: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Return candidate flights in a traffic volume ordered by proximity to ref time,
+        augmented with regulation ranking scores based on FlightFeatures.
+
+        Args:
+            traffic_volume_id: Traffic volume identifier
+            ref_time_str: Reference time string in HHMMSS (or HHMM) format
+            seed_flight_ids: Comma-separated seed flight IDs
+            top_k: Optionally limit number of ranked flights returned
+            normalize: Whether to normalize feature components to [0, 1]
+
+        Returns:
+            Dictionary containing ranked flights with arrival info and score components.
+        """
+        self._ensure_evaluator_ready()
+
+        # Get ordered flights and arrival details using existing functionality
+        ordered = await self.get_traffic_volume_flights_ordered_by_ref_time(
+            traffic_volume_id, ref_time_str
+        )
+
+        candidate_flight_ids = list(ordered.get("ordered_flights", []))
+        details_list = ordered.get("details", [])
+        detail_by_fid = {d.get("flight_id"): d for d in details_list}
+
+        # Parse seeds (comma-separated)
+        seeds = [s.strip() for s in str(seed_flight_ids).split(",") if s.strip()]
+
+        loop = asyncio.get_event_loop()
+
+        def _compute_rank() -> List[Dict[str, Any]]:
+            # Reuse a single cached FlightFeatures instance built on the master flight list
+            # Lazily initialize to avoid heavy startup cost
+            time_start = time.time()
+            if self._flight_features is None:
+                with self._features_lock:
+                    if self._flight_features is None:
+                        self._flight_features = FlightFeatures(
+                            self._flight_list,
+                            self._evaluator,
+                        )
+                        time_end = time.time()
+                        print(f"FlightFeatures computation took {time_end - time_start} seconds")
+            feats = self._flight_features
+            time_start = time.time()
+            seed_footprint = feats.compute_seed_footprint(seeds)
+            time_end = time.time()
+            print(f"Seed footprint computation took {time_end - time_start} seconds")
+            time_start = time.time()
+            return feats.rank_candidates(
+                seed_footprint,
+                candidate_flight_ids=candidate_flight_ids,
+                normalize=normalize,
+                top_k=top_k,
+            )
+
+        try:
+            ranked = await loop.run_in_executor(self._executor, _compute_rank)
+        except ValueError:
+            raise
+        except Exception as e:
+            print(
+                f"Error computing regulation ranking for {traffic_volume_id} at {ref_time_str}: {e}"
+            )
+            raise e
+
+        # Merge ranking with arrival details
+        ranked_with_details: List[Dict[str, Any]] = []
+        for item in ranked:
+            fid = item.get("flight_id")
+            det = detail_by_fid.get(fid, {})
+            ranked_with_details.append(
+                {
+                    "flight_id": fid,
+                    "arrival_time": det.get("arrival_time"),
+                    "time_window": det.get("time_window"),
+                    "delta_seconds": det.get("delta_seconds"),
+                    "score": item.get("score"),
+                    "components": item.get("components", {}),
+                }
+            )
+
+        return {
+            "traffic_volume_id": traffic_volume_id,
+            "ref_time_str": ref_time_str,
+            "seed_flight_ids": seeds,
+            "ranked_flights": ranked_with_details,
+            "metadata": {
+                "num_candidates": len(candidate_flight_ids),
+                "num_ranked": len(ranked_with_details),
+                "time_bin_minutes": self._evaluator.time_bin_minutes,
+            },
+        }
     
     def __del__(self):
         """Clean up the thread pool executor."""
