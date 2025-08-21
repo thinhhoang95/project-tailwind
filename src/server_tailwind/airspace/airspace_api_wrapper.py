@@ -229,6 +229,41 @@ class AirspaceAPIWrapper:
                 "total_flights": self._evaluator.flight_list.num_flights
             }
         }
+
+    async def get_hotspots(self, threshold: float = 0.0) -> Dict[str, Any]:
+        """
+        Get list of hotspots (traffic volumes where capacity exceeds demand).
+        
+        Args:
+            threshold: Minimum excess traffic to consider as overloaded
+            
+        Returns:
+            Dictionary with hotspot information including traffic_volume_id, 
+            time_bin, z_max, z_sum, and other statistics
+        """
+        self._ensure_evaluator_ready()
+        
+        loop = asyncio.get_event_loop()
+        try:
+            hotspots = await loop.run_in_executor(
+                self._executor,
+                self._evaluator.get_hotspots,
+                threshold
+            )
+            
+            return {
+                "hotspots": hotspots,
+                "count": len(hotspots),
+                "metadata": {
+                    "threshold": threshold,
+                    "time_bin_minutes": self._evaluator.time_bin_minutes,
+                    "analysis_type": "hourly_excess_capacity"
+                }
+            }
+            
+        except Exception as e:
+            print(f"Error computing hotspots: {e}")
+            raise e
     
     def __del__(self):
         """Clean up the thread pool executor."""
