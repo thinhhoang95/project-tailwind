@@ -167,6 +167,11 @@ class NetworkEvaluator:
         """
         total_occupancy = self.flight_list.get_total_occupancy_by_tvtw()
         num_tvtws = len(total_occupancy)
+        num_tvs = len(self.tv_id_to_idx)
+        bins_per_tv = 24 * (60 // self.time_bin_minutes)
+        # Defensive check: ensure consistent shape
+        if num_tvtws != num_tvs * bins_per_tv:
+            raise ValueError(f"num_tvtws ({num_tvtws}) != num_tvs * bins_per_tv ({num_tvs} * {bins_per_tv} expected)")
         excess_vector = np.zeros(num_tvtws)
 
         bins_per_hour = 60 // self.time_bin_minutes

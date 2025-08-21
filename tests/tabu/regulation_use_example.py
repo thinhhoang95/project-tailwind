@@ -158,6 +158,7 @@ def main():
     print(f"Computation completed in {time_end - time_start} seconds")
     # Technically it could also be done through calling compute_horizon_metrics(horizon_time_windows=0)
     # but we will write everything out here for now for clarity
+    # Recall: z_max is the maximum excess traffic in any TVTW, z_sum is the total excess traffic across all TVTWs.
     pre_z_sum = float(pre_excess.sum()) if pre_excess.size > 0 else 0.0
     pre_z_max = float(pre_excess.max()) if pre_excess.size > 0 else 0.0
     pre_metrics = {
