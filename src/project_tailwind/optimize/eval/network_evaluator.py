@@ -95,7 +95,7 @@ class NetworkEvaluator:
                 if start_hour is None:
                     continue
 
-                self.hourly_capacity_by_tv[tv_id][start_hour] = hourly_capacity
+                self.hourly_capacity_by_tv[tv_id][start_hour] = float(hourly_capacity)
 
     def _get_total_capacity_vector(self) -> np.ndarray:
         """
@@ -155,6 +155,11 @@ class NetworkEvaluator:
         hourly throughput capacity, and distributes any excess traffic equally
         back to the TVTWs within that hour.
 
+        Output Format:
+        Excess Count per TVTW: [(TV1, TW1), (TV1, TW2), ... (TV2, TW1), ...]
+        i.e., the first 96 values are the excess counts for TV1, the next 96 are for TV2, etc.
+        This format is consistent with tvtw_indexer.py's output format.
+
         Returns:
             1D numpy array where:
             - 0 indicates no overload
@@ -173,9 +178,10 @@ class NetworkEvaluator:
 
         # Aggregate occupancy into hourly buckets for each traffic volume
         num_time_bins_per_tv = num_tvtws // len(self.tv_id_to_idx)
-        if num_time_bins_per_tv != 96:
+        expected_bins_per_tv = 24 * (60 // self.time_bin_minutes)
+        if num_time_bins_per_tv != expected_bins_per_tv:
             raise ValueError(
-                f"Number of time bins per TVTW is not 96: {num_time_bins_per_tv}"
+                f"num_time_bins_per_tv mismatch: expected {expected_bins_per_tv}, got {num_time_bins_per_tv}"
             )
 
         for tv_id, tv_row in self.tv_id_to_idx.items():
@@ -224,9 +230,18 @@ class NetworkEvaluator:
                                 tvtw_indices_for_hour.append(tvtw_idx)
 
                     if tvtw_indices_for_hour:
-                        excess_per_tvtw = hourly_excess / len(tvtw_indices_for_hour)
-                        for tvtw_idx in tvtw_indices_for_hour:
-                            excess_vector[tvtw_idx] += excess_per_tvtw
+                        # Instead of equal split, allocate hourly excess proportionally to the per-bin occupancy within the hour.
+                        # This preserves z_sum and makes z_95 more indicative of peak bins:
+                        hour_bins = np.arange(start_bin_of_hour, end_bin_of_hour)
+                        mask = hour_bins < num_time_bins_per_tv
+                        tvtw_indices_for_hour = (tv_start + hour_bins[mask]).tolist()
+                        bin_demands = total_occupancy[tvtw_indices_for_hour]
+                        den = float(np.sum(bin_demands))
+                        if den > 0:
+                            weights = bin_demands / den
+                        else:
+                            weights = np.full_like(bin_demands, 1.0 / len(bin_demands), dtype=float)
+                        excess_vector[tvtw_indices_for_hour] += hourly_excess * weights
 
         return excess_vector
 
@@ -546,22 +561,39 @@ class NetworkEvaluator:
         Returns:
             Dictionary with z_max (maximum excess) and z_sum (total excess)
         """
+
         excess_vector = self.compute_excess_traffic_vector()
+        # reshape by (num_tvs, num_time_bins_per_tv), keep first K time bins for all TVs
+        num_tvtws = self.flight_list.num_tvtws
+        num_tvs = len(self.tv_id_to_idx)
+        bins_per_tv = 24 * (60 // self.time_bin_minutes)
+        # Defensive check: ensure consistent shape
+        if num_tvtws != num_tvs * bins_per_tv:
+            raise ValueError(f"num_tvtws ({num_tvtws}) != num_tvs * bins_per_tv ({num_tvs} * {bins_per_tv} expected)")
+            # excess_vector = np.resize(excess_vector, (num_tvs * bins_per_tv,))  # or raise
+        # Apply horizon across time axis
+        if horizon_time_windows > 0:
+            k = min(horizon_time_windows, bins_per_tv)
+            ev2d = excess_vector.reshape(num_tvs, bins_per_tv)
+            excess_vector = ev2d[:, :k].ravel()
+
         # delay_vector = self.compute_delay_stats()
 
         # Limit to horizon
-        if horizon_time_windows > 0:
-            excess_vector = excess_vector[:horizon_time_windows]
+        # if horizon_time_windows > 0:
+        #     excess_vector = excess_vector[:horizon_time_windows]
 
         z_95 = (
             float(np.percentile(excess_vector, percentile_for_z_max))
             if len(excess_vector) > 0
             else 0.0
         )
+        z_max = float(np.max(excess_vector)) if len(excess_vector) > 0 else 0.0
         z_sum = float(np.sum(excess_vector))
 
         return {
             "z_95": z_95,
+            "z_max": z_max,
             "z_sum": z_sum,
             "horizon_windows": len(excess_vector),
             # "total_delay_seconds": delay_vector["total_delay_seconds"],
