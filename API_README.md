@@ -9,6 +9,7 @@ This FastAPI server provides endpoints for analyzing traffic volume occupancy da
 - **`/tv_flights_ordered`** - Get all flights for a traffic volume ordered by proximity to a reference time
 - **`/traffic_volumes`** - List all available traffic volume IDs
 - **`/tv_count_with_capacity`** - Get occupancy counts along with hourly capacity for a traffic volume
+- **`/hotspots`** - Get list of hotspots where traffic volume exceeds capacity with detailed statistics
 - **Data Science Integration** - Uses `NetworkEvaluator` for computational analysis
 - **Network Abstraction** - `AirspaceAPIWrapper` handles network layer and JSON serialization
 
@@ -159,6 +160,54 @@ Returns list of available traffic volume IDs.
 }
 ```
 
+### GET `/hotspots?threshold={value}`
+
+Returns list of hotspots (traffic volume and time bin combinations where capacity exceeds demands) with detailed statistics including z_max and z_sum metrics.
+
+**Parameters:**
+- `threshold` (float, optional): Minimum excess traffic to consider as overloaded (default: 0.0)
+
+**Response:**
+```json
+{
+  "hotspots": [
+    {
+      "traffic_volume_id": "MASB5KL",
+      "time_bin": "06:00-07:00",
+      "z_max": 12.5,
+      "z_sum": 45.2,
+      "hourly_occupancy": 67.0,
+      "hourly_capacity": 55.0,
+      "is_overloaded": true
+    },
+    {
+      "traffic_volume_id": "TV001",
+      "time_bin": "08:00-09:00", 
+      "z_max": 8.3,
+      "z_sum": 32.1,
+      "hourly_occupancy": 43.0,
+      "hourly_capacity": 35.0,
+      "is_overloaded": true
+    }
+  ],
+  "count": 2,
+  "metadata": {
+    "threshold": 0.0,
+    "time_bin_minutes": 15,
+    "analysis_type": "hourly_excess_capacity"
+  }
+}
+```
+
+**Response Fields:**
+- `traffic_volume_id`: String identifier for the traffic volume
+- `time_bin`: Hourly time window in format "HH:00-HH+1:00"
+- `z_max`: Maximum excess traffic within the time bin
+- `z_sum`: Total excess traffic within the time bin  
+- `hourly_occupancy`: Actual traffic volume for the hour
+- `hourly_capacity`: Maximum capacity for the hour
+- `is_overloaded`: Boolean indicating if occupancy exceeds capacity
+
 ## Architecture
 
 ### Components
@@ -192,6 +241,10 @@ curl "http://localhost:8000/tv_flights?traffic_volume_id=MASB5KL"
 
 ```bash
 curl "http://localhost:8000/tv_flights_ordered?traffic_volume_id=MASB5KL&ref_time_str=080010"
+```
+
+```bash
+curl "http://localhost:8000/hotspots?threshold=0.0"
 ```
 
 ## Configuration

@@ -103,6 +103,22 @@ async def get_tv_flights_ordered(traffic_volume_id: str, ref_time_str: str) -> D
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+@app.get("/hotspots")
+async def get_hotspots(threshold: float = 0.0) -> Dict[str, Any]:
+    """
+    Get list of hotspots (traffic volume and time bin where capacity exceeds demands).
+    
+    Returns hotspots with traffic_volume_id, time bin, z_max, z_sum, and other statistics.
+    
+    Args:
+        threshold: Minimum excess traffic to consider as overloaded (default: 0.0)
+    """
+    try:
+        result = await airspace_wrapper.get_hotspots(threshold)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

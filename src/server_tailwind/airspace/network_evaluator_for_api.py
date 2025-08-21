@@ -546,6 +546,9 @@ class NetworkEvaluator:
         Returns:
             Dictionary with z_max (maximum excess) and z_sum (total excess)
         """
+
+        raise NotImplementedError("compute_horizon_metrics is currently regarded as faulty and not available for API use.")
+
         excess_vector = self.compute_excess_traffic_vector()
         # delay_vector = self.compute_delay_stats()
 
@@ -891,6 +894,75 @@ class NetworkEvaluator:
             result[time_window] = flight_ids
 
         return result
+
+    def get_hotspots(self, threshold: float = 0.0) -> List[Dict[str, Any]]:
+        """
+        Get list of hotspots (traffic volumes with excess capacity) with detailed statistics.
+        
+        Args:
+            threshold: Minimum excess traffic to consider as overloaded
+            
+        Returns:
+            List of dictionaries with hotspot information including:
+            - traffic_volume_id: string
+            - time_bin: string like "06:00-06:15" 
+            - z_max: maximum excess for this hotspot
+            - z_sum: total excess for this hotspot
+            - hourly_occupancy: actual traffic volume
+            - hourly_capacity: capacity limit
+            - is_overloaded: boolean flag
+        """
+        # Get hotspot data from the base method
+        hotspot_data = self.get_hotspot_flights(threshold=threshold, mode="hour")
+        
+        if not hotspot_data:
+            return []
+        
+        # Compute excess vector to get z_max and z_sum
+        excess_vector = self.compute_excess_traffic_vector()
+        total_occupancy = self.flight_list.get_total_occupancy_by_tvtw()
+        
+        # Helper to calculate z_max and z_sum for each (tv, hour)
+        num_tvtws = self.flight_list.num_tvtws
+        num_time_bins_per_tv = num_tvtws // len(self.tv_id_to_idx)
+        bins_per_hour = 60 // self.time_bin_minutes
+        
+        results = []
+        for item in hotspot_data:
+            tv_id = item["traffic_volume_id"]
+            hour = item["hour"]
+            
+            # Calculate indices for this hour
+            tv_row = self.tv_id_to_idx[tv_id]
+            tv_start = tv_row * num_time_bins_per_tv
+            start_bin = tv_start + hour * bins_per_hour
+            end_bin = min(start_bin + bins_per_hour, tv_start + num_time_bins_per_tv)
+            
+            # Get z_max and z_sum for this hour
+            hour_indices = list(range(start_bin, end_bin))
+            hour_excess = excess_vector[hour_indices]
+            hour_occupancy = total_occupancy[hour_indices]
+            
+            z_max = float(np.max(hour_excess)) if len(hour_excess) > 0 else 0.0
+            z_sum = float(np.sum(hour_excess))
+            
+            # Format time bin as hour range
+            time_bin = f"{hour:02d}:00-{(hour+1):02d}:00"
+            
+            results.append({
+                "traffic_volume_id": tv_id,
+                "time_bin": time_bin,
+                "z_max": z_max,
+                "z_sum": z_sum,
+                "hourly_occupancy": float(item["hourly_occupancy"]),
+                "hourly_capacity": float(item["hourly_capacity"]),
+                "is_overloaded": bool(item["is_overloaded"])
+            })
+        
+        # Sort by z_sum descending (most problematic first)
+        results.sort(key=lambda x: x["z_sum"], reverse=True)
+        
+        return results
 
     def get_traffic_volume_flights_ordered_by_ref_time(
         self, traffic_volume_id: str, ref_time_str: str
