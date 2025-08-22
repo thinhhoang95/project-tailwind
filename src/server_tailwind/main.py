@@ -57,6 +57,33 @@ async def get_tv_count_with_capacity(traffic_volume_id: str) -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+@app.get("/slack_distribution")
+async def get_slack_distribution(
+    traffic_volume_id: str, ref_time_str: str, sign: str
+) -> Dict[str, Any]:
+    """
+    Get slack distribution across all TVs by shifting the reference bin by nominal travel time.
+
+    Query params:
+    - traffic_volume_id: source TV id
+    - ref_time_str: HHMM, HHMMSS, HH:MM or HH:MM:SS
+    - sign: "plus" or "minus"
+    """
+    try:
+        result = await airspace_wrapper.get_slack_distribution(
+            traffic_volume_id=traffic_volume_id,
+            ref_time_str=ref_time_str,
+            sign=sign,
+        )
+        return result
+    except ValueError as e:
+        msg = str(e)
+        if "sign must be one of" in msg:
+            raise HTTPException(status_code=400, detail=msg)
+        raise HTTPException(status_code=404, detail=msg)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
 @app.get("/traffic_volumes")
 async def get_traffic_volumes() -> Dict[str, Any]:
     """
