@@ -79,6 +79,53 @@ def build_overloaded_bin_flight_map(evaluator: NetworkEvaluator) -> Dict[int, Li
     return mapping
 
 
+def list_overloaded_bin_hotspots(
+    evaluator: NetworkEvaluator, indexer: TVTWIndexer
+) -> List[Tuple[int, str, int]]:
+    """
+    Build a list of overloaded hotspots at bin-level for interactive selection.
+    Returns a list of tuples: (tvtw_index, label, flight_count)
+    where label is like "TV_NAME at HH:MM-HH:MM".
+    """
+    results = evaluator.get_hotspot_flights(threshold=0.0, mode="bin")
+    menu: List[Tuple[int, str, int]] = []
+    for item in results:
+        try:
+            tvtw_idx = int(item.get("tvtw_index"))
+        except Exception:
+            continue
+        tv_name, time_label = indexer.get_human_readable_tvtw(tvtw_idx) or ("?", "?")
+        flight_count = len(item.get("flight_ids", []))
+        menu.append((tvtw_idx, f"{tv_name} at {time_label}", flight_count))
+    return menu
+
+
+def prompt_hotspot_selection(options: List[Tuple[int, str, int]]) -> int | None:
+    """
+    Present a numeric menu and return the selected tvtw_index, or None if aborted.
+    """
+    if not options:
+        print("X No overloaded hotspots found (threshold > 0.0).")
+        return None
+
+    print("\n2) Select a hotspot to inspect")
+    for idx, (_tvtw, label, cnt) in enumerate(options, start=1):
+        print(f"  [{idx}] {label} — {cnt} flights")
+    print("  [q] Quit")
+
+    while True:
+        choice = input("Enter selection #: ").strip().lower()
+        if choice in {"q", "quit", "exit"}:
+            return None
+        try:
+            sel = int(choice)
+            if 1 <= sel <= len(options):
+                return options[sel - 1][0]
+        except Exception:
+            pass
+        print("Invalid selection. Please enter a valid number or 'q' to quit.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
@@ -126,23 +173,10 @@ def main():
     evaluator = NetworkEvaluator(tvs_gdf, flight_list)
     indexer = TVTWIndexer.load(args.tvtw_indexer)
 
-    # Prompt inputs
-    print("\n2) Enter selection for inspection")
-    tv_id = input("Enter traffic_volume_id: ").strip()
-    time_bin_label = input("Enter time bin (e.g., 06:00-06:15): ").strip()
-
-    # Map to time-window index and global TVTW index
-    try:
-        time_idx = parse_time_bin_label(time_bin_label, flight_list.time_bin_minutes)
-    except Exception as e:
-        print(f"X {e}")
-        return
-
-    tvtw_index = indexer.get_tvtw_index(tv_id, time_idx)
+    # Interactive menu for hotspot selection (bin-level)
+    options = list_overloaded_bin_hotspots(evaluator, indexer)
+    tvtw_index = prompt_hotspot_selection(options)
     if tvtw_index is None:
-        print(
-            "X Could not map (tv_id, time_bin) to a TVTW index. Check the TV id and time bin label."
-        )
         return
 
     print("\n3) Finding overloaded hotspots and flights...")
