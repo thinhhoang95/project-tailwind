@@ -11,6 +11,7 @@ This FastAPI server provides endpoints for analyzing traffic volume occupancy da
 - **`/traffic_volumes`** - List all available traffic volume IDs
 - **`/tv_count_with_capacity`** - Get occupancy counts along with hourly capacity for a traffic volume
 - **`/hotspots`** - Get list of hotspots where traffic volume exceeds capacity with detailed statistics
+- **`/slack_distribution`** - For a source TV and reference time, returns per-TV slack at the query bin shifted by nominal travel time (475 kts)
 - **Data Science Integration** - Uses `NetworkEvaluator` for computational analysis
 - **Network Abstraction** - `AirspaceAPIWrapper` handles network layer and JSON serialization
 
@@ -251,6 +252,64 @@ Returns list of hotspots (traffic volume and time bin combinations where capacit
   }
 }
 ```
+
+### GET `/slack_distribution?traffic_volume_id={id}&ref_time_str={time}&sign={plus|minus}`
+
+Returns a slack distribution across all traffic volumes at the “query bin” computed by shifting the source reference bin by the nominal travel time (distance at 475 kts). Useful for finding TVs with spare capacity to absorb demand.
+
+Accepts flexible time formats for `ref_time_str`: `HHMMSS`, `HHMM`, `HH:MM`, `HH:MM:SS`.
+
+**Parameters:**
+- `traffic_volume_id` (string): Source traffic volume ID
+- `ref_time_str` (string): Reference time string
+- `sign` (string): Either `plus` or `minus` (shift direction)
+
+**Response:**
+```json
+{
+  "traffic_volume_id": "MASB5KL",
+  "ref_time_str": "08:30",
+  "sign": "plus",
+  "time_bin_minutes": 15,
+  "nominal_speed_kts": 475.0,
+  "count": 3,
+  "results": [
+    {
+      "traffic_volume_id": "TV001",
+      "time_window": "08:45-09:00",
+      "slack": 12.0,
+      "occupancy": 3.0,
+      "capacity_per_bin": 15.0,
+      "distance_nm": 120.5,
+      "travel_minutes": 15.2,
+      "bin_offset": 1,
+      "clamped": false
+    },
+    {
+      "traffic_volume_id": "TV002",
+      "time_window": "08:30-08:45",
+      "slack": 8.0,
+      "occupancy": 5.0,
+      "capacity_per_bin": 13.0,
+      "distance_nm": 90.0,
+      "travel_minutes": 11.4,
+      "bin_offset": 1,
+      "clamped": false
+    }
+  ]
+}
+```
+
+**Result Fields:**
+- `traffic_volume_id`: Destination TV ID
+- `time_window`: Query time window label `HH:MM-HH:MM`
+- `slack`: `capacity_per_bin - occupancy`
+- `occupancy`: Occupancy at the query bin
+- `capacity_per_bin`: Hourly capacity distributed evenly across bins in the hour
+- `distance_nm`: Great-circle distance between TV centroids
+- `travel_minutes`: Nominal travel time at 475 kts
+- `bin_offset`: Signed bin shift applied from the reference bin
+- `clamped`: Whether the query bin was clamped to the day edges
 
 **Response Fields:**
 - `traffic_volume_id`: String identifier for the traffic volume
