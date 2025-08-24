@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException
 from typing import Dict, Any, Optional
 from .airspace.airspace_api_wrapper import AirspaceAPIWrapper
 
-app = FastAPI(title="Airspace Traffic Analysis API", version="1.0.0")
+app = FastAPI(title="Airspace Traffic Analysis API", version="1.0.0", debug=True)
 
 # Initialize the airspace API wrapper
 airspace_wrapper = AirspaceAPIWrapper()
@@ -59,7 +59,7 @@ async def get_tv_count_with_capacity(traffic_volume_id: str) -> Dict[str, Any]:
 
 @app.get("/slack_distribution")
 async def get_slack_distribution(
-    traffic_volume_id: str, ref_time_str: str, sign: str
+    traffic_volume_id: str, ref_time_str: str, sign: str, delta_min: float = 0.0
 ) -> Dict[str, Any]:
     """
     Get slack distribution across all TVs by shifting the reference bin by nominal travel time.
@@ -68,12 +68,14 @@ async def get_slack_distribution(
     - traffic_volume_id: source TV id
     - ref_time_str: HHMM, HHMMSS, HH:MM or HH:MM:SS
     - sign: "plus" or "minus"
+    - delta_min: additional time shift in minutes (can be negative); applied after travel-time shift
     """
     try:
         result = await airspace_wrapper.get_slack_distribution(
             traffic_volume_id=traffic_volume_id,
             ref_time_str=ref_time_str,
             sign=sign,
+            delta_min=delta_min,
         )
         return result
     except ValueError as e:
@@ -144,6 +146,7 @@ async def get_hotspots(threshold: float = 0.0) -> Dict[str, Any]:
         result = await airspace_wrapper.get_hotspots(threshold)
         return result
     except Exception as e:
+        print(f"Error in get_hotspots: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/regulation_ranking_tv_flights_ordered")
