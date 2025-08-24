@@ -11,7 +11,7 @@ This FastAPI server provides endpoints for analyzing traffic volume occupancy da
 - **`/traffic_volumes`** - List all available traffic volume IDs
 - **`/tv_count_with_capacity`** - Get occupancy counts along with hourly capacity for a traffic volume
 - **`/hotspots`** - Get list of hotspots where traffic volume exceeds capacity with detailed statistics
-- **`/slack_distribution`** - For a source TV and reference time, returns per-TV slack at the query bin shifted by nominal travel time (475 kts)
+- **`/slack_distribution`** - For a source TV and reference time, returns per-TV slack at the query bin shifted by nominal travel time (475 kts), with an optional additional shift `delta_min` (minutes)
 - **Data Science Integration** - Uses `NetworkEvaluator` for computational analysis
 - **Network Abstraction** - `AirspaceAPIWrapper` handles network layer and JSON serialization
 
@@ -253,9 +253,9 @@ Returns list of hotspots (traffic volume and time bin combinations where capacit
 }
 ```
 
-### GET `/slack_distribution?traffic_volume_id={id}&ref_time_str={time}&sign={plus|minus}`
+### GET `/slack_distribution?traffic_volume_id={id}&ref_time_str={time}&sign={plus|minus}&delta_min={minutes}`
 
-Returns a slack distribution across all traffic volumes at the “query bin” computed by shifting the source reference bin by the nominal travel time (distance at 475 kts). Useful for finding TVs with spare capacity to absorb demand.
+Returns a slack distribution across all traffic volumes at the “query bin” computed by shifting the source reference bin by the nominal travel time (distance at 475 kts). You can optionally apply an additional shift of `delta_min` minutes (positive or negative) after the travel-time shift. Useful for finding TVs with spare capacity to absorb demand.
 
 Accepts flexible time formats for `ref_time_str`: `HHMMSS`, `HHMM`, `HH:MM`, `HH:MM:SS`.
 
@@ -263,6 +263,7 @@ Accepts flexible time formats for `ref_time_str`: `HHMMSS`, `HHMM`, `HH:MM`, `HH
 - `traffic_volume_id` (string): Source traffic volume ID
 - `ref_time_str` (string): Reference time string
 - `sign` (string): Either `plus` or `minus` (shift direction)
+- `delta_min` (float, optional): Extra shift in minutes applied after travel-time shift; can be negative; default `0.0`
 
 **Response:**
 ```json
@@ -270,6 +271,7 @@ Accepts flexible time formats for `ref_time_str`: `HHMMSS`, `HHMM`, `HH:MM`, `HH
   "traffic_volume_id": "MASB5KL",
   "ref_time_str": "08:30",
   "sign": "plus",
+  "delta_min": 0.0,
   "time_bin_minutes": 15,
   "nominal_speed_kts": 475.0,
   "count": 3,
@@ -310,6 +312,7 @@ Accepts flexible time formats for `ref_time_str`: `HHMMSS`, `HHMM`, `HH:MM`, `HH
 - `travel_minutes`: Nominal travel time at 475 kts
 - `bin_offset`: Signed bin shift applied from the reference bin
 - `clamped`: Whether the query bin was clamped to the day edges
+- `delta_min` (top-level field): The additional shift, in minutes, that was applied
 
 **Response Fields:**
 - `traffic_volume_id`: String identifier for the traffic volume

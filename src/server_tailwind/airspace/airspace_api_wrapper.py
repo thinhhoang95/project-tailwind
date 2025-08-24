@@ -53,7 +53,8 @@ class AirspaceAPIWrapper:
         try:
             # Load traffic volumes GeoDataFrame
             # Update this path based on your actual data location
-            traffic_volumes_path = "D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
+            # traffic_volumes_path = "D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
+            traffic_volumes_path = "/Volumes/CrucialX/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
             
             if not Path(traffic_volumes_path).exists():
                 # Fallback to a relative path if absolute doesn't exist
@@ -223,10 +224,11 @@ class AirspaceAPIWrapper:
             self._tv_travel_minutes = nested
             return self._tv_travel_minutes
 
-    async def get_slack_distribution(self, traffic_volume_id: str, ref_time_str: str, sign: str) -> Dict[str, Any]:
+    async def get_slack_distribution(self, traffic_volume_id: str, ref_time_str: str, sign: str, delta_min: float = 0.0) -> Dict[str, Any]:
         """
         For the given source traffic volume and reference time, compute slack at the
-        corresponding query bin for every TV by shifting by nominal travel time.
+        corresponding query bin for every TV by shifting by nominal travel time, then
+        applying an additional shift of delta_min minutes.
         """
         self._ensure_evaluator_ready()
 
@@ -275,6 +277,7 @@ class AirspaceAPIWrapper:
                     "traffic_volume_id": traffic_volume_id,
                     "ref_time_str": ref_time_str,
                     "sign": sign,
+                    "delta_min": float(delta_min),
                     "time_bin_minutes": self._evaluator.time_bin_minutes,
                     "nominal_speed_kts": 475.0,
                     "count": 0,
@@ -292,13 +295,12 @@ class AirspaceAPIWrapper:
             for dst, dst_row in tv_map.items():
                 # Travel minutes from src to dst
                 m = float(travel_minutes_map.get(src, {}).get(dst, 0.0))
-                shift_bins = int(round(m / float(self._evaluator.time_bin_minutes)))
-                if sign == "plus":
-                    query_bin = ref_bin + shift_bins
-                    bin_offset = shift_bins
-                else:
-                    query_bin = ref_bin - shift_bins
-                    bin_offset = -shift_bins
+                sign_mult = 1 if sign == "plus" else -1
+                # Combine travel-time minutes and delta_min first, then discretize once
+                total_offset_minutes = sign_mult * m + float(delta_min)
+                total_offset_bins = int(round(total_offset_minutes / float(self._evaluator.time_bin_minutes)))
+                query_bin = ref_bin + total_offset_bins
+                bin_offset = total_offset_bins
 
                 clamped = False
                 if query_bin < 0:
@@ -338,6 +340,7 @@ class AirspaceAPIWrapper:
                 "traffic_volume_id": traffic_volume_id,
                 "ref_time_str": ref_time_str,
                 "sign": sign,
+                "delta_min": float(delta_min),
                 "time_bin_minutes": self._evaluator.time_bin_minutes,
                 "nominal_speed_kts": 475.0,
                 "count": len(results),
