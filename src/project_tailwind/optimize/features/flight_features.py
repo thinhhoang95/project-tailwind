@@ -6,6 +6,10 @@ Features per flight:
 - footprint set: traffic volumes visited by the flight
 - slack valley score: measures how deep capacity slack valleys are around the
   flight's scheduled times in the TVs it traverses (higher is worse slack)
+ - NSH score: approximated score per prompts/tabu/prompt_for_nsh_gap.md capturing
+   best average of the minimum slack across the flight's footprint over a
+   short window (higher suggests more ability to absorb delay without creating
+   a secondary hotspot)
 
 Also provides ranking helper to combine features with configurable weights.
 """
@@ -33,6 +37,7 @@ class FlightFeatureValues:
     slack_valley_score: positive number, larger means deeper shortage of slack around schedule
     slack_min_p5: the most severe (lowest) 5th percentile slack across TVs visited
     slack_mean_over_tvs: mean of per-TV mean slacks around schedule
+    nsh_score: approximated NSH score per prompt; higher is better
     """
 
     footprint_tv_ids: Set[str]
@@ -40,6 +45,10 @@ class FlightFeatureValues:
     slack_valley_score: float
     slack_min_p5: float
     slack_mean_over_tvs: float
+    # Approximate NSH score as described in prompts/tabu/prompt_for_nsh_gap.md
+    # Uses window length L (default 4) and maximizes over t in [1, nsh_max_t]
+    # with x_s approximated as 0. Higher is better (more slack available for hit-taking).
+    nsh_score: float
 
 
 class FlightFeatures:
@@ -59,10 +68,14 @@ class FlightFeatures:
         overload_threshold: float = 0.0,
         *,
         limit_to_flight_ids: Optional[Iterable[str]] = None,
+        nsh_window_L: int = 4,
+        nsh_max_t: int = 8,
     ) -> None:
         self.flight_list = flight_list
         self.evaluator = evaluator
         self.overload_threshold = float(overload_threshold)
+        self._nsh_window_L: int = max(1, int(nsh_window_L))
+        self._nsh_max_t: int = max(1, int(nsh_max_t))
         # If provided, compute features only for these flight ids
         self._flight_id_pool: Set[str] = (
             set(limit_to_flight_ids) if limit_to_flight_ids is not None else set(self.flight_list.flight_ids)
@@ -116,6 +129,9 @@ class FlightFeatures:
     def slack_valley(self, flight_id: str) -> float:
         return float(self._features[flight_id].slack_valley_score)
 
+    def nsh_score(self, flight_id: str) -> float:
+        return float(self._features[flight_id].nsh_score)
+
     def compute_seed_footprint(self, seed_flight_ids: Iterable[str]) -> Set[str]:
         seed_set: Set[str] = set()
         for fid in seed_flight_ids:
@@ -133,13 +149,13 @@ class FlightFeatures:
         normalize: bool = True,
         top_k: Optional[int] = None,
     ) -> List[Dict[str, object]]:
-        """Rank candidate flights combining multiplicity/similarity/slack.
+        """Rank candidate flights combining multiplicity/similarity/slack/NSH.
 
         Parameters
         ----------
         seed_footprint_tv_ids: set of TV ids that represent seed footprint
         candidate_flight_ids: iterable of flight ids to rank; if None, rank all
-        weights: mapping with keys 'multiplicity', 'similarity', 'slack'
+        weights: mapping with keys 'multiplicity', 'similarity', 'slack', 'nsh'
         normalize: if True, normalize raw components to [0, 1] across pool
         top_k: optionally return only the top K results
 
@@ -153,8 +169,8 @@ class FlightFeatures:
             else list(self._features.keys())
         )
 
-        # Defaults favor multiplicity, then slack, then similarity
-        w = {"multiplicity": 0.5, "similarity": 0.2, "slack": 0.3}
+        # Defaults favor multiplicity, then slack, then similarity; NSH off by default
+        w = {"multiplicity": 0.5, "similarity": 0.2, "slack": 0.3, "nsh": 0.0}
         if weights:
             w.update(weights)
 
@@ -162,10 +178,12 @@ class FlightFeatures:
         raw_mult: List[float] = []
         raw_sim: List[float] = []
         raw_slack: List[float] = []
+        raw_nsh: List[float] = []
         for fid in pool:
             feats = self._features[fid]
             raw_mult.append(float(feats.multiplicity_by_hour))
             raw_slack.append(float(feats.slack_valley_score))
+            raw_nsh.append(float(feats.nsh_score))
             raw_sim.append(
                 _jaccard_similarity(feats.footprint_tv_ids, seed_footprint_tv_ids)
             )
@@ -173,13 +191,20 @@ class FlightFeatures:
         mult_arr = np.asarray(raw_mult, dtype=float)
         sim_arr = np.asarray(raw_sim, dtype=float)
         slack_arr = np.asarray(raw_slack, dtype=float)
+        nsh_arr = np.asarray(raw_nsh, dtype=float)
 
         if normalize:
             mult_arr = _safe_minmax_norm(mult_arr)
             # similarity already ∈ [0,1]
             slack_arr = _safe_minmax_norm(slack_arr)
+            nsh_arr = _safe_minmax_norm(nsh_arr)
 
-        scores = w["multiplicity"] * mult_arr + w["similarity"] * sim_arr + w["slack"] * slack_arr
+        scores = (
+            w["multiplicity"] * mult_arr
+            + w["similarity"] * sim_arr
+            + w["slack"] * slack_arr
+            + w["nsh"] * nsh_arr
+        )
 
         results: List[Dict[str, object]] = []
         for i, fid in enumerate(pool):
@@ -191,6 +216,7 @@ class FlightFeatures:
                         "multiplicity": float(mult_arr[i]),
                         "similarity": float(sim_arr[i]),
                         "slack": float(slack_arr[i]),
+                        "nsh": float(nsh_arr[i]),
                     },
                 }
             )
@@ -253,12 +279,15 @@ class FlightFeatures:
         # Build dense capacity matrix (rows: tv rows per evaluator mapping, cols: hours)
         cap_mat: Optional[np.ndarray] = None
         occ_mat: Optional[np.ndarray] = None
+        # Boolean mask indicating where capacity is actually known/defined
+        cap_mask: Optional[np.ndarray] = None
         num_rows: int = 0
         num_hours: int = 0
         if isinstance(hourly_occupancy, np.ndarray) and hourly_occupancy.size > 0:
             occ_mat = hourly_occupancy.astype(np.float32, copy=False)
             num_rows, num_hours = int(occ_mat.shape[0]), int(occ_mat.shape[1])
             cap_mat = np.zeros_like(occ_mat, dtype=np.float32)
+            cap_mask = np.zeros_like(occ_mat, dtype=bool)
             # Fill capacities from mapping {tv_id -> {hour -> cap}}
             for tv_id, per_hour in capacity_by_tv.items():
                 row_idx = tv_id_to_row.get(tv_id)
@@ -271,6 +300,7 @@ class FlightFeatures:
                         hh = int(h)
                         if 0 <= hh < num_hours:
                             cap_mat[row_idx, hh] = float(cap)
+                            cap_mask[row_idx, hh] = True
                     except Exception:
                         continue
 
@@ -353,12 +383,85 @@ class FlightFeatures:
             # Positive valley score: deeper negative slack -> higher score
             slack_valley_score = float(max(0.0, -slack_min_p5))
 
+            # -------------------------------------------------------
+            # NSH score (vectorized, simplified per prompt):
+            # J(t, L) = (1/L) * sum_{k=0..L-1} min_s sl_s( (t + k) + xi_s )
+            # with xi_s set to the earliest scheduled hour at tv s, offset by
+            # the earliest such hour across footprint (so min(xi_s)=0).
+            # We ignore x_s component per prompt.
+            # Then J = max_{t in [1, nsh_max_t]} J(t, L).
+            nsh_score = 0.0
+            if occ_mat is not None and cap_mat is not None and by_tv:
+                # Build arrays of row indices and xi_s for footprint TVs
+                earliest_hours: List[int] = []
+                row_indices: List[int] = []
+                for tv_id, hours in by_tv.items():
+                    if not hours:
+                        continue
+                    row_idx = tv_id_to_row.get(tv_id)
+                    if row_idx is None or row_idx < 0 or row_idx >= num_rows:
+                        continue
+                    # Use earliest visited hour for this TV as base "arrival"
+                    try:
+                        h0 = int(min(int(h) for h in hours))
+                    except Exception:
+                        continue
+                    if h0 < 0 or h0 >= num_hours:
+                        # Clip to range; if outside entirely, skip
+                        continue
+                    row_indices.append(int(row_idx))
+                    earliest_hours.append(int(h0))
+
+                if row_indices:
+                    rows_arr = np.asarray(row_indices, dtype=np.int32)
+                    h0_arr = np.asarray(earliest_hours, dtype=np.int32)
+                    # Normalize xi so the first arrival is at time 0
+                    anchor = int(h0_arr.min())
+                    xi_arr = (h0_arr - anchor).astype(np.int32, copy=False)
+
+                    # Precompute tau offsets for window L
+                    Lw = int(self._nsh_window_L)
+                    tau_offsets = np.arange(Lw, dtype=np.int32)[None, :]  # shape (1, L)
+                    rows_mat = rows_arr[:, None]  # shape (S, 1)
+                    xi_mat = xi_arr[:, None]      # shape (S, 1)
+
+                    best = -np.inf
+                    for t_off in range(1, int(self._nsh_max_t) + 1):
+                        # times for each TV across window: (S, L)
+                        times = xi_mat + int(t_off) + tau_offsets
+                        # Valid mask in horizon AND where capacity is known
+                        valid_time = (times >= 0) & (times < num_hours)
+                        # Broadcast rows to (S, L)
+                        rows_idx = np.broadcast_to(rows_mat, times.shape)
+                        # Capacity-known mask for these samples
+                        if cap_mask is not None:
+                            cap_known = cap_mask[rows_idx, times]
+                            valid = valid_time & cap_known
+                        else:
+                            valid = valid_time
+                        # Gather slacks
+                        slc = (cap_mat[rows_idx, times] - occ_mat[rows_idx, times]).astype(np.float32, copy=False)
+                        # Mask invalids as +inf so they don't affect mins
+                        slc = np.where(valid, slc, np.inf)
+                        # Min across TVs -> (L,)
+                        min_over_s = np.min(slc, axis=0)
+                        # Only average over valid taus (where at least one TV valid)
+                        tau_valid = np.isfinite(min_over_s)
+                        if not np.any(tau_valid):
+                            jt = 0.0
+                        else:
+                            jt = float(np.sum(min_over_s[tau_valid]) / max(1, int(np.sum(tau_valid))))
+                        if jt > best:
+                            best = jt
+                    nsh_score = float(0.0 if not np.isfinite(best) else best)
+
             features[fid] = FlightFeatureValues(
                 footprint_tv_ids=footprint,
                 multiplicity_by_hour=int(mult),
                 slack_valley_score=slack_valley_score,
                 slack_min_p5=float(slack_min_p5),
                 slack_mean_over_tvs=float(slack_mean_over_tvs),
+                nsh_score=float(nsh_score),
             )
         return features
 
