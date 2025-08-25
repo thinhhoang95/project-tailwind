@@ -780,12 +780,21 @@ class AirspaceAPIWrapper:
                 parser=parser,
                 tvtw_indexer=tvtw_indexer,
             )
+            time_start = time.time()
             plan_result = evaluator.evaluate_plan(network_plan, self._flight_list, weights=weights)
+            time_end = time.time()
+            print(f"Plan evaluation took {time_end - time_start} seconds")
 
             # Rolling-hour occupancy arrays for all bins per TV (length = bins_per_tv)
             # 1) Build flat occupancy vectors pre/post
+            time_start = time.time()
             pre_total = self._flight_list.get_total_occupancy_by_tvtw().astype(np.float32, copy=False)
+            time_end = time.time()
+            print(f"Pre-regulation occupancy computation took {time_end - time_start} seconds")
+            time_start = time.time()
             post_total = plan_result["delta_view"].get_total_occupancy_by_tvtw().astype(np.float32, copy=False)
+            time_end = time.time()
+            print(f"Post-regulation occupancy computation took {time_end - time_start} seconds")
 
             # 2) Dimensions and helpers
             num_tvtws = int(self._flight_list.num_tvtws)
@@ -809,6 +818,7 @@ class AirspaceAPIWrapper:
                 post_by_tv[row, :] = post_total[start:end]
 
             # 5) Rolling-hour (forward) sums per bin: sum over bins [i, i+W-1] (clamped at end)
+            time_start = time.time()
             def rolling_forward_sum_full(mat: np.ndarray, window: int) -> np.ndarray:
                 # pad zeros at end to keep length the same (forward-looking window)
                 pad = [(0, 0), (0, window - 1)]
@@ -821,13 +831,14 @@ class AirspaceAPIWrapper:
 
             pre_roll = rolling_forward_sum_full(pre_by_tv, bins_per_hour)
             post_roll = rolling_forward_sum_full(post_by_tv, bins_per_hour)
-
+            time_end = time.time()
+            print(f"Rolling-hour sums computation took {time_end - time_start} seconds")
+            
             # 6) Capacity per bin for each TV (repeat hourly capacity across bins in that hour)
-            # Use server evaluator for consistent capacity parsing
-            base_eval = NetworkEvaluator(self._traffic_volumes_gdf, self._flight_list)
+            # Reuse the cached evaluator for consistent capacity parsing
             cap_by_tv = {}
             for tv_id, row in tv_items:
-                hourly_caps = base_eval.hourly_capacity_by_tv.get(tv_id, {})
+                hourly_caps = self._evaluator.hourly_capacity_by_tv.get(tv_id, {})
                 if not hourly_caps:
                     # mark as missing capacity with -1.0 per bin
                     cap_by_tv[tv_id] = np.full(bins_per_tv, -1.0, dtype=np.float32)
