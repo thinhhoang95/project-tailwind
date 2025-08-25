@@ -59,8 +59,8 @@ class AirspaceAPIWrapper:
         try:
             # Load traffic volumes GeoDataFrame
             # Update this path based on your actual data location
-            traffic_volumes_path = "D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
-            # traffic_volumes_path = "/Volumes/CrucialX/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
+            # traffic_volumes_path = "D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
+            traffic_volumes_path = "/Volumes/CrucialX/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
             
             if not Path(traffic_volumes_path).exists():
                 # Fallback to a relative path if absolute doesn't exist
@@ -885,7 +885,29 @@ class AirspaceAPIWrapper:
                     continue
                 ranking.append((tv_id, float(np.max(busy_pre))))
             ranking.sort(key=lambda t: t[1], reverse=True)
-            selected_tv_ids = [tv for tv, _ in ranking[: max(0, int(top_k))]]
+            # Ensure reference TVs from the regulations appear first (deduplicated), then fill with ranked TVs
+            regulated_tv_ids: List[str] = []
+            for reg in network_plan.regulations:
+                loc = getattr(reg, "location", None)
+                if loc and loc in self._flight_list.tv_id_to_idx:
+                    regulated_tv_ids.append(loc)
+
+            # Deduplicate while preserving order
+            seen: set = set()
+            dedup_reg_tvs: List[str] = []
+            for tv in regulated_tv_ids:
+                if tv not in seen:
+                    seen.add(tv)
+                    dedup_reg_tvs.append(tv)
+
+            # Append ranked TVs excluding ones already included
+            ordered_tv_ids: List[str] = list(dedup_reg_tvs)
+            for tv, _ in ranking:
+                if tv not in seen:
+                    seen.add(tv)
+                    ordered_tv_ids.append(tv)
+
+            selected_tv_ids = ordered_tv_ids[: max(0, int(top_k))]
 
             # 9) Package rolling arrays for selected TVs
             rolling_top_tvs: List[Dict[str, Any]] = []
