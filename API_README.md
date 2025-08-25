@@ -328,7 +328,7 @@ Accepts flexible time formats for `ref_time_str`: `HHMMSS`, `HHMM`, `HH:MM`, `HH
 
 ### POST `/regulation_plan_simulation`
 
-Simulates a regulation plan and returns per-flight delays, evaluation metrics, and rolling-hour occupancy for the top-K busiest TVs across all traffic volumes. TVs are ranked by max(pre_rolling_count − hourly_capacity) computed over the union of all active time windows provided in the plan.
+Simulates a regulation plan and returns per-flight delays, evaluation metrics, and rolling-hour occupancy for the top-K busiest TVs across all traffic volumes. TVs are ranked by max(pre_rolling_count − hourly_capacity) computed over the union of all active time windows provided in the plan. Also returns `pre_flight_context` with baseline takeoff and TV-arrival times for flights present in `delays_by_flight`.
 
 You can provide regulations as raw strings in the `Regulation` DSL or as structured objects.
 
@@ -364,6 +364,9 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
 ```json
 {
   "delays_by_flight": {"F1": 5, "F2": 0},
+  "pre_flight_context": {
+    "F1": {"takeoff_time": "07:12:05", "tv_arrival_time": "08:00:12"}
+  },
   "delay_stats": {
     "total_delay_seconds": 300.0,
     "mean_delay_seconds": 150.0,
@@ -403,6 +406,9 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
   }
 }
 ```
+
+Fields:
+- `pre_flight_context`: Map of flight ID → `{takeoff_time, tv_arrival_time}` strings (HH:MM:SS). `tv_arrival_time` can be `null` if the flight does not enter any regulated traffic volume.
 
 **cURL Example:**
 ```bash

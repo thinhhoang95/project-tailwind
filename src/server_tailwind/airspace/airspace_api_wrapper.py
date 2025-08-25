@@ -14,6 +14,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import numpy as np
+from datetime import timedelta
 
 # Import relative to the project structure
 import sys
@@ -713,7 +714,7 @@ class AirspaceAPIWrapper:
         regulations: List[Any],
         *,
         weights: Optional[Dict[str, float]] = None,
-        top_k: int = 25,
+        top_k: int = 50,
         include_excess_vector: bool = False,
     ) -> Dict[str, Any]:
         """
@@ -912,11 +913,77 @@ class AirspaceAPIWrapper:
                     }
                 }
 
+            # Build pre-flight context: takeoff time and baseline arrival time to any regulated TV
+            pre_flight_context: Dict[str, Dict[str, Optional[str]]] = {}
+            delays_by_flight = plan_result.get("delays_by_flight", {}) or {}
+            if delays_by_flight:
+                # Collect regulated TV ranges [start, end) in the flat TVTW index space
+                regulated_tv_ids: List[str] = []
+                for reg in network_plan.regulations:
+                    loc = getattr(reg, "location", None)
+                    if loc and loc in self._flight_list.tv_id_to_idx:
+                        regulated_tv_ids.append(loc)
+
+                # Deduplicate while preserving order
+                seen: set = set()
+                reg_tv_ids_dedup: List[str] = []
+                for tv in regulated_tv_ids:
+                    if tv not in seen:
+                        seen.add(tv)
+                        reg_tv_ids_dedup.append(tv)
+                regulated_tv_ids = reg_tv_ids_dedup
+
+                tv_ranges: List[Tuple[str, int, int]] = []
+                for tv_id in regulated_tv_ids:
+                    row = self._flight_list.tv_id_to_idx[tv_id]
+                    start = row * bins_per_tv
+                    end = start + bins_per_tv
+                    tv_ranges.append((tv_id, start, end))
+
+                for fid in delays_by_flight.keys():
+                    meta = self._flight_list.flight_metadata.get(fid)
+                    if not meta:
+                        continue
+                    takeoff_dt = meta.get("takeoff_time")
+                    if not takeoff_dt:
+                        continue
+
+                    # Earliest entry to any regulated TV
+                    earliest_entry_s: Optional[int] = None
+                    for interval in meta.get("occupancy_intervals", []):
+                        col = interval.get("tvtw_index")
+                        if col is None:
+                            continue
+                        in_reg_tv = False
+                        for _, s, e in tv_ranges:
+                            if s <= int(col) < e:
+                                in_reg_tv = True
+                                break
+                        if not in_reg_tv:
+                            continue
+                        entry_s = int(interval.get("entry_time_s", 0))
+                        if earliest_entry_s is None or entry_s < earliest_entry_s:
+                            earliest_entry_s = entry_s
+
+                    # Format times
+                    takeoff_time_str = f"{takeoff_dt.hour:02d}:{takeoff_dt.minute:02d}:{takeoff_dt.second:02d}"
+                    if earliest_entry_s is not None:
+                        arrival_dt = takeoff_dt + timedelta(seconds=int(earliest_entry_s))
+                        tv_arrival_time_str: Optional[str] = f"{arrival_dt.hour:02d}:{arrival_dt.minute:02d}:{arrival_dt.second:02d}"
+                    else:
+                        tv_arrival_time_str = None
+
+                    pre_flight_context[fid] = {
+                        "takeoff_time": takeoff_time_str,
+                        "tv_arrival_time": tv_arrival_time_str,
+                    }
+
             return {
                 "delays_by_flight": plan_result.get("delays_by_flight", {}),
                 "delay_stats": plan_result.get("delay_stats", {}),
                 "objective": plan_result.get("objective", 0.0),
                 "objective_components": plan_result.get("objective_components", {}),
+                "pre_flight_context": pre_flight_context,
                 "rolling_top_tvs": rolling_top_tvs,
                 "metadata": {
                     "top_k": int(top_k),
