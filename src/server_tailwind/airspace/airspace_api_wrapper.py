@@ -7,7 +7,7 @@ and the data science logic in NetworkEvaluator.
 
 import json
 import time
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 import geopandas as gpd
 import asyncio
@@ -24,6 +24,11 @@ from project_tailwind.optimize.eval.flight_list import FlightList
 from project_tailwind.optimize.features.flight_features import FlightFeatures
 from .network_evaluator_for_api import NetworkEvaluator
 from project_tailwind.impact_eval.distance_computation import haversine_vectorized
+from project_tailwind.optimize.eval.plan_evaluator import PlanEvaluator
+from project_tailwind.optimize.network_plan import NetworkPlan
+from project_tailwind.optimize.regulation import Regulation
+from project_tailwind.optimize.parser.regulation_parser import RegulationParser
+from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 
 
 class AirspaceAPIWrapper:
@@ -53,8 +58,8 @@ class AirspaceAPIWrapper:
         try:
             # Load traffic volumes GeoDataFrame
             # Update this path based on your actual data location
-            # traffic_volumes_path = "D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
-            traffic_volumes_path = "/Volumes/CrucialX/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
+            traffic_volumes_path = "D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
+            # traffic_volumes_path = "/Volumes/CrucialX/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
             
             if not Path(traffic_volumes_path).exists():
                 # Fallback to a relative path if absolute doesn't exist
@@ -702,6 +707,224 @@ class AirspaceAPIWrapper:
                 "duration_min": int(duration_min) if duration_min is not None else None,
             },
         }
+    
+    async def run_regulation_plan_simulation(
+        self,
+        regulations: List[Any],
+        *,
+        weights: Optional[Dict[str, float]] = None,
+        top_k: int = 25,
+        include_excess_vector: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Evaluate a regulation plan on the baseline flight list and return post-regulation
+        delays, metrics, and rolling-hour occupancy for the top-K busiest TVs.
+
+        - regulations: list of raw strings (Regulation DSL) or dicts with keys
+            {location, rate, time_windows[], filter_type?, filter_value?, target_flight_ids?}
+        - weights: optional objective weights
+        - top_k: number of TVs to include (ranked by max(count - capacity) over the union of active regulation windows)
+        - include_excess_vector: if True, include the full post-regulation excess vector
+        """
+        self._ensure_evaluator_ready()
+
+        loop = asyncio.get_event_loop()
+
+        def _compute() -> Dict[str, Any]:
+            # Build indexer and parser based on the same files backing the server's FlightList
+            tvtw_indexer = TVTWIndexer.load(self._flight_list.tvtw_indexer_path)
+            parser = RegulationParser(
+                flights_file=self._flight_list.occupancy_file_path,
+                tvtw_indexer=tvtw_indexer,
+            )
+
+            # Normalize regulations into Regulation objects or raw strings
+            normalized_regs: List[Any] = []
+            for item in regulations:
+                if isinstance(item, str):
+                    normalized_regs.append(item)
+                elif isinstance(item, dict):
+                    loc = str(item.get("location"))
+                    rate = int(item.get("rate"))
+                    time_windows = [int(w) for w in item.get("time_windows", [])]
+                    filter_type = str(item.get("filter_type", "IC"))
+                    filter_value = str(item.get("filter_value", "__"))
+                    target_flight_ids = item.get("target_flight_ids")
+                    reg = Regulation.from_components(
+                        location=loc,
+                        rate=rate,
+                        time_windows=time_windows,
+                        filter_type=filter_type,
+                        filter_value=filter_value,
+                        target_flight_ids=target_flight_ids,
+                    )
+                    normalized_regs.append(reg)
+                else:
+                    raise ValueError("Each regulation must be a string or an object with required fields")
+
+            network_plan = NetworkPlan(normalized_regs)
+
+            # Evaluate plan -> delays, overlay view, metrics
+            evaluator = PlanEvaluator(
+                traffic_volumes_gdf=self._traffic_volumes_gdf,
+                parser=parser,
+                tvtw_indexer=tvtw_indexer,
+            )
+            plan_result = evaluator.evaluate_plan(network_plan, self._flight_list, weights=weights)
+
+            # Rolling-hour occupancy arrays for all bins per TV (length = bins_per_tv)
+            # 1) Build flat occupancy vectors pre/post
+            pre_total = self._flight_list.get_total_occupancy_by_tvtw().astype(np.float32, copy=False)
+            post_total = plan_result["delta_view"].get_total_occupancy_by_tvtw().astype(np.float32, copy=False)
+
+            # 2) Dimensions and helpers
+            num_tvtws = int(self._flight_list.num_tvtws)
+            num_tvs = int(len(self._flight_list.tv_id_to_idx))
+            bins_per_hour = 60 // int(self._flight_list.time_bin_minutes)
+            bins_per_tv = num_tvtws // max(num_tvs, 1)
+            if bins_per_tv <= 0:
+                raise RuntimeError("Invalid bins_per_tv computed from occupancy vector")
+
+            # 3) Stable ordering of TVs by row index
+            tv_items = sorted(self._flight_list.tv_id_to_idx.items(), key=lambda kv: kv[1])
+            tv_ids_in_row_order = [tv for tv, _ in tv_items]
+
+            # 4) Reshape pre/post into [num_tvs, bins_per_tv]
+            pre_by_tv = np.zeros((num_tvs, bins_per_tv), dtype=np.float32)
+            post_by_tv = np.zeros((num_tvs, bins_per_tv), dtype=np.float32)
+            for tv_id, row in tv_items:
+                start = row * bins_per_tv
+                end = start + bins_per_tv
+                pre_by_tv[row, :] = pre_total[start:end]
+                post_by_tv[row, :] = post_total[start:end]
+
+            # 5) Rolling-hour (forward) sums per bin: sum over bins [i, i+W-1] (clamped at end)
+            def rolling_forward_sum_full(mat: np.ndarray, window: int) -> np.ndarray:
+                # pad zeros at end to keep length the same (forward-looking window)
+                pad = [(0, 0), (0, window - 1)]
+                padded = np.pad(mat, pad, mode="constant", constant_values=0.0)
+                cs = np.cumsum(padded, axis=1, dtype=np.float64)
+                # out[i] = cs[i+W-1] - cs[i-1]; implement vectorized with shifted cs
+                left = np.concatenate([np.zeros((mat.shape[0], 1), dtype=np.float64), cs[:, :-window]], axis=1)
+                right = cs[:, window - 1 : window - 1 + mat.shape[1]]
+                return (right - left).astype(np.float32, copy=False)
+
+            pre_roll = rolling_forward_sum_full(pre_by_tv, bins_per_hour)
+            post_roll = rolling_forward_sum_full(post_by_tv, bins_per_hour)
+
+            # 6) Capacity per bin for each TV (repeat hourly capacity across bins in that hour)
+            # Use server evaluator for consistent capacity parsing
+            base_eval = NetworkEvaluator(self._traffic_volumes_gdf, self._flight_list)
+            cap_by_tv = {}
+            for tv_id, row in tv_items:
+                hourly_caps = base_eval.hourly_capacity_by_tv.get(tv_id, {})
+                if not hourly_caps:
+                    # mark as missing capacity with -1.0 per bin
+                    cap_by_tv[tv_id] = np.full(bins_per_tv, -1.0, dtype=np.float32)
+                    continue
+                arr = np.full(bins_per_tv, -1.0, dtype=np.float32)
+                for h, c in hourly_caps.items():
+                    if 0 <= int(h) < (bins_per_tv // bins_per_hour):
+                        start = int(h) * bins_per_hour
+                        end = start + bins_per_hour
+                        arr[start:end] = float(c)
+                cap_by_tv[tv_id] = arr
+
+            # 7) Build per-TV active window mask from the plan and also the UNION mask across all TVs
+            tv_to_active_mask = {tv: np.zeros(bins_per_tv, dtype=bool) for tv, _ in tv_items}
+            union_active_mask = np.zeros(bins_per_tv, dtype=bool)
+            for reg in network_plan.regulations:
+                loc = getattr(reg, "location", None)
+                wins = getattr(reg, "time_windows", []) or []
+                if not loc or loc not in tv_to_active_mask:
+                    continue
+                mask = tv_to_active_mask[loc]
+                for w in wins:
+                    wi = int(w)
+                    if 0 <= wi < bins_per_tv:
+                        mask[wi] = True
+                        union_active_mask[wi] = True
+
+            # 8) Rank TVs by max busy over the UNION of active regulation windows using PRE state; skip bins without capacity
+            ranking: List[Tuple[str, float]] = []
+            for tv_id, row in tv_items:
+                # Use the union of regulation windows so all TVs are considered over the same bins
+                mask = union_active_mask
+                if not mask.any():
+                    continue  # no active windows in the plan overall
+                cap_vec = cap_by_tv.get(tv_id)
+                if cap_vec is None:
+                    continue
+                # capacity missing bins are marked -1 -> exclude
+                valid = (cap_vec >= 0.0) & mask
+                if not np.any(valid):
+                    continue
+                busy_pre = pre_roll[row, valid] - cap_vec[valid]
+                if busy_pre.size == 0:
+                    continue
+                ranking.append((tv_id, float(np.max(busy_pre))))
+            ranking.sort(key=lambda t: t[1], reverse=True)
+            selected_tv_ids = [tv for tv, _ in ranking[: max(0, int(top_k))]]
+
+            # 9) Package rolling arrays for selected TVs
+            rolling_top_tvs: List[Dict[str, Any]] = []
+            for tv_id in selected_tv_ids:
+                row = self._flight_list.tv_id_to_idx[tv_id]
+                active_wins = np.where(tv_to_active_mask[tv_id])[0].tolist()
+                rolling_top_tvs.append(
+                    {
+                        "traffic_volume_id": tv_id,
+                        "pre_rolling_counts": pre_roll[row, :].astype(float).tolist(),
+                        "post_rolling_counts": post_roll[row, :].astype(float).tolist(),
+                        "capacity_per_bin": cap_by_tv[tv_id].astype(float).tolist(),
+                        "active_time_windows": [int(w) for w in active_wins],
+                    }
+                )
+
+            # Optionally include the full post-regulation excess vector
+            post_excess = plan_result.get("excess_vector")
+            excess_payload: Dict[str, Any]
+            if include_excess_vector and post_excess is not None:
+                try:
+                    excess_payload = {"excess_vector": [float(x) for x in post_excess.tolist()]}  # type: ignore[attr-defined]
+                except Exception:
+                    # Fallback if not numpy
+                    excess_payload = {"excess_vector": list(map(float, post_excess))}
+            else:
+                # Compact stats
+                import numpy as _np
+                ev = _np.asarray(post_excess, dtype=float)
+                excess_payload = {
+                    "excess_vector_stats": {
+                        "sum": float(_np.sum(ev)) if ev.size > 0 else 0.0,
+                        "max": float(_np.max(ev)) if ev.size > 0 else 0.0,
+                        "mean": float(_np.mean(ev)) if ev.size > 0 else 0.0,
+                        "count": int(ev.size),
+                    }
+                }
+
+            return {
+                "delays_by_flight": plan_result.get("delays_by_flight", {}),
+                "delay_stats": plan_result.get("delay_stats", {}),
+                "objective": plan_result.get("objective", 0.0),
+                "objective_components": plan_result.get("objective_components", {}),
+                "rolling_top_tvs": rolling_top_tvs,
+                "metadata": {
+                    "top_k": int(top_k),
+                    "time_bin_minutes": int(self._flight_list.time_bin_minutes),
+                    "bins_per_tv": int(bins_per_tv),
+                    "bins_per_hour": int(bins_per_hour),
+                    "num_traffic_volumes": int(num_tvs),
+                    "ranking_metric": "max(pre_rolling_count - hourly_capacity) over the union of active regulation windows",
+                },
+                **excess_payload,
+            }
+
+        try:
+            return await loop.run_in_executor(self._executor, _compute)
+        except Exception as e:
+            print(f"Error in run_regulation_plan_simulation: {e}")
+            raise
     
     def __del__(self):
         """Clean up the thread pool executor."""
