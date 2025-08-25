@@ -762,6 +762,15 @@ class AirspaceAPIWrapper:
                 else:
                     raise ValueError("Each regulation must be a string or an object with required fields")
 
+            # Debug: print out the regulations
+            print("DEBUG: Normalized regulations:")
+            for i, reg in enumerate(normalized_regs):
+                if isinstance(reg, str):
+                    print(f"  {i}: (string) {reg}")
+                else:
+                    print(f"  {i}: (object) loc={reg.location}, rate={reg.rate}, time_windows={reg.time_windows}, filter_type={reg.filter_type}, filter_value={reg.filter_value}, target_flight_ids={reg.target_flight_ids}")
+
+
             network_plan = NetworkPlan(normalized_regs)
 
             # Evaluate plan -> delays, overlay view, metrics
