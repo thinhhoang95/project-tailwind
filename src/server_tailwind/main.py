@@ -154,6 +154,7 @@ async def get_regulation_ranking_tv_flights_ordered(
     traffic_volume_id: str,
     ref_time_str: str,
     seed_flight_ids: str,
+    duration_min: Optional[int] = None,
     top_k: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
@@ -163,6 +164,7 @@ async def get_regulation_ranking_tv_flights_ordered(
     - traffic_volume_id: TV identifier
     - ref_time_str: reference time in HHMMSS (or HHMM) format
     - seed_flight_ids: comma-separated seed flight IDs
+    - duration_min: optional positive integer; after ranking, keep only flights whose entry time into the TV is in [ref_time_str, ref_time_str + duration_min]
     - top_k: optional limit on number of results
 
     Returns ranked flights with arrival time, score and component breakdown.
@@ -172,6 +174,7 @@ async def get_regulation_ranking_tv_flights_ordered(
             traffic_volume_id=traffic_volume_id,
             ref_time_str=ref_time_str,
             seed_flight_ids=seed_flight_ids,
+            duration_min=duration_min,
             top_k=top_k,
         )
         return result

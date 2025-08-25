@@ -145,16 +145,17 @@ Use `ref_time_str` in numeric `HHMMSS` format (e.g., `084510` for 08:45:10). `HH
 }
 ```
 
-### GET `/regulation_ranking_tv_flights_ordered?traffic_volume_id={id}&ref_time_str={HHMMSS}&seed_flight_ids={csv}&top_k={n}`
+### GET `/regulation_ranking_tv_flights_ordered?traffic_volume_id={id}&ref_time_str={HHMMSS}&seed_flight_ids={csv}&duration_min={m}&top_k={n}`
 
-Ranks flights that pass through the specified traffic volume near a reference time using heuristic features from `FlightFeatures`. It reuses the ordered flights list and augments with a score and component breakdown.
+Ranks flights that pass through the specified traffic volume near a reference time using heuristic features from `FlightFeatures`. It reuses the ordered flights list and augments with a score and component breakdown. If `duration_min` is provided, results are filtered post-ranking to include only flights whose entry time into the TV lies between the reference time and `ref_time_str + duration_min` minutes. Remaining candidates are sorted by descending score.
 
 Use `ref_time_str` in numeric `HHMMSS` format (e.g., `084510` for 08:45:10). `HHMM` is also accepted (seconds assumed 00). Provide `seed_flight_ids` as a comma-separated list.
 
 **Parameters:**
 - `traffic_volume_id` (string): The traffic volume ID to analyze
-- `ref_time_str` (string): Reference time for ordering flights by proximity
+- `ref_time_str` (string): Reference time for ordering flights by proximity (numeric `HHMMSS` or `HHMM`)
 - `seed_flight_ids` (string): Comma-separated seed flight IDs used to build the footprint
+- `duration_min` (integer, optional): Positive minutes window; after ranking, keep only flights whose `arrival_time` into the TV is within `[ref_time_str, ref_time_str + duration_min]`
 - `top_k` (integer, optional): Limit number of ranked flights returned
 
 **Response:**
@@ -192,7 +193,8 @@ Use `ref_time_str` in numeric `HHMMSS` format (e.g., `084510` for 08:45:10). `HH
   "metadata": {
     "num_candidates": 120,
     "num_ranked": 20,
-    "time_bin_minutes": 15
+    "time_bin_minutes": 15,
+    "duration_min": 20
   }
 }
 ```

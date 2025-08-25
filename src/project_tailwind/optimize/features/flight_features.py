@@ -433,14 +433,16 @@ class FlightFeatures:
                         valid_time = (times >= 0) & (times < num_hours)
                         # Broadcast rows to (S, L)
                         rows_idx = np.broadcast_to(rows_mat, times.shape)
+                        # Clamp times into range for safe advanced indexing
+                        times_safe = np.clip(times, 0, num_hours - 1)
                         # Capacity-known mask for these samples
                         if cap_mask is not None:
-                            cap_known = cap_mask[rows_idx, times]
+                            cap_known = cap_mask[rows_idx, times_safe]
                             valid = valid_time & cap_known
                         else:
                             valid = valid_time
                         # Gather slacks
-                        slc = (cap_mat[rows_idx, times] - occ_mat[rows_idx, times]).astype(np.float32, copy=False)
+                        slc = (cap_mat[rows_idx, times_safe] - occ_mat[rows_idx, times_safe]).astype(np.float32, copy=False)
                         # Mask invalids as +inf so they don't affect mins
                         slc = np.where(valid, slc, np.inf)
                         # Min across TVs -> (L,)

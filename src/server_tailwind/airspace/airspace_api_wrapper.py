@@ -553,9 +553,10 @@ class AirspaceAPIWrapper:
         traffic_volume_id: str,
         ref_time_str: str,
         seed_flight_ids: str,
+        duration_min: Optional[int],
         top_k: Optional[int] = None,
         *,
-        normalize: bool = True,
+        normalize: bool = True
     ) -> Dict[str, Any]:
         """
         Return candidate flights in a traffic volume ordered by proximity to ref time,
@@ -610,7 +611,7 @@ class AirspaceAPIWrapper:
                 seed_footprint,
                 candidate_flight_ids=candidate_flight_ids,
                 normalize=normalize,
-                top_k=top_k,
+                top_k=None,
             )
 
         try:
@@ -621,7 +622,57 @@ class AirspaceAPIWrapper:
             print(
                 f"Error computing regulation ranking for {traffic_volume_id} at {ref_time_str}: {e}"
             )
+            import traceback
+            print(f"Full stack trace: {traceback.format_exc()}")
             raise e
+
+        # Optional: filter by duration window after ranking
+        def _parse_ref_time_to_seconds(ts: str) -> int:
+            s = str(ts).strip()
+            if s.isdigit() and len(s) in (4, 6):
+                hour = int(s[0:2])
+                minute = int(s[2:4])
+                second = int(s[4:6]) if len(s) == 6 else 0
+            else:
+                raise ValueError("ref_time_str must be numeric in 'HHMMSS' (or 'HHMM') format")
+            if not (0 <= hour < 24 and 0 <= minute < 60 and 0 <= second < 60):
+                raise ValueError("ref_time_str contains invalid time components")
+            return hour * 3600 + minute * 60 + second
+
+        if duration_min is not None:
+            try:
+                dur_min_int = int(duration_min)
+            except Exception:
+                dur_min_int = None
+            if dur_min_int is not None and dur_min_int > 0:
+                ref_seconds = _parse_ref_time_to_seconds(ref_time_str)
+                end_seconds = min(ref_seconds + int(dur_min_int) * 60, 24 * 3600 - 1)
+                filtered_ranked: List[Dict[str, Any]] = []
+                for item in ranked:
+                    fid = item.get("flight_id")
+                    det = detail_by_fid.get(fid)
+                    if not det:
+                        continue
+                    arr_sec = det.get("arrival_seconds")
+                    try:
+                        arr_sec_int = int(arr_sec)
+                    except Exception:
+                        continue
+                    if ref_seconds <= arr_sec_int <= end_seconds:
+                        filtered_ranked.append(item)
+
+                # Ensure sorting by score descending after filtering
+                filtered_ranked.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+                ranked = filtered_ranked
+
+        # Apply top_k last (after optional duration filter)
+        if top_k is not None:
+            try:
+                tk = int(top_k)
+            except Exception:
+                tk = None
+            if tk is not None and tk > 0:
+                ranked = ranked[:tk]
 
         # Merge ranking with arrival details
         ranked_with_details: List[Dict[str, Any]] = []
@@ -648,6 +699,7 @@ class AirspaceAPIWrapper:
                 "num_candidates": len(candidate_flight_ids),
                 "num_ranked": len(ranked_with_details),
                 "time_bin_minutes": self._evaluator.time_bin_minutes,
+                "duration_min": int(duration_min) if duration_min is not None else None,
             },
         }
     
