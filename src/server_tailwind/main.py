@@ -183,6 +183,40 @@ async def get_regulation_ranking_tv_flights_ordered(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+@app.post("/regulation_plan_simulation")
+async def regulation_plan_simulation(request: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Simulate a regulation plan and return:
+    - per-flight delays and delay stats
+    - objective and component breakdown
+    - rolling-hour occupancy arrays (pre and post) for all bins of the top-K busiest TVs
+      (busiest defined as TVs with highest max(pre_rolling_count - hourly_capacity)
+      over the active regulation time windows)
+
+    Request JSON keys:
+    - regulations: List[str|object]
+    - weights: Optional[dict]
+    - top_k: Optional[int] (number of TVs to include; default 25)
+    - include_excess_vector: Optional[bool]
+    """
+    try:
+        regs = request.get("regulations", [])
+        weights = request.get("weights")
+        top_k = int(request.get("top_k", 25))
+        include_excess_vector = bool(request.get("include_excess_vector", False))
+
+        result = await airspace_wrapper.run_regulation_plan_simulation(
+            regs,
+            weights=weights,
+            top_k=top_k,
+            include_excess_vector=include_excess_vector,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
