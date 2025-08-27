@@ -8,6 +8,7 @@ This FastAPI server provides endpoints for analyzing traffic volume occupancy da
 - **`/tv_flights`** - Get flight identifiers grouped by time window for a specific traffic volume
 - **`/tv_flights_ordered`** - Get all flights for a traffic volume ordered by proximity to a reference time
 - **`/regulation_ranking_tv_flights_ordered`** - Rank ordered TV flights by heuristic features with scores and components
+- **`/flow_extraction`** - Compute community assignments for flights near a reference time using Jaccard similarity and Leiden clustering
 - **`/traffic_volumes`** - List all available traffic volume IDs
 - **`/tv_count_with_capacity`** - Get occupancy counts along with hourly capacity for a traffic volume
 - **`/hotspots`** - Get list of hotspots where traffic volume exceeds capacity with detailed statistics
@@ -199,6 +200,42 @@ Use `ref_time_str` in numeric `HHMMSS` format (e.g., `084510` for 08:45:10). `HH
   }
 }
 ```
+
+### GET `/flow_extraction?traffic_volume_id={id}&ref_time_str={time}&threshold={t}&resolution={r}&seed={n}&limit={k}`
+
+Computes community assignments for flights that pass through the specified traffic volume near a reference time. It reuses the ordered flights list and then applies a subflows flow extractor that builds Jaccard similarities over per-flight TV footprints and runs Leiden clustering. Internally, the extractor uses only the source `traffic_volume_id` and the candidate `flight_ids` (no "bin" or "hour" mode).
+
+Accepts flexible time formats for `ref_time_str`: `HHMMSS`, `HHMM`, `HH:MM`, `HH:MM:SS`.
+
+**Parameters:**
+- `traffic_volume_id` (string): Source traffic volume ID
+- `ref_time_str` (string): Reference time string
+- `threshold` (float, optional): Similarity threshold for edges (default: `0.8`)
+- `resolution` (float, optional): Leiden resolution parameter (default: `1.0`)
+- `seed` (integer, optional): Random seed for Leiden
+- `limit` (integer, optional): Limit number of closest flights to include
+
+**Response:**
+```json
+{
+  "traffic_volume_id": "MASB5KL",
+  "ref_time_str": "080010",
+  "flight_ids": ["0200AFRAM650E", "3944E1AFR96RF", "1234XYZZY"],
+  "communities": {"0200AFRAM650E": 0, "3944E1AFR96RF": 0, "1234XYZZY": 1},
+  "groups": {"0": ["0200AFRAM650E", "3944E1AFR96RF"], "1": ["1234XYZZY"]},
+  "metadata": {
+    "num_flights": 3,
+    "time_bin_minutes": 15,
+    "threshold": 0.8,
+    "resolution": 1.0
+  }
+}
+```
+
+**Notes:**
+- The underlying flow extraction trims each candidate flight's footprint up to its first occurrence of the specified traffic volume and computes Jaccard similarity across these footprints.
+- There is no bin/hour "mode" parameter. Grouping is determined solely by the provided `traffic_volume_id` and candidate `flight_ids`.
+- If the Leiden libraries are unavailable, a graph connected-components fallback is used.
 
 ### GET `/traffic_volumes`
 
@@ -420,6 +457,10 @@ curl -X POST "http://localhost:8000/regulation_plan_simulation" \
     "top_k": 25,
     "include_excess_vector": false
   }'
+```
+
+```bash
+curl "http://localhost:8000/flow_extraction?traffic_volume_id=MASB5KL&ref_time_str=080010&threshold=0.8&resolution=1.0&limit=100"
 ```
 
 ## Architecture
