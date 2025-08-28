@@ -7,8 +7,13 @@ This FastAPI server provides endpoints for analyzing traffic volume occupancy da
 - **`/tv_count`** - Get occupancy counts for all time windows of a specific traffic volume
 - **`/tv_flights`** - Get flight identifiers grouped by time window for a specific traffic volume
 - **`/tv_flights_ordered`** - Get all flights for a traffic volume ordered by proximity to a reference time
+- **`/regulation_ranking_tv_flights_ordered`** - Rank ordered TV flights by heuristic features with scores and components
+- **`/flow_extraction`** - Compute community assignments for flights near a reference time using Jaccard similarity and Leiden clustering
 - **`/traffic_volumes`** - List all available traffic volume IDs
 - **`/tv_count_with_capacity`** - Get occupancy counts along with hourly capacity for a traffic volume
+- **`/hotspots`** - Get list of hotspots where traffic volume exceeds capacity with detailed statistics
+- **`/slack_distribution`** - For a source TV and reference time, returns per-TV slack at the query bin shifted by nominal travel time (475 kts), with an optional additional shift `delta_min` (minutes)
+- **`/regulation_plan_simulation`** - Simulate a regulation plan to get per-flight delays, objective metrics, and top-K busiest TVs (rolling-hour occupancy) ranked over the union of the plan's active time windows (pre/post)
 - **Data Science Integration** - Uses `NetworkEvaluator` for computational analysis
 - **Network Abstraction** - `AirspaceAPIWrapper` handles network layer and JSON serialization
 
@@ -142,6 +147,96 @@ Use `ref_time_str` in numeric `HHMMSS` format (e.g., `084510` for 08:45:10). `HH
 }
 ```
 
+### GET `/regulation_ranking_tv_flights_ordered?traffic_volume_id={id}&ref_time_str={HHMMSS}&seed_flight_ids={csv}&duration_min={m}&top_k={n}`
+
+Ranks flights that pass through the specified traffic volume near a reference time using heuristic features from `FlightFeatures`. It reuses the ordered flights list and augments with a score and component breakdown. If `duration_min` is provided, results are filtered post-ranking to include only flights whose entry time into the TV lies between the reference time and `ref_time_str + duration_min` minutes. Remaining candidates are sorted by descending score.
+
+Use `ref_time_str` in numeric `HHMMSS` format (e.g., `084510` for 08:45:10). `HHMM` is also accepted (seconds assumed 00). Provide `seed_flight_ids` as a comma-separated list.
+
+**Parameters:**
+- `traffic_volume_id` (string): The traffic volume ID to analyze
+- `ref_time_str` (string): Reference time for ordering flights by proximity (numeric `HHMMSS` or `HHMM`)
+- `seed_flight_ids` (string): Comma-separated seed flight IDs used to build the footprint
+- `duration_min` (integer, optional): Positive minutes window; after ranking, keep only flights whose `arrival_time` into the TV is within `[ref_time_str, ref_time_str + duration_min]`
+- `top_k` (integer, optional): Limit number of ranked flights returned
+
+**Response:**
+```json
+{
+  "traffic_volume_id": "MASB5KL",
+  "ref_time_str": "080010",
+  "seed_flight_ids": ["0200AFRAM650E", "3944E1AFR96RF"],
+  "ranked_flights": [
+    {
+      "flight_id": "0200AFRAM650E",
+      "arrival_time": "08:00:12",
+      "time_window": "08:00-08:15",
+      "delta_seconds": 2,
+      "score": 0.873,
+      "components": {
+        "multiplicity": 1.0,
+        "similarity": 0.75,
+        "slack": 0.62
+      }
+    },
+    {
+      "flight_id": "1234XYZZY",
+      "arrival_time": "08:02:30",
+      "time_window": "08:00-08:15",
+      "delta_seconds": 140,
+      "score": 0.721,
+      "components": {
+        "multiplicity": 0.6,
+        "similarity": 0.50,
+        "slack": 0.58
+      }
+    }
+  ],
+  "metadata": {
+    "num_candidates": 120,
+    "num_ranked": 20,
+    "time_bin_minutes": 15,
+    "duration_min": 20
+  }
+}
+```
+
+### GET `/flow_extraction?traffic_volume_id={id}&ref_time_str={time}&threshold={t}&resolution={r}&seed={n}&limit={k}`
+
+Computes community assignments for flights that pass through the specified traffic volume near a reference time. It reuses the ordered flights list and then applies a subflows flow extractor that builds Jaccard similarities over per-flight TV footprints and runs Leiden clustering. Internally, the extractor uses only the source `traffic_volume_id` and the candidate `flight_ids` (no "bin" or "hour" mode).
+
+Accepts flexible time formats for `ref_time_str`: `HHMMSS`, `HHMM`, `HH:MM`, `HH:MM:SS`.
+
+**Parameters:**
+- `traffic_volume_id` (string): Source traffic volume ID
+- `ref_time_str` (string): Reference time string
+- `threshold` (float, optional): Similarity threshold for edges (default: `0.8`)
+- `resolution` (float, optional): Leiden resolution parameter (default: `1.0`)
+- `seed` (integer, optional): Random seed for Leiden
+- `limit` (integer, optional): Limit number of closest flights to include
+
+**Response:**
+```json
+{
+  "traffic_volume_id": "MASB5KL",
+  "ref_time_str": "080010",
+  "flight_ids": ["0200AFRAM650E", "3944E1AFR96RF", "1234XYZZY"],
+  "communities": {"0200AFRAM650E": 0, "3944E1AFR96RF": 0, "1234XYZZY": 1},
+  "groups": {"0": ["0200AFRAM650E", "3944E1AFR96RF"], "1": ["1234XYZZY"]},
+  "metadata": {
+    "num_flights": 3,
+    "time_bin_minutes": 15,
+    "threshold": 0.8,
+    "resolution": 1.0
+  }
+}
+```
+
+**Notes:**
+- The underlying flow extraction trims each candidate flight's footprint up to its first occurrence of the specified traffic volume and computes Jaccard similarity across these footprints.
+- There is no bin/hour "mode" parameter. Grouping is determined solely by the provided `traffic_volume_id` and candidate `flight_ids`.
+- If the Leiden libraries are unavailable, a graph connected-components fallback is used.
+
 ### GET `/traffic_volumes`
 
 Returns list of available traffic volume IDs.
@@ -157,6 +252,215 @@ Returns list of available traffic volume IDs.
     "total_flights": 50000
   }
 }
+```
+
+### GET `/hotspots?threshold={value}`
+
+Returns list of hotspots (traffic volume and time bin combinations where capacity exceeds demands) with detailed statistics including z_max and z_sum metrics.
+
+**Parameters:**
+- `threshold` (float, optional): Minimum excess traffic to consider as overloaded (default: 0.0)
+
+**Response:**
+```json
+{
+  "hotspots": [
+    {
+      "traffic_volume_id": "MASB5KL",
+      "time_bin": "06:00-07:00",
+      "z_max": 12.5,
+      "z_sum": 45.2,
+      "hourly_occupancy": 67.0,
+      "hourly_capacity": 55.0,
+      "is_overloaded": true
+    },
+    {
+      "traffic_volume_id": "TV001",
+      "time_bin": "08:00-09:00", 
+      "z_max": 8.3,
+      "z_sum": 32.1,
+      "hourly_occupancy": 43.0,
+      "hourly_capacity": 35.0,
+      "is_overloaded": true
+    }
+  ],
+  "count": 2,
+  "metadata": {
+    "threshold": 0.0,
+    "time_bin_minutes": 15,
+    "analysis_type": "hourly_excess_capacity"
+  }
+}
+```
+
+### GET `/slack_distribution?traffic_volume_id={id}&ref_time_str={time}&sign={plus|minus}&delta_min={minutes}`
+
+Returns a slack distribution across all traffic volumes at the “query bin” computed by shifting the source reference bin by the nominal travel time (distance at 475 kts). You can optionally apply an additional shift of `delta_min` minutes (positive or negative) after the travel-time shift. Useful for finding TVs with spare capacity to absorb demand.
+
+Accepts flexible time formats for `ref_time_str`: `HHMMSS`, `HHMM`, `HH:MM`, `HH:MM:SS`.
+
+**Parameters:**
+- `traffic_volume_id` (string): Source traffic volume ID
+- `ref_time_str` (string): Reference time string
+- `sign` (string): Either `plus` or `minus` (shift direction)
+- `delta_min` (float, optional): Extra shift in minutes applied after travel-time shift; can be negative; default `0.0`
+
+**Response:**
+```json
+{
+  "traffic_volume_id": "MASB5KL",
+  "ref_time_str": "08:30",
+  "sign": "plus",
+  "delta_min": 0.0,
+  "time_bin_minutes": 15,
+  "nominal_speed_kts": 475.0,
+  "count": 3,
+  "results": [
+    {
+      "traffic_volume_id": "TV001",
+      "time_window": "08:45-09:00",
+      "slack": 12.0,
+      "occupancy": 3.0,
+      "capacity_per_bin": 15.0,
+      "distance_nm": 120.5,
+      "travel_minutes": 15.2,
+      "bin_offset": 1,
+      "clamped": false
+    },
+    {
+      "traffic_volume_id": "TV002",
+      "time_window": "08:30-08:45",
+      "slack": 8.0,
+      "occupancy": 5.0,
+      "capacity_per_bin": 13.0,
+      "distance_nm": 90.0,
+      "travel_minutes": 11.4,
+      "bin_offset": 1,
+      "clamped": false
+    }
+  ]
+}
+```
+
+**Result Fields:**
+- `traffic_volume_id`: Destination TV ID
+- `time_window`: Query time window label `HH:MM-HH:MM`
+- `slack`: `capacity_per_bin - occupancy`
+- `occupancy`: Occupancy at the query bin
+- `capacity_per_bin`: Hourly capacity distributed evenly across bins in the hour
+- `distance_nm`: Great-circle distance between TV centroids
+- `travel_minutes`: Nominal travel time at 475 kts
+- `bin_offset`: Signed bin shift applied from the reference bin
+- `clamped`: Whether the query bin was clamped to the day edges
+- `delta_min` (top-level field): The additional shift, in minutes, that was applied
+
+**Response Fields:**
+- `traffic_volume_id`: String identifier for the traffic volume
+- `time_bin`: Hourly time window in format "HH:00-HH+1:00"
+- `z_max`: Maximum excess traffic within the time bin
+- `z_sum`: Total excess traffic within the time bin  
+- `hourly_occupancy`: Actual traffic volume for the hour
+- `hourly_capacity`: Maximum capacity for the hour
+- `is_overloaded`: Boolean indicating if occupancy exceeds capacity
+
+### POST `/regulation_plan_simulation`
+
+Simulates a regulation plan and returns per-flight delays, evaluation metrics, and rolling-hour occupancy for the top-K busiest TVs across all traffic volumes. TVs are ranked by max(pre_rolling_count − hourly_capacity) computed over the union of all active time windows provided in the plan. Also returns `pre_flight_context` with baseline takeoff and TV-arrival times for flights present in `delays_by_flight`.
+
+You can provide regulations as raw strings in the `Regulation` DSL or as structured objects.
+
+**Request (JSON):**
+```json
+{
+  "regulations": [
+    "TV_TVA IC__ 3 32",
+    {
+      "location": "TVA",
+      "rate": 1,
+      "time_windows": [32],
+      "filter_type": "IC",
+      "filter_value": "__",
+      "target_flight_ids": ["F1", "F2", "F3"]
+    }
+  ],
+  "weights": {"alpha": 1.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0},
+  "top_k": 25,
+  "include_excess_vector": false
+}
+```
+
+**Notes:**
+- `regulations`: List of either raw strings like `TV_<LOC> <FILTER> <RATE> <TW>` or objects with `location`, `rate`, `time_windows`, and optional `filter_type`, `filter_value`, `target_flight_ids`.
+- `weights`: Optional objective weights for combining overload and delay components.
+- `top_k`: Number of busiest TVs to include (default: 25). Ranking is across all TVs, evaluated only on the union of the plan's active time windows.
+- `include_excess_vector`: If true, returns the full post-regulation excess vector; otherwise returns compact stats.
+- Hours/bins with no capacity are skipped when computing busy-ness.
+- Ranking metric: `max(pre_rolling_count - hourly_capacity)` over the union mask of active regulation windows.
+
+**Response:**
+```json
+{
+  "delays_by_flight": {"F1": 5, "F2": 0},
+  "pre_flight_context": {
+    "F1": {"takeoff_time": "07:12:05", "tv_arrival_time": "08:00:12"}
+  },
+  "delay_stats": {
+    "total_delay_seconds": 300.0,
+    "mean_delay_seconds": 150.0,
+    "max_delay_seconds": 300.0,
+    "min_delay_seconds": 0.0,
+    "delayed_flights_count": 1,
+    "num_flights": 2
+  },
+  "objective": 12.0,
+  "objective_components": {
+    "z_sum": 10.0,
+    "z_max": 5.0,
+    "delay_min": 5.0,
+    "num_regs": 2,
+    "alpha": 1.0,
+    "beta": 2.0,
+    "gamma": 0.1,
+    "delta": 25.0
+  },
+  "rolling_top_tvs": [
+    {
+      "traffic_volume_id": "TVA",
+      "pre_rolling_counts": [3.0, 4.0, 5.0],
+      "post_rolling_counts": [2.0, 3.0, 4.0],
+      "capacity_per_bin": [1.0, 1.0, 1.0],
+      "active_time_windows": [32]
+    }
+  ],
+  "excess_vector_stats": {"sum": 10.0, "max": 3.0, "mean": 0.1, "count": 9600},
+  "metadata": {
+    "top_k": 25,
+    "time_bin_minutes": 15,
+    "bins_per_tv": 384,
+    "bins_per_hour": 4,
+    "num_traffic_volumes": 1,
+    "ranking_metric": "max(pre_rolling_count - hourly_capacity) over the union of active regulation windows"
+  }
+}
+```
+
+Fields:
+- `pre_flight_context`: Map of flight ID → `{takeoff_time, tv_arrival_time}` strings (HH:MM:SS). `tv_arrival_time` can be `null` if the flight does not enter any regulated traffic volume.
+
+**cURL Example:**
+```bash
+curl -X POST "http://localhost:8000/regulation_plan_simulation" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "regulations": ["TV_TVA IC__ 3 32"],
+    "weights": {"alpha": 1.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0},
+    "top_k": 25,
+    "include_excess_vector": false
+  }'
+```
+
+```bash
+curl "http://localhost:8000/flow_extraction?traffic_volume_id=MASB5KL&ref_time_str=080010&threshold=0.8&resolution=1.0&limit=100"
 ```
 
 ## Architecture
@@ -192,6 +496,14 @@ curl "http://localhost:8000/tv_flights?traffic_volume_id=MASB5KL"
 
 ```bash
 curl "http://localhost:8000/tv_flights_ordered?traffic_volume_id=MASB5KL&ref_time_str=080010"
+```
+
+```bash
+curl "http://localhost:8000/regulation_ranking_tv_flights_ordered?traffic_volume_id=MASB5KL&ref_time_str=080010&seed_flight_ids=0200AFRAM650E,3944E1AFR96RF&top_k=20"
+```
+
+```bash
+curl "http://localhost:8000/hotspots?threshold=0.0"
 ```
 
 ## Configuration

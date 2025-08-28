@@ -3,7 +3,7 @@ FlightList class for loading and managing occupancy matrix data from SO6 flight 
 """
 
 import json
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Sequence
 import numpy as np
 from scipy import sparse
 from datetime import datetime, timedelta
@@ -38,9 +38,17 @@ class FlightList:
         self.time_bin_minutes = self.tvtw_indexer['time_bin_minutes']
         self.tv_id_to_idx = self.tvtw_indexer['tv_id_to_idx']
         self.num_traffic_volumes = len(self.tv_id_to_idx)
+        # Derived helpers
+        # Number of time bins for each traffic volume (expected: 24 * 60 / time_bin_minutes)
+        self.num_time_bins_per_tv: int = (24 * 60) // int(self.time_bin_minutes)
+        # Reverse mapping from contiguous tv index -> traffic_volume_id
+        self.idx_to_tv_id: Dict[int, str] = {idx: tv_id for tv_id, idx in self.tv_id_to_idx.items()}
         
         # Load flight data
         self._load_flight_data()
+        
+        # Cache for per-flight TV index sequences (after de-duplicating consecutive repeats)
+        self._flight_tv_sequence_cache: Dict[str, np.ndarray] = {}
         
     def _load_flight_data(self):
         """Load flight occupancy data and build sparse matrix."""
@@ -318,6 +326,99 @@ class FlightList:
         new_flight_list.flight_data = deepcopy(self.flight_data)
         
         return new_flight_list
+
+    # === Subflows/Footprint helpers ===
+    def get_flight_tv_sequence_indices(self, flight_id: str) -> np.ndarray:
+        """
+        Return the sequence of traffic-volume indices visited by a flight, ordered
+        by entry time and with consecutive duplicates compressed.
+
+        Args:
+            flight_id: The flight identifier.
+
+        Returns:
+            1D numpy array of integer TV indices in chronological order with
+            consecutive repeats removed.
+        """
+        if flight_id not in self.flight_metadata:
+            raise ValueError(f"Flight ID {flight_id} not found")
+
+        # Serve from cache if available
+        cached = self._flight_tv_sequence_cache.get(flight_id)
+        if cached is not None:
+            return cached
+
+        meta = self.flight_metadata[flight_id]
+        intervals = meta['occupancy_intervals']
+        if not intervals:
+            seq = np.empty(0, dtype=np.int64)
+            self._flight_tv_sequence_cache[flight_id] = seq
+            return seq
+
+        # Sort by entry_time_s to ensure chronological order
+        entry_times = np.fromiter((int(iv['entry_time_s']) for iv in intervals), dtype=np.int64)
+        order = np.argsort(entry_times, kind='mergesort')
+        # Map tvtw_index -> traffic volume index via integer division
+        tvtw_indices = np.fromiter((int(intervals[i]['tvtw_index']) for i in order), dtype=np.int64)
+        tv_indices = tvtw_indices // int(self.num_time_bins_per_tv)
+
+        if tv_indices.size == 0:
+            seq = tv_indices
+        else:
+            # Compress consecutive duplicates (stay within same TV over multiple bins)
+            keep_mask = np.ones(tv_indices.shape[0], dtype=bool)
+            keep_mask[1:] = tv_indices[1:] != tv_indices[:-1]
+            seq = tv_indices[keep_mask]
+
+        # Cache and return
+        self._flight_tv_sequence_cache[flight_id] = seq
+        return seq
+
+    def get_flight_tv_footprint_indices(self, flight_id: str, hotspot_tv_index: Optional[int] = None) -> np.ndarray:
+        """
+        Compute a flight's TV footprint as the set of unique TV indices visited,
+        optionally trimmed to the prefix up to and including the first occurrence
+        of the hotspot TV index.
+
+        Args:
+            flight_id: The flight identifier.
+            hotspot_tv_index: Optional TV index indicating where to prefix-trim.
+
+        Returns:
+            1D numpy array of unique TV indices (sorted ascending) representing
+            the footprint.
+        """
+        seq = self.get_flight_tv_sequence_indices(flight_id)
+        if seq.size == 0:
+            return seq
+
+        if hotspot_tv_index is not None:
+            # Find first occurrence; include it in the prefix if present
+            where = np.where(seq == int(hotspot_tv_index))[0]
+            if where.size > 0:
+                cut_idx = int(where[0]) + 1
+                seq = seq[:cut_idx]
+
+        # Return unique TV indices; order is irrelevant for Jaccard
+        return np.unique(seq)
+
+    def get_footprints_for_flights(
+        self, flight_ids: Sequence[str], hotspot_tv_index: Optional[int]
+    ) -> List[np.ndarray]:
+        """
+        Batch helper to compute footprints for multiple flights.
+
+        Args:
+            flight_ids: Sequence of flight identifiers.
+            hotspot_tv_index: Optional TV index for prefix trimming.
+
+        Returns:
+            List of numpy arrays, one per flight, containing unique TV indices.
+        """
+        footprints: List[np.ndarray] = []
+        for fid in flight_ids:
+            footprints.append(self.get_flight_tv_footprint_indices(fid, hotspot_tv_index))
+        return footprints
     
     def update_flight(self, flight_id: str, updates: Dict[str, Any]):
         """Update flight data with new values."""

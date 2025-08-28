@@ -52,6 +52,13 @@
             "request": "launch",
             "program": "examples/run_flow_cache_extraction_basic_debug.py",
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Example: Regulation Use (Debug)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "tests/tabu/regulation_use_example.py",
+            "console": "integratedTerminal"
         }
     ]
 }
