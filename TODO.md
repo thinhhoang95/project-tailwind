@@ -1,0 +1,1 @@
+1. Add API support for custom window length and stride (regulation plan simulation), the other things like charting is handled by the client-side.

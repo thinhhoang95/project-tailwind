@@ -39,7 +39,7 @@ The helper class will be in charge with computing overload and pulling out the l
 
 It is also capable of getting the raw count for each traffic volume time window (TVTW). See `retrieve_raw_tvtw_count.py` test script. This should be best used in conjunction with project-cirrus's capacity faker (`capacity_faker.py`) script which reproduces a traffic volume definition geojson with the actual count, from which we can manually induce hotspots.
 
-## Flow Extraction
+## Flow Extraction (DEPRECATED FOR NOW)
 The flow extraction script is `flow_x/flow_extractor.py`. You can check out the docs in `flow_extractor.md`. A complete example can be found in `tests/test_network_evaluator.py`.
 
 # Scenarios
@@ -47,8 +47,18 @@ From project-cirrus, we launch the scenario_gen module `main.py` to generate mul
 
 There is absolutely no need to recompute the occupancy vectors for each flight: the scenarios just change the capacity values, and do NOT tamper with the indexing system (tvtw_indexer.json) as well as the time bins nor the definition of the traffic volumes. 
 
-# Flow Extraction to a File
+# Flow Extraction to a File (DEPRECATED FOR NOW)
 We can run the file `run_flow_cache_extraction_basic_debugmp.py` to generate the list of flows, as well as several cached statistics such as number of overloaded sectors, total overloads, and the slack when delay t time bins. This code relies on the NetworkEvaluator.
 
 Then we can visualize the flows with the help of the notebook `interactive_sector_trajectory_visualization.ipynb`.
+
+---
+
+
+
+
+# TABU
+- `flight_features.py` computes the three heuristic components for each flight (to be added to a regulation set): how many hotspots it travels through (aggregated to hour level), the Jaccard distance in TV footprint (for similarity in the herd), and the 5th percentile that approximates the minimum slack available for the flight.
+
+> Note currently the slack is without delay, the correct slack must induce 1, 2, 3 unit of delay timebins (15, 30, 45 minutes lookahead).
 

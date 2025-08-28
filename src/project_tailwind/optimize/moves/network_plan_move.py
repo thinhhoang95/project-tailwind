@@ -1,7 +1,6 @@
 from typing import Dict, List, Union, TYPE_CHECKING
 from collections import defaultdict
-from project_tailwind.casa.casa_flightlist import run_readapted_casa
-from project_tailwind.impact_eval.operators.delay import batch_delay_operator
+from project_tailwind.optimize.fcfs.scheduler import assign_delays
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.optimize.eval.flight_list import FlightList
 from project_tailwind.optimize.eval.delta_flight_list import DeltaFlightList
@@ -68,14 +67,9 @@ class NetworkPlanMove:
         Returns:
             Tuple containing the new ProblemState with modified FlightList and the total delay applied
         """
-        # Create a copy of the flight_list for modification
-        flight_list_copy = state.flight_list.copy()
-        
-        # Apply regulations using the existing logic
-        modified_flight_list, total_delay = self._apply_to_flight_list(flight_list_copy)
-        
-        # Return the new ProblemState along with the total delay
-        return state.with_flight_list(modified_flight_list), total_delay
+        # Build a non-mutating delta view and return a new ProblemState
+        delta_view, total_delay = self.build_delta_view(state.flight_list)
+        return state.with_flight_list(delta_view), total_delay
         
     def _apply_to_flight_list(self, state: FlightList) -> tuple[FlightList, float]:
         """
@@ -89,76 +83,8 @@ class NetworkPlanMove:
         """
         if not self.network_plan.regulations:
             return state, 0.0
-        
-        # Dictionary to collect all delay values for each flight
-        flight_delays_by_regulation: Dict[str, List[float]] = defaultdict(list)
-        total_regulations_applied = 0
-        
-        # Process each regulation and collect delays
-        for regulation in self.network_plan.regulations:
-            if is_debug_enabled():
-                try:
-                    explanation = self.parser.explain_regulation(regulation)
-                except Exception:
-                    explanation = regulation.raw_str
-                console.print(f"[debug] Evaluating regulation → {explanation}", style="debug")
-            # Find flights matching this regulation
-            matched_flights = self.parser.parse(regulation)
-            if not matched_flights:
-                if is_debug_enabled():
-                    console.print(
-                        "[warn] No flights matched this regulation; skipping.",
-                        style="warn",
-                    )
-                continue  # Skip if no flights match
-            
-            total_regulations_applied += 1
-            
-            # Calculate delays using C-CASA for this regulation
-            delays = run_readapted_casa(
-                flight_list=state,
-                identifier_list=matched_flights,
-                reference_location=regulation.location,
-                tvtw_indexer=self.tvtw_indexer,
-                hourly_rate=regulation.rate,
-                active_time_windows=regulation.time_windows,
-            )
-            if is_debug_enabled():
-                nonzero = {k: v for k, v in delays.items() if v > 0}
-                console.print(
-                    f"[info] CASA produced delays for {len(nonzero)} flights; total minutes={int(sum(nonzero.values()))}",
-                    style="info",
-                )
-            
-            # Collect delays for each flight
-            for flight_id, delay_minutes in delays.items():
-                if delay_minutes > 0:
-                    flight_delays_by_regulation[flight_id].append(delay_minutes)
-        
-        # Apply the highest delay for each flight
-        final_flight_delays: Dict[str, int] = {}
-        for flight_id, delay_list in flight_delays_by_regulation.items():
-            # Take the maximum delay for this flight
-            max_delay = max(delay_list)
-            final_flight_delays[flight_id] = int(max_delay)
-        
-        # Calculate total delay
-        total_delay = sum(final_flight_delays.values())
-        if is_debug_enabled():
-            console.print(
-                f"[info] Applying max-per-flight delays to {len(final_flight_delays)} flights; total={int(total_delay)} minutes",
-                style="info",
-            )
-        
-        # Apply the final delays in batch
-        if final_flight_delays:
-            batch_delay_operator(
-                flight_delays=final_flight_delays,
-                state=state,
-                indexer=self.tvtw_indexer,
-            )
-        
-        return state, total_delay
+        # Return a non-mutating overlay view for incremental evaluation
+        return self.build_delta_view(state)
 
     # --- New: expose a non-mutating evaluation helper ---------------------------
     def compute_final_delays(self, state: FlightList) -> Dict[str, int]:
@@ -172,11 +98,16 @@ class NetworkPlanMove:
         flight_delays_by_regulation: Dict[str, List[float]] = defaultdict(list)
 
         for regulation in self.network_plan.regulations:
-            matched_flights = self.parser.parse(regulation)
+            # Prefer explicit targets if provided
+            matched_flights = (
+                regulation.target_flight_ids
+                if getattr(regulation, "target_flight_ids", None) is not None
+                else self.parser.parse(regulation)
+            )
             if not matched_flights:
                 continue
 
-            delays = run_readapted_casa(
+            delays = assign_delays(
                 flight_list=state,
                 identifier_list=matched_flights,
                 reference_location=regulation.location,
