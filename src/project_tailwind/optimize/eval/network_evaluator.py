@@ -6,6 +6,7 @@ _get_total_capacity_vector() also “distributes capacity per bin,” but it is 
 """
 
 import json
+import math
 import numpy as np
 import geopandas as gpd
 from typing import Dict, List, Any, Optional, Tuple
@@ -146,6 +147,37 @@ class NetworkEvaluator:
             return start_hour, end_hour
         except (ValueError, IndexError):
             return None, None
+
+    def _parse_hhmm_to_local_bin(self, beginning_of_time_str: str) -> int:
+        """
+        Parse an HH:MM string to a local time-bin index (0..bins_per_day-1),
+        snapping down to the nearest bin boundary defined by time_bin_minutes.
+
+        Args:
+            beginning_of_time_str: String like "09:15" or "9:15".
+
+        Returns:
+            Integer local bin index.
+
+        Raises:
+            ValueError if the input cannot be parsed.
+        """
+        try:
+            parts = beginning_of_time_str.strip().split(":")
+            if len(parts) != 2:
+                raise ValueError
+            hour = int(parts[0])
+            minute = int(parts[1])
+            if not (0 <= hour < 24 and 0 <= minute < 60):
+                raise ValueError
+        except Exception as e:
+            raise ValueError(f"Invalid beginning_of_time_str: {beginning_of_time_str}") from e
+
+        minute_of_day = hour * 60 + minute
+        # Snap down to bin boundary
+        bin_size = int(self.time_bin_minutes)
+        local_bin = (minute_of_day // bin_size) % (24 * (60 // bin_size))
+        return int(local_bin)
 
     def compute_excess_traffic_vector(self) -> np.ndarray:
         """
@@ -331,20 +363,149 @@ class NetworkEvaluator:
         self,
         threshold: float = 0.0,
         mode: str = "bin",
+        traffic_volume_id: Optional[str] = None,
+        beginning_of_time_str: Optional[str] = None,
+        period_of_time_min: Optional[int] = None,
+        return_metadata: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Retrieve flight identifiers for each hotspot.
 
         Args:
-            threshold: Minimum excess traffic to consider as overloaded.
-            mode: "bin" to return per-TVTW flights; "hour" to return per (traffic_volume_id, hour).
+            threshold: Minimum excess traffic to consider as overloaded (ignored for mode="interval").
+            mode: "bin" to return per-TVTW flights; "hour" to return per (traffic_volume_id, hour);
+                  "interval" to return union of flights over an arbitrary start and horizon.
+            traffic_volume_id: When mode == "interval", restrict retrieval to this TV. If None, return one
+                               entry per TV.
+            beginning_of_time_str: HH:MM string for interval start (mode == "interval").
+            period_of_time_min: Duration in minutes for the interval (mode == "interval").
+            return_metadata: If True and mode == "interval", include per-bin occupancy and helper fields.
 
         Returns:
             If mode == "bin": list of {"tvtw_index": int, "flight_ids": List[str]}.
-            If mode == "hour": list of {"traffic_volume_id": str, "hour": int, "flight_ids": List[str], 
+            If mode == "hour": list of {"traffic_volume_id": str, "hour": int, "flight_ids": List[str],
                                         "hourly_occupancy": float, "unique_flights": int}.
+            If mode == "interval": list of {"traffic_volume_id": str, "start_local_bin": int,
+                                        "num_bins": int, "start_minute_of_day": int, "duration_min": int,
+                                        "flight_ids": List[str], "unique_flights": int, ...} where extra
+                                        metadata fields are included when return_metadata=True.
         """
-        # Compute excess once and determine overloaded indices
+        if mode == "interval":
+            # Validate inputs
+            if beginning_of_time_str is None or period_of_time_min is None:
+                raise ValueError("mode='interval' requires beginning_of_time_str and period_of_time_min")
+
+            # Finalize any pending updates and convert to CSC for fast column slicing
+            try:
+                self.flight_list.finalize_occupancy_updates()
+            except Exception:
+                pass
+            occ_csc = self.flight_list.occupancy_matrix.tocsc(copy=False)
+
+            num_tvtws = self.flight_list.num_tvtws
+            num_time_bins_per_tv = int(self.flight_list.num_time_bins_per_tv)
+            bins_per_hour = 60 // int(self.time_bin_minutes)
+
+            start_local_bin = self._parse_hhmm_to_local_bin(beginning_of_time_str)
+            horizon_bins = int(max(0, int(math.ceil(float(period_of_time_min) / float(self.time_bin_minutes)))))
+            if horizon_bins <= 0:
+                return []
+            # Limit to one day worth of bins for stability
+            horizon_bins_capped = int(min(horizon_bins, num_time_bins_per_tv))
+
+            # Helper to build one result entry for a given tv_id
+            def _build_result_for_tv(tv_id: str) -> Optional[Dict[str, Any]]:
+                if tv_id not in self.tv_id_to_idx:
+                    return None
+                tv_row = int(self.tv_id_to_idx[tv_id])
+                tv_start = tv_row * num_time_bins_per_tv
+
+                # Determine local bin ranges, handling wrap across midnight
+                end_local_bin = start_local_bin + horizon_bins_capped
+                ranges: List[Tuple[int, int]] = []
+                if end_local_bin <= num_time_bins_per_tv:
+                    ranges.append((tv_start + start_local_bin, tv_start + end_local_bin))
+                else:
+                    # Split into [start_local_bin, end_of_day) and [0, wrap)
+                    ranges.append((tv_start + start_local_bin, tv_start + num_time_bins_per_tv))
+                    wrap_len = end_local_bin - num_time_bins_per_tv
+                    ranges.append((tv_start + 0, tv_start + min(wrap_len, num_time_bins_per_tv)))
+
+                # Union of flights across the ranges
+                all_rows: Optional[np.ndarray] = None
+                per_bin_counts: Optional[np.ndarray] = None
+                for a, b in ranges:
+                    if b <= a:
+                        continue
+                    sub = occ_csc[:, a:b]
+                    rows = sub.nonzero()[0]
+                    if all_rows is None:
+                        all_rows = rows
+                    else:
+                        # Concatenate then unique later
+                        all_rows = np.concatenate((all_rows, rows))
+                    if return_metadata:
+                        # Per-bin occupancy counts for this slice
+                        counts = np.asarray(sub.sum(axis=0)).ravel()
+                        per_bin_counts = counts if per_bin_counts is None else np.concatenate((per_bin_counts, counts))
+
+                if all_rows is None or all_rows.size == 0:
+                    return None
+                unique_row_indices = np.unique(all_rows)
+                flight_ids = [self.flight_list.flight_ids[i] for i in unique_row_indices.tolist()]
+
+                start_minute_of_day = int(start_local_bin * int(self.time_bin_minutes))
+                result: Dict[str, Any] = {
+                    "traffic_volume_id": tv_id,
+                    "start_local_bin": int(start_local_bin),
+                    "num_bins": int(horizon_bins_capped),
+                    "start_minute_of_day": start_minute_of_day,
+                    "duration_min": int(period_of_time_min),
+                    "flight_ids": flight_ids,
+                    "unique_flights": int(len(flight_ids)),
+                }
+
+                if return_metadata and per_bin_counts is not None:
+                    # Rolling-hour occupancy over the interval (sliding window of size bins_per_hour)
+                    B = int(bins_per_hour)
+                    if B > 0 and per_bin_counts.size > 0:
+                        # Compute sliding sums via cumsum trick
+                        c = np.concatenate(([0.0], np.cumsum(per_bin_counts, dtype=float)))
+                        # For each t, sum per_bin_counts[t : t+B]
+                        last = per_bin_counts.size
+                        window_ends = np.minimum(np.arange(B, last + 1), last)
+                        window_starts = np.arange(0, last)
+                        # Align sizes by computing explicitly
+                        rolling = []
+                        for t in range(last):
+                            end_idx = min(t + B, last)
+                            rolling.append(float(c[end_idx] - c[t]))
+                        result["per_bin_occupancy"] = per_bin_counts.astype(int).tolist()
+                        result["rolling_hourly_occupancy"] = rolling
+                        # Capacity snapshots at the hour of each bin start
+                        cap_map = self.hourly_capacity_by_tv.get(tv_id, {})
+                        hours = [int(((start_local_bin + t) // B) % 24) for t in range(int(horizon_bins_capped))]
+                        hourly_caps = [float(cap_map.get(h, -1.0)) for h in hours]
+                        result["hour_at_bin_start"] = hours
+                        result["hourly_capacity_at_bin_hour"] = hourly_caps
+
+                return result
+
+            results: List[Dict[str, Any]] = []
+            if traffic_volume_id is not None:
+                one = _build_result_for_tv(traffic_volume_id)
+                if one is not None:
+                    results.append(one)
+            else:
+                for tv_id in self.tv_id_to_idx.keys():
+                    r = _build_result_for_tv(tv_id)
+                    if r is not None:
+                        results.append(r)
+
+            # If nothing found, return []
+            return results
+
+        # Compute excess once and determine overloaded indices for legacy modes
         excess_vector = self.compute_excess_traffic_vector()
         overloaded_indices = np.where(excess_vector > threshold)[0]
         if overloaded_indices.size == 0:
@@ -459,7 +620,7 @@ class NetworkEvaluator:
             results.sort(key=lambda x: (x["traffic_volume_id"], x["hour"]))
             return results
 
-        raise ValueError("mode must be either 'bin' or 'hour'")
+        raise ValueError("mode must be one of 'bin', 'hour', or 'interval'")
 
 
 
