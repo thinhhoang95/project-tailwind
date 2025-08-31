@@ -3,14 +3,16 @@ FastAPI server for airspace traffic analysis.
 Provides endpoints for traffic volume occupancy analysis.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from typing import Dict, Any, Optional
 from .airspace.airspace_api_wrapper import AirspaceAPIWrapper
+from .deepflow.flows_api_wrapper import FlowsWrapper
 
 app = FastAPI(title="Airspace Traffic Analysis API", version="1.0.0", debug=True)
 
 # Initialize the airspace API wrapper
 airspace_wrapper = AirspaceAPIWrapper()
+flows_wrapper = FlowsWrapper()
 
 @app.get("/")
 async def root():
@@ -170,6 +172,25 @@ async def get_flow_extraction(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.get("/flows")
+async def get_flows(
+    tvs: str = Query(..., description="Comma-separated traffic volume IDs"),
+    timebins: Optional[str] = Query(None, description="Comma-separated time bin indices (0=midnight)"),
+    threshold: Optional[float] = Query(None, description="Jaccard cutoff in [0,1] for clustering (default 0.1)"),
+    resolution: Optional[float] = Query(None, description="Leiden resolution (>0), higher yields more clusters (default 1.0)"),
+) -> Any:
+    try:
+        return await flows_wrapper.get_flows(
+            tvs=tvs,
+            timebins=timebins,
+            threshold=threshold,
+            resolution=resolution,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to compute flows: {str(e)}")
 
 @app.get("/hotspots")
 async def get_hotspots(threshold: float = 0.0) -> Dict[str, Any]:
