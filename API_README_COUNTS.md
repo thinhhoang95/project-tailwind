@@ -53,7 +53,9 @@ Endpoint for computing traffic-volume occupancy counts over the day, optionally 
   - `end_bin` (int): Last returned bin index within a TV (inclusive).
   - `labels` (list[string]): Human-readable window labels for each returned bin, formatted `HH:MM-HH:MM`.
 - `counts` (object): `{ tv_id: [int, ...] }` counts per bin for the ranked top‑50 TVs (ranking may include TVs not in `traffic_volume_ids`).
+- `capacity` (object): `{ tv_id: [float, ...] }` capacity per bin aligned to the same bins as `counts` for the ranked top‑50 TVs. Values are the hourly capacity value repeated across bins in that hour; `-1` indicates capacity not available.
 - `mentioned_counts` (object, optional): `{ tv_id: [int, ...] }` counts per bin for TVs explicitly provided in `traffic_volume_ids` (if any). These TVs can also appear in `counts`.
+- `mentioned_capacity` (object, optional): `{ tv_id: [float, ...] }` capacity per bin for TVs explicitly provided in `traffic_volume_ids`.
 - `by_category` (object, optional): `{ category_id: { tv_id: [int, ...] } }` per-category counts per bin for the same set of TVs as in `counts` (top‑50).
 - `by_category_mentioned` (object, optional): present when `traffic_volume_ids` are provided; `{ category_id: { tv_id: [int, ...] } }` per-category counts per bin for only the mentioned TVs.
 - `metadata` (object):
@@ -97,6 +99,10 @@ Response (truncated)
     "TV_456": [3, 5, 9, "..."],
     "...": ["..."]
   },
+  "capacity": {
+    "TV_123": [20, 20, 20, "..."],
+    "TV_456": [18, 18, 18, "..."]
+  },
   "metadata": {
     "num_tvs": 50,
     "num_bins": 96,
@@ -138,8 +144,15 @@ Response (bins 06:00–07:30 → N=7 for 15-min bins)
     "TV_X": [7, 9, 8, 11, 9, 6, 5],
     "...": ["..."]
   },
+  "capacity": {
+    "TV_A": [22, 22, 22, 22, 22, 22, 22],
+    "TV_X": [18, 18, 18, 18, 18, 18, 18]
+  },
   "mentioned_counts": {
     "TV_A": [8, 11, 9, 12, 10, 7, 6]
+  },
+  "mentioned_capacity": {
+    "TV_A": [22, 22, 22, 22, 22, 22, 22]
   },
   "metadata": {
     "num_tvs": 50,

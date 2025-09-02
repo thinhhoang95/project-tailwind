@@ -212,6 +212,8 @@ async def original_counts(request: Dict[str, Any]) -> Dict[str, Any]:
     - include_overall: bool (accepted for backward-compatibility; counts are always included for the top 50 TVs)
 
     Always returns counts for the top_k=50 TVs ranked by 'rank_by' over the selected time range.
+    Also returns capacity arrays per bin aligned with the returned counts: 
+    - 'capacity' for the top-k TVs, and 'mentioned_capacity' when 'traffic_volume_ids' are provided.
     """
     try:
         tvs = request.get("traffic_volume_ids")
