@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import asyncio
 from pathlib import Path
 import numpy as np
+import geopandas as gpd
 
 # Ensure imports from project src are available
 import sys
@@ -38,6 +39,84 @@ class CountAPIWrapper:
 
         # Cached overall totals (across all flights)
         self._total_occupancy_vector: Optional[np.ndarray] = None
+        # Capacity caches
+        self._hourly_capacity_by_tv: Dict[str, Dict[int, float]] = {}
+        self._capacity_per_bin_matrix: Optional[np.ndarray] = None
+        self._init_capacity_data()
+
+    def _init_capacity_data(self) -> None:
+        """Load hourly capacity by TV from GeoJSON and build per-bin matrix."""
+        # Try absolute path first (as used elsewhere), then fallback
+        try_paths = [
+            Path("D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"),
+            Path("data/traffic_volumes_with_capacity.geojson"),
+        ]
+        gdf = None
+        for p in try_paths:
+            try:
+                if p.exists():
+                    gdf = gpd.read_file(str(p))
+                    break
+            except Exception:
+                continue
+        if gdf is None:
+            # no capacity available
+            self._hourly_capacity_by_tv = {}
+            self._capacity_per_bin_matrix = None
+            return
+
+        # Process capacity column -> mapping {tv_id: {hour:int -> capacity:float}}
+        hourly_by_tv: Dict[str, Dict[int, float]] = {}
+        for _, row in gdf.iterrows():
+            tv_id = row.get("traffic_volume_id")
+            if tv_id is None or tv_id not in self._flight_list.tv_id_to_idx:
+                continue
+            raw = row.get("capacity")
+            mapping: Dict[int, float] = {}
+            try:
+                if isinstance(raw, str):
+                    import json as _json
+                    try:
+                        raw = _json.loads(raw.replace("'", '"'))
+                    except Exception:
+                        raw = None
+                if isinstance(raw, dict):
+                    for k, v in raw.items():
+                        # keys like "6:00-7:00" -> take start hour before ':'
+                        try:
+                            if isinstance(k, str) and ":" in k:
+                                hour = int(k.split(":")[0])
+                            else:
+                                hour = int(k)
+                            mapping[int(hour)] = float(v)
+                        except Exception:
+                            continue
+            except Exception:
+                mapping = {}
+            hourly_by_tv[str(tv_id)] = mapping
+        self._hourly_capacity_by_tv = hourly_by_tv
+
+        # Build per-bin capacity matrix [num_tvs, bins_per_tv] repeating hourly cap across bins
+        num_tvs = len(self._flight_list.tv_id_to_idx)
+        bins_per_tv = int(self._flight_list.num_time_bins_per_tv)
+        # integer bins per hour
+        bins_per_hour = max(1, 60 // int(self._flight_list.time_bin_minutes))
+        mat = np.full((num_tvs, bins_per_tv), -1.0, dtype=np.float32)
+        # iterate tvs by their row index
+        for tv_id, row_idx in self._flight_list.tv_id_to_idx.items():
+            per_hour = self._hourly_capacity_by_tv.get(tv_id, {})
+            if not per_hour:
+                continue
+            for h, cap in per_hour.items():
+                try:
+                    hh = int(h)
+                    start = hh * bins_per_hour
+                    end = min(start + bins_per_hour, bins_per_tv)
+                    if start < bins_per_tv and start >= 0:
+                        mat[int(row_idx), start:end] = float(cap)
+                except Exception:
+                    continue
+        self._capacity_per_bin_matrix = mat
 
     # ---------- Helpers ----------
     @property
@@ -241,12 +320,40 @@ class CountAPIWrapper:
             vec = sliced[int(idx), :]
             counts[tv_id] = [int(x) for x in np.asarray(vec).ravel().tolist()]
 
+        # Capacity for top-k TVs over the same time slice
+        capacity: Dict[str, List[float]] = {}
+        if self._capacity_per_bin_matrix is not None:
+            cap_slice = self._capacity_per_bin_matrix[:, slice_start : slice_end_inclusive + 1]
+            for idx in top_indices:
+                tv_id = idx_to_tv[int(idx)]
+                cap_vec = cap_slice[int(idx), :]
+                capacity[tv_id] = [float(x) for x in np.asarray(cap_vec).ravel().tolist()]
+        else:
+            # No capacity available; fill -1.0
+            neg = [-1.0] * (int(end_bin) - int(start_bin) + 1)
+            for idx in top_indices:
+                tv_id = idx_to_tv[int(idx)]
+                capacity[tv_id] = list(neg)
+
         # If specific TVs were mentioned, also include them under mentioned_counts
         if traffic_volume_ids:
             for tv in traffic_volume_ids:
                 row = int(tv_map[tv])
                 vec = sliced[row, :]
                 mentioned_counts[tv] = [int(x) for x in np.asarray(vec).ravel().tolist()]
+        # Mentioned capacity
+        mentioned_capacity: Dict[str, List[float]] = {}
+        if traffic_volume_ids:
+            if self._capacity_per_bin_matrix is not None:
+                cap_slice = self._capacity_per_bin_matrix[:, slice_start : slice_end_inclusive + 1]
+                for tv in traffic_volume_ids:
+                    row = int(tv_map[tv])
+                    cap_vec = cap_slice[row, :]
+                    mentioned_capacity[tv] = [float(x) for x in np.asarray(cap_vec).ravel().tolist()]
+            else:
+                neg = [-1.0] * (int(end_bin) - int(start_bin) + 1)
+                for tv in traffic_volume_ids:
+                    mentioned_capacity[tv] = list(neg)
 
         # Category-specific counts for the same set of TVs as in counts (top-k)
         flights_considered: int
@@ -314,6 +421,7 @@ class CountAPIWrapper:
                 "labels": labels,
             },
             "counts": counts,
+            "capacity": capacity,
             "metadata": {
                 "num_tvs": int(len(ranked_tv_ids)),
                 "num_bins": int(end_bin) - int(start_bin) + 1,
@@ -328,6 +436,7 @@ class CountAPIWrapper:
 
         if traffic_volume_ids:
             resp["mentioned_counts"] = mentioned_counts
+            resp["mentioned_capacity"] = mentioned_capacity
             resp["metadata"]["num_mentioned"] = int(len(traffic_volume_ids))
 
         # Attach by_category and/or missing flights info when present
