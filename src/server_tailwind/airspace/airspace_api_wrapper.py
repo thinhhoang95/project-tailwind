@@ -60,8 +60,8 @@ class AirspaceAPIWrapper:
         try:
             # Load traffic volumes GeoDataFrame
             # Update this path based on your actual data location
-            # traffic_volumes_path = "D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
-            traffic_volumes_path = "/Volumes/CrucialX/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
+            traffic_volumes_path = "D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
+            # traffic_volumes_path = "/Volumes/CrucialX/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
             
             if not Path(traffic_volumes_path).exists():
                 # Fallback to a relative path if absolute doesn't exist
