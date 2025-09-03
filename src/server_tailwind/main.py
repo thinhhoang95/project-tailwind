@@ -8,12 +8,25 @@ from typing import Dict, Any, Optional
 from .airspace.airspace_api_wrapper import AirspaceAPIWrapper
 from .deepflow.flows_api_wrapper import FlowsWrapper
 from .CountAPIWrapper import CountAPIWrapper
+from .core.resources import get_resources
 from parrhesia.api.base_evaluation import compute_base_evaluation
+try:
+    import parrhesia.api.resources as parr_res
+except Exception:
+    parr_res = None  # type: ignore[assignment]
 
 
 app = FastAPI(title="Airspace Traffic Analysis API", version="1.0.0", debug=True)
 
-# Initialize the airspace API wrapper
+# Preload global resources and initialize wrappers
+_res = get_resources().preload_all()
+# Register shared resources with parrhesia so its modules can reuse them
+if parr_res is not None:
+    try:
+        parr_res.set_global_resources(_res.indexer, _res.flight_list)
+    except Exception as _e:
+        # Non-fatal: parrhesia will fall back to disk loading
+        print(f"Warning: failed to register parrhesia resources: {_e}")
 airspace_wrapper = AirspaceAPIWrapper()
 flows_wrapper = FlowsWrapper()
 count_wrapper = CountAPIWrapper()
