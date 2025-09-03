@@ -31,6 +31,7 @@ from project_tailwind.optimize.regulation import Regulation
 from project_tailwind.optimize.parser.regulation_parser import RegulationParser
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.subflows.flow_extractor import assign_communities_for_hotspot
+from server_tailwind.core.resources import get_resources
 
 
 class AirspaceAPIWrapper:
@@ -58,26 +59,11 @@ class AirspaceAPIWrapper:
     def _initialize_data(self):
         """Initialize the NetworkEvaluator with required data."""
         try:
-            # Load traffic volumes GeoDataFrame
-            # Update this path based on your actual data location
-            # traffic_volumes_path = "D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
-            traffic_volumes_path = "/Volumes/CrucialX/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
-            
-            if not Path(traffic_volumes_path).exists():
-                # Fallback to a relative path if absolute doesn't exist
-                traffic_volumes_path = "data/traffic_volumes_with_capacity.geojson"
-            
-            self._traffic_volumes_gdf = gpd.read_file(traffic_volumes_path)
-            
-            # Load flight list
-            self._flight_list = FlightList(
-                occupancy_file_path="output/so6_occupancy_matrix_with_times.json",
-                tvtw_indexer_path="output/tvtw_indexer.json",
-            )
-            
-            # Initialize evaluator
+            res = get_resources()
+            self._traffic_volumes_gdf = res.traffic_volumes_gdf
+            self._flight_list = res.flight_list
+            # Initialize evaluator with shared resources
             self._evaluator = NetworkEvaluator(self._traffic_volumes_gdf, self._flight_list)
-            
         except Exception as e:
             print(f"Warning: Failed to initialize data: {e}")
             self._evaluator = None
@@ -155,80 +141,15 @@ class AirspaceAPIWrapper:
 
     def _ensure_travel_minutes(self, speed_kts: float = 475.0) -> Dict[str, Dict[str, float]]:
         """
-        Ensure pairwise travel minutes between TVs are available (persisted and cached).
+        Ensure pairwise travel minutes between TVs are available (cached globally).
         minutes = (distance_nm / speed_kts) * 60
         """
-        # If cached and matches speed, return
         if self._tv_travel_minutes is not None:
             return self._tv_travel_minutes
-
         with self._travel_lock:
             if self._tv_travel_minutes is not None:
                 return self._tv_travel_minutes
-
-            filename = f"output/tv_travel_minutes_{int(speed_kts)}.json"
-            fpath = Path(filename)
-            if fpath.exists():
-                try:
-                    with open(fpath, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    meta = data.get("metadata", {})
-                    if float(meta.get("speed_kts", -1)) == float(speed_kts):
-                        self._tv_travel_minutes = data.get("travel_minutes", {})
-                        return self._tv_travel_minutes
-                except Exception:
-                    pass
-
-            # Compute from centroids
-            tv_id_list = list(self._evaluator.tv_id_to_idx.keys())
-            centroid_map = self._compute_tv_centroid_latlon_map()
-            lat_list: List[float] = []
-            lon_list: List[float] = []
-            valid_ids: List[str] = []
-            for tv_id in tv_id_list:
-                pt = centroid_map.get(tv_id)
-                if pt is None:
-                    continue
-                valid_ids.append(tv_id)
-                lat_list.append(pt["lat"])
-                lon_list.append(pt["lon"])
-
-            if not valid_ids:
-                self._tv_travel_minutes = {}
-                return self._tv_travel_minutes
-
-            lat_arr = np.asarray(lat_list, dtype=np.float64)
-            lon_arr = np.asarray(lon_list, dtype=np.float64)
-
-            lat1 = lat_arr[:, None]
-            lon1 = lon_arr[:, None]
-            lat2 = lat_arr[None, :]
-            lon2 = lon_arr[None, :]
-
-            dist_nm_matrix = haversine_vectorized(lat1, lon1, lat2, lon2)
-            minutes_matrix = (dist_nm_matrix / float(speed_kts)) * 60.0
-
-            # Build nested dict
-            nested: Dict[str, Dict[str, float]] = {}
-            for i, src in enumerate(valid_ids):
-                inner: Dict[str, float] = {}
-                row_minutes = minutes_matrix[i]
-                for j, dst in enumerate(valid_ids):
-                    inner[dst] = float(row_minutes[j])
-                nested[src] = inner
-
-            # Persist
-            try:
-                fpath.parent.mkdir(parents=True, exist_ok=True)
-                with open(fpath, "w", encoding="utf-8") as f:
-                    json.dump({
-                        "metadata": {"speed_kts": float(speed_kts)},
-                        "travel_minutes": nested,
-                    }, f, indent=2)
-            except Exception:
-                pass
-
-            self._tv_travel_minutes = nested
+            self._tv_travel_minutes = get_resources().travel_minutes(speed_kts)
             return self._tv_travel_minutes
 
     async def get_slack_distribution(self, traffic_volume_id: str, ref_time_str: str, sign: str, delta_min: float = 0.0) -> Dict[str, Any]:

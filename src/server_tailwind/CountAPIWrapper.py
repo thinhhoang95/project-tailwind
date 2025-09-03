@@ -20,7 +20,7 @@ import sys
 project_root = Path(__file__).parent.parent.parent / "src"
 sys.path.insert(0, str(project_root))
 
-from project_tailwind.optimize.eval.flight_list import FlightList
+from server_tailwind.core.resources import get_resources
 
 
 class CountAPIWrapper:
@@ -31,18 +31,15 @@ class CountAPIWrapper:
 
     def __init__(self):
         self._executor = ThreadPoolExecutor(max_workers=2)
-        # Load once and reuse
-        self._flight_list = FlightList(
-            occupancy_file_path="output/so6_occupancy_matrix_with_times.json",
-            tvtw_indexer_path="output/tvtw_indexer.json",
-        )
+        # Load once and reuse shared resources
+        res = get_resources()
+        self._flight_list = res.flight_list
 
         # Cached overall totals (across all flights)
         self._total_occupancy_vector: Optional[np.ndarray] = None
-        # Capacity caches
-        self._hourly_capacity_by_tv: Dict[str, Dict[int, float]] = {}
-        self._capacity_per_bin_matrix: Optional[np.ndarray] = None
-        self._init_capacity_data()
+        # Capacity caches (reused from global resources)
+        self._hourly_capacity_by_tv: Dict[str, Dict[int, float]] = res.hourly_capacity_by_tv
+        self._capacity_per_bin_matrix: Optional[np.ndarray] = res.capacity_per_bin_matrix
 
     def _init_capacity_data(self) -> None:
         """Load hourly capacity by TV from GeoJSON and build per-bin matrix."""

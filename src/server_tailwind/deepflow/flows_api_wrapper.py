@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Import compute_flows directly from the parrhesia package
 from parrhesia.api.flows import compute_flows
-from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
+from server_tailwind.core.resources import get_resources
 
 
 class FlowsWrapper:
@@ -17,8 +17,8 @@ class FlowsWrapper:
 
     def __init__(self):
         self._executor = ThreadPoolExecutor(max_workers=2)
-        # Load TVTW indexer once for time bin conversion
-        self._tvtw_indexer = TVTWIndexer.load("output/tvtw_indexer.json")
+        # Reuse shared TVTW indexer for time-bin conversion
+        self._tvtw_indexer = get_resources().indexer
 
     async def get_flows(
         self,
