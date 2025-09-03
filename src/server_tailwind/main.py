@@ -8,6 +8,8 @@ from typing import Dict, Any, Optional
 from .airspace.airspace_api_wrapper import AirspaceAPIWrapper
 from .deepflow.flows_api_wrapper import FlowsWrapper
 from .CountAPIWrapper import CountAPIWrapper
+from parrhesia.api.base_evaluation import compute_base_evaluation
+
 
 app = FastAPI(title="Airspace Traffic Analysis API", version="1.0.0", debug=True)
 
@@ -333,6 +335,27 @@ async def regulation_plan_simulation(request: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/base_evaluation")
+def post_base_evaluation(payload: dict):
+    # Minimal validation: require targets and flows to be present
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+    if not payload.get("targets"):
+        raise HTTPException(status_code=400, detail="'targets' is required")
+    if not payload.get("flows"):
+        raise HTTPException(status_code=400, detail="'flows' is required")
+    try:
+        result = compute_base_evaluation(payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        print(f"Exception in /base_evaluation: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to compute base evaluation: {e}")
+    return result
+
 
 if __name__ == "__main__":
     import uvicorn
