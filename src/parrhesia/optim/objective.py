@@ -91,7 +91,7 @@ from .occupancy import compute_occupancy
 from .capacity import rolling_hour_sum
 # --------------------------------- Public API --------------------------------
 # Optional timing logs (set True for debug)
-DEBUG_TIMING = True
+DEBUG_TIMING = False
 
 
 @dataclass
@@ -108,6 +108,9 @@ class ScoreContext:
     flights_sorted_by_flow: Dict[Any, List[Tuple[str, Optional[object], int]]]
     attn_tv_ids: List[str]
     beta_gamma_by_flow: Dict[Any, Tuple[np.ndarray, np.ndarray]]
+    base_occ_all_by_tv: Dict[str, np.ndarray]
+    base_occ_sched_zero_by_tv: Dict[str, np.ndarray]
+    sched_fids: List[str]
 
 
 def build_score_context(
@@ -169,6 +172,38 @@ def build_score_context(
                 np.full(T, float(weights.gamma_ctx), dtype=np.float32),
             )
 
+    # Precompute occupancy baselines
+    sched_fids: List[str] = []
+    for ids in fids_by_flow.values():
+        sched_fids.extend([str(x) for x in (ids or [])])
+    base_occ_all_by_tv: Dict[str, np.ndarray] = {}
+    base_occ_sched_zero_by_tv: Dict[str, np.ndarray] = {}
+    if flight_list is not None:
+        # All flights, zero delays
+        base_occ_all_by_tv = compute_occupancy(
+            flight_list, {}, indexer, tv_filter=tvs_of_interest
+        )
+        # Scheduled flights only, zero delays (guard if backend doesn't support flight_filter)
+        try:
+            import inspect  # type: ignore
+            supports_filter = "flight_filter" in inspect.signature(compute_occupancy).parameters
+        except Exception:
+            supports_filter = False
+        if supports_filter:
+            base_occ_sched_zero_by_tv = compute_occupancy(
+                flight_list, {}, indexer, tv_filter=tvs_of_interest, flight_filter=sched_fids
+            )
+        else:
+            # Fallback: build a tiny subset flight_list with only scheduled flights
+            fm = getattr(flight_list, "flight_metadata", {}) or {}
+            sub_meta = {fid: fm.get(fid) for fid in sched_fids if fid in fm}
+            _Sub = type("_SubFlights", (), {})
+            sub_flight_list = _Sub()
+            setattr(sub_flight_list, "flight_metadata", sub_meta)
+            base_occ_sched_zero_by_tv = compute_occupancy(
+                sub_flight_list, {}, indexer, tv_filter=tvs_of_interest
+            )
+
     return ScoreContext(
         indexer=indexer,
         weights=weights,
@@ -182,6 +217,9 @@ def build_score_context(
         flights_sorted_by_flow=flights_sorted_by_flow,
         attn_tv_ids=attn_tv_ids,
         beta_gamma_by_flow=beta_gamma_by_flow,
+        base_occ_all_by_tv=base_occ_all_by_tv,
+        base_occ_sched_zero_by_tv=base_occ_sched_zero_by_tv,
+        sched_fids=sched_fids,
     )
 
 
@@ -213,12 +251,56 @@ def score_with_context(
     # Occupancy only for TVs of interest
     if DEBUG_TIMING:
         time_start = time.time()
-    occ_by_tv = compute_occupancy(
-        flight_list if flight_list is not None else type("_Dummy", (), {"flight_metadata": {}})(),
-        delays_min,
-        indexer,
-        tv_filter=context.tvs_of_interest,
-    )
+    if flight_list is not None and context.base_occ_all_by_tv:
+        # Compute occupancy for scheduled flights only with current delays
+        try:
+            import inspect  # type: ignore
+            supports_filter = "flight_filter" in inspect.signature(compute_occupancy).parameters
+        except Exception:
+            supports_filter = False
+        if supports_filter:
+            occ_sched = compute_occupancy(
+                flight_list,
+                delays_min,
+                indexer,
+                tv_filter=context.tvs_of_interest,
+                flight_filter=context.sched_fids,
+            )
+        else:
+            # Fallback: small subset flight_list wrapper
+            fm = getattr(flight_list, "flight_metadata", {}) or {}
+            sub_meta = {fid: fm.get(fid) for fid in context.sched_fids if fid in fm}
+            _Sub = type("_SubFlights", (), {})
+            sub_flight_list = _Sub()
+            setattr(sub_flight_list, "flight_metadata", sub_meta)
+            delays_sched = {fid: delays_min.get(fid, 0) for fid in context.sched_fids}
+            occ_sched = compute_occupancy(
+                sub_flight_list,
+                delays_sched,
+                indexer,
+                tv_filter=context.tvs_of_interest,
+            )
+        # Combine using delta: all-zero + (scheduled-current - scheduled-zero)
+        occ_by_tv: Dict[str, np.ndarray] = {}
+        T_int = int(indexer.num_time_bins)
+        zeros = np.zeros(T_int, dtype=np.int64)
+        for tv in context.tvs_of_interest:
+            tvs = str(tv)
+            base_all = context.base_occ_all_by_tv.get(tvs, zeros)
+            base_sched_zero = context.base_occ_sched_zero_by_tv.get(tvs, zeros)
+            sched_cur = occ_sched.get(tvs, zeros)
+            occ_by_tv[tvs] = (
+                base_all.astype(np.int64)
+                + sched_cur.astype(np.int64)
+                - base_sched_zero.astype(np.int64)
+            )
+    else:
+        occ_by_tv = compute_occupancy(
+            flight_list if flight_list is not None else type("_Dummy", (), {"flight_metadata": {}})(),
+            delays_min,
+            indexer,
+            tv_filter=context.tvs_of_interest,
+        )
     if DEBUG_TIMING:
         time_end = time.time(); print(f"compute_occupancy time: {time_end - time_start} seconds for {len(context.tvs_of_interest)} TVs")
 

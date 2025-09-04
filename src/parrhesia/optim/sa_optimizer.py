@@ -243,7 +243,7 @@ class SAParams:
     max_shift: int = 4  # maximum Δ for shift-later
     pull_max: int = 2   # maximum Δ for pull-forward
     smooth_window_max: int = 3  # maximum window length for smoothing
-    verbose: bool = True  # if True (or env SA_VERBOSE truthy), print SA progress
+    verbose: bool = False  # if True (or env SA_VERBOSE truthy), print SA progress
 
 
 def _to_T_plus_1(arr: Iterable[int], T: int) -> np.ndarray:

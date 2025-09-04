@@ -70,6 +70,8 @@ from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 # Weakly referenced to avoid memory leaks across runs.
 _OCC_FOOTPRINTS_CACHE: "WeakKeyDictionary" = WeakKeyDictionary()
 
+DEBUG_PROFILE_TIMING = False
+
 # Optional Numba acceleration
 _HAS_NUMBA = True
 try:
@@ -186,6 +188,7 @@ def compute_occupancy(
     delays: Mapping[str, int],
     indexer: TVTWIndexer,
     tv_filter: Optional[Iterable[str]] = None,
+    flight_filter: Optional[Iterable[str]] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Compute per‑TV per‑bin occupancy after applying per‑flight delays.
@@ -207,6 +210,9 @@ def compute_occupancy(
     tv_filter : Optional[Iterable[str]]
         If provided, restrict occupancy aggregation to these traffic_volume_ids.
         When None, aggregate for all TVs known to the indexer.
+    flight_filter : Optional[Iterable[str]]
+        If provided, restrict computation to these flight ids only. When None,
+        process all flights present in `flight_list.flight_metadata`.
 
     Returns
     -------
@@ -251,6 +257,8 @@ def compute_occupancy(
     >>> set(occ.keys()) == {"TV1"}
     True
     """
+    import time 
+
     # Establish which TVs to compute for (maintain deterministic order)
     if tv_filter is not None:
         tv_ids_requested = list(dict.fromkeys(str(tv) for tv in tv_filter))
@@ -265,6 +273,8 @@ def compute_occupancy(
 
     # Build compact mapping for the rows we care about
     # row_to_compact[row] -> [0..V-1] or -1 if not selected
+    if DEBUG_PROFILE_TIMING:
+        start_time = time.time()
     row_to_compact = np.full(num_rows, -1, dtype=np.int32)
     tv_ids: list[str] = []
     for tv in tv_ids_requested:
@@ -275,28 +285,51 @@ def compute_occupancy(
         if 0 <= row_idx < num_rows and row_to_compact[row_idx] < 0:
             row_to_compact[row_idx] = len(tv_ids)
             tv_ids.append(str(tv))
+    if DEBUG_PROFILE_TIMING:
+        end_time = time.time()
+        print(f"Time taken to build compact mapping: {end_time - start_time} seconds")
 
     V = len(tv_ids)
     if V == 0:
         return {}
 
     # Precompute delays in seconds
+    if DEBUG_PROFILE_TIMING:
+        start_time = time.time()
     delays_sec: Dict[str, int] = {}
     for k, v in (delays or {}).items():
         try:
             delays_sec[str(k)] = int(v) * 60
         except Exception:
             delays_sec[str(k)] = 0
-
+    if DEBUG_PROFILE_TIMING:
+        end_time = time.time()
+        print(f"Time taken to precompute delays: {end_time - start_time} seconds")
+    
     # Retrieve or build cached footprints (rows, base_bins, entry_mods) per flight
+    if DEBUG_PROFILE_TIMING:
+        start_time = time.time()
     cache = _get_or_build_footprints_cache(flight_list, indexer)
+    if DEBUG_PROFILE_TIMING:
+        end_time = time.time()
+        print(f"Time taken to retrieve or build cached footprints: {end_time - start_time} seconds")
+    
     per_flight = cache["per_flight"]  # type: ignore[index]
 
     # Accumulate all contributing (compact_row, bin) pairs across flights
     rows_all: list[np.ndarray] = []
     bins_all: list[np.ndarray] = []
-
-    for fid, triple in per_flight.items():  # type: ignore[assignment]
+    if DEBUG_PROFILE_TIMING:
+        start_time = time.time()
+    # Determine which flights to process
+    if flight_filter is not None:
+        flight_ids_requested = [str(fid) for fid in flight_filter if str(fid) in per_flight]
+    else:
+        flight_ids_requested = list(per_flight.keys())
+    for fid in flight_ids_requested:
+        triple = per_flight.get(str(fid))  # type: ignore[assignment]
+        if triple is None:
+            continue
         rows_i, base_bins_i, entry_mods_i = triple  # each is np.ndarray[int32]
         if rows_i.size == 0:
             continue
@@ -325,7 +358,11 @@ def compute_occupancy(
 
         rows_all.append(comp_rows_i[mask].astype(np.int64, copy=False))
         bins_all.append(bins_i[mask].astype(np.int64, copy=False))
-
+    
+    if DEBUG_PROFILE_TIMING:
+        end_time = time.time()
+        print(f"Time taken to accumulate all contributing (compact_row, bin) pairs across flights: {end_time - start_time} seconds")
+    
     # If no contributing intervals, return zeros for requested TVs
     if not rows_all:
         return {tv: np.zeros(T, dtype=np.int64) for tv in tv_ids}
