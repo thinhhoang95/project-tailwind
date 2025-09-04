@@ -21,7 +21,7 @@ class ResourcePaths:
     occupancy_file_path: Path = Path("output/so6_occupancy_matrix_with_times.json")
     tvtw_indexer_path: Path = Path("output/tvtw_indexer.json")
     traffic_volumes_path: Path = Path("/Volumes/CrucialX/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson")
-    fallback_traffic_volumes_path: Path = Path("data/traffic_volumes_with_capacity.geojson")
+    fallback_traffic_volumes_path: Path = Path("D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson")
 
 
 class AppResources:
