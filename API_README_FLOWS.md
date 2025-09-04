@@ -183,6 +183,7 @@ Top-level:
 - **target_cells** (Array<[string, int]>)
 - **ripple_cells** (Array<[string, int]>)
 - **flows** (FlowOpt[]): per-flow results
+- **delays_min** (object): `flight_id -> delay_minutes` under the optimized schedule (integers; 0 means no delay)
 - **objective_baseline**: `{"score": number, "components": {...}}`
 - **objective_optimized**: `{"score": number, "components": {...}}`
 - **improvement**: `{"absolute": number, "percent": number}`
@@ -216,4 +217,5 @@ curl -X POST http://localhost:8000/automatic_rate_adjustment \
 #### Notes
 - Arrays are JSON-serializable (numpy arrays are converted to lists).
 - “Demands” mirror `/base_evaluation` (earliest crossings), while “occupancy_opt” reflects realized occupancy after delays with the optimized schedule.
+- Use `delays_min` to retrieve per-flight delays (in minutes). Filter values > 0 to list only delayed flights.
 - Determinism controlled via `sa_params.seed`.
