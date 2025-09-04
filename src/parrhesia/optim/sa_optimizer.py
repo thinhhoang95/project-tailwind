@@ -43,8 +43,8 @@ import numpy as np
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from ..flows.flow_pipeline import collect_hotspot_flights
 from project_tailwind.optimize.eval.flight_list import FlightList
-from .objective import score, ObjectiveWeights
-from ..fcfs.flowful import _normalize_flight_spec
+from .objective import score, ObjectiveWeights, build_score_context, score_with_context
+from ..fcfs.flowful import _normalize_flight_spec, preprocess_flights_for_scheduler
 
 
 # ---------------------------- Controlled volumes ----------------------------
@@ -61,27 +61,33 @@ def _earliest_crossing_bins_for_flow(
       hotspot_id -> list[int (bins)]
     Only flights that cross a hotspot contribute to its list.
     """
+    # Use precomputed per-flight earliest bins if available to avoid rescanning
     idx = flight_list.indexer
     by_hotspot: Dict[str, List[int]] = {str(h): [] for h in hotspot_ids}
+    allowed = set(str(h) for h in hotspot_ids)
+    # Build a small cache for this flow
     for fid in flow_flight_ids:
         meta = flight_list.flight_metadata.get(fid)
         if not meta:
             continue
         earliest_bin_by_tv: Dict[str, int] = {}
         for iv in meta.get("occupancy_intervals", []) or []:
+            tvtw_idx_raw = iv.get("tvtw_index")
             try:
-                tvtw_idx = int(iv.get("tvtw_index"))
+                tvtw_idx = int(tvtw_idx_raw)
             except Exception:
                 continue
             decoded = idx.get_tvtw_from_index(tvtw_idx)
             if not decoded:
                 continue
             tv_id, tbin = decoded
-            if tv_id not in by_hotspot:
+            s_tv = str(tv_id)
+            if s_tv not in allowed:
                 continue
-            cur = earliest_bin_by_tv.get(tv_id)
-            if cur is None or int(tbin) < cur:
-                earliest_bin_by_tv[tv_id] = int(tbin)
+            tb = int(tbin)
+            cur = earliest_bin_by_tv.get(s_tv)
+            if cur is None or tb < cur:
+                earliest_bin_by_tv[s_tv] = tb
         for h, b in earliest_bin_by_tv.items():
             by_hotspot[h].append(int(b))
     return by_hotspot
@@ -91,6 +97,8 @@ def _controlled_volume_for_flow(
     flow_flight_ids: Sequence[str],
     flight_list: FlightList,
     hotspot_ids: Sequence[str],
+    *,
+    earliest_bin_by_flight_by_hotspot: Optional[Mapping[str, Mapping[str, int]]] = None,
 ) -> Optional[str]:
     """
     Earliest-median policy across the given hotspot set.
@@ -100,7 +108,17 @@ def _controlled_volume_for_flow(
     h; tie-break by smallest IQR (p75 - p25) then by lexical TV id.
     Returns None if no flights touch any hotspot.
     """
-    bins_by_h = _earliest_crossing_bins_for_flow(flow_flight_ids, flight_list, hotspot_ids)
+    if earliest_bin_by_flight_by_hotspot is not None:
+        # Aggregate from precomputed earliest bins per flight
+        bins_by_h: Dict[str, List[int]] = {str(h): [] for h in hotspot_ids}
+        for fid in flow_flight_ids:
+            eb = earliest_bin_by_flight_by_hotspot.get(str(fid), {})
+            for h in hotspot_ids:
+                v = eb.get(str(h))
+                if v is not None:
+                    bins_by_h[str(h)].append(int(v))
+    else:
+        bins_by_h = _earliest_crossing_bins_for_flow(flow_flight_ids, flight_list, hotspot_ids)
     best: Optional[Tuple[float, float, str]] = None  # (median, iqr, tv_id)
     for h in hotspot_ids:
         vals = bins_by_h.get(str(h), []) or []
@@ -159,6 +177,7 @@ def prepare_flow_scheduling_inputs(
 
     # Precompute earliest crossing per flight per hotspot
     earliest_bin_by_flight_by_hotspot: Dict[str, Dict[str, int]] = {}
+    hotspot_set = set(str(h) for h in hotspot_ids)
     for fid, meta in flight_list.flight_metadata.items():
         d: Dict[str, int] = {}
         for iv in meta.get("occupancy_intervals", []) or []:
@@ -170,15 +189,19 @@ def prepare_flow_scheduling_inputs(
             if not decoded:
                 continue
             tv_id, tbin = decoded
-            if str(tv_id) not in set(str(h) for h in hotspot_ids):
+            s_tv = str(tv_id)
+            if s_tv not in hotspot_set:
                 continue
-            cur = d.get(str(tv_id))
-            if cur is None or int(tbin) < cur:
-                d[str(tv_id)] = int(tbin)
+            tb = int(tbin)
+            cur = d.get(s_tv)
+            if cur is None or tb < cur:
+                d[s_tv] = tb
         earliest_bin_by_flight_by_hotspot[str(fid)] = d
 
     for flow_id, fids in flights_by_flow.items():
-        ctrl = _controlled_volume_for_flow(fids, flight_list, list(hotspot_ids))
+        ctrl = _controlled_volume_for_flow(
+            fids, flight_list, list(hotspot_ids), earliest_bin_by_flight_by_hotspot=earliest_bin_by_flight_by_hotspot
+        )
         controlled_by_flow[flow_id] = ctrl
         specs: List[Dict[str, Any]] = []
         for fid in fids:
@@ -421,10 +444,9 @@ def run_sa(
     d_by_flow = _compute_demands_from_flights(flights_by_flow, indexer)
     n_by_flow: Dict[Any, np.ndarray] = _build_initial_schedule_from_demands(d_by_flow)
 
-    # Evaluate baseline with n=d
-    J_best, comps_best, arts_best = score(
-        n_by_flow,
-        flights_by_flow=flights_by_flow,
+    # Build scoring context and evaluate baseline with n=d via fast path
+    context = build_score_context(
+        flights_by_flow,
         indexer=indexer,
         capacities_by_tv=capacities_by_tv,
         target_cells=target_cells,
@@ -432,6 +454,13 @@ def run_sa(
         flight_list=flight_list,
         weights=weights,
         tv_filter=tv_filter,
+    )
+    J_best, comps_best, arts_best = score_with_context(
+        n_by_flow,
+        flights_by_flow=flights_by_flow,
+        capacities_by_tv=capacities_by_tv,
+        flight_list=flight_list,
+        context=context,
     )
     n_best = {f: np.array(v, dtype=np.int64, copy=True) for f, v in n_by_flow.items()}
 
@@ -446,16 +475,12 @@ def run_sa(
         mv = _propose_move(rng, trial, d_by_flow, attn_masks, params)
         if mv is None:
             continue
-        J_trial, _c, _a = score(
+        J_trial, _c, _a = score_with_context(
             trial,
             flights_by_flow=flights_by_flow,
-            indexer=indexer,
             capacities_by_tv=capacities_by_tv,
-            target_cells=target_cells,
-            ripple_cells=ripple_cells,
             flight_list=flight_list,
-            weights=weights,
-            tv_filter=tv_filter,
+            context=context,
         )
         deltas.append(float(J_trial - J_best))
     sigma = float(np.std(np.asarray(deltas, dtype=np.float64))) if deltas else 1.0
@@ -467,16 +492,12 @@ def run_sa(
         mv = _propose_move(rng, candidate, d_by_flow, attn_masks, params)
         if mv is None:
             continue
-        J_new, comps_new, arts_new = score(
+        J_new, comps_new, arts_new = score_with_context(
             candidate,
             flights_by_flow=flights_by_flow,
-            indexer=indexer,
             capacities_by_tv=capacities_by_tv,
-            target_cells=target_cells,
-            ripple_cells=ripple_cells,
             flight_list=flight_list,
-            weights=weights,
-            tv_filter=tv_filter,
+            context=context,
         )
         dJ = float(J_new - J_best)
         accept = dJ <= 0.0 or rng.random() < math.exp(-(max(dJ, 0.0)) / max(Tcur, 1e-9))
