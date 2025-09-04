@@ -488,11 +488,20 @@ def _compute_J_cap(
     capacities_by_tv: Mapping[str, np.ndarray],
     alpha_by_tv: Mapping[str, np.ndarray],
     K: int,
+    *,
+    audit_exceedances: bool = False, # if true, print audit lines for each exceedance cell
+    indexer: Optional[TVTWIndexer] = None,
+    target_cells: Optional[Iterable[Cell]] = None,
+    ripple_cells: Optional[Iterable[Cell]] = None,
 ) -> float:
     """
     Compute weighted exceedance across TVs with provided alpha weights.
     """
     J_cap = 0.0
+    # Precompute classification sets for auditing
+    tgt_cells = set((str(tv), int(t)) for (tv, t) in (target_cells or []))
+    rip_cells = set((str(tv), int(t)) for (tv, t) in (ripple_cells or []))
+    printed_header = False
     for tv_id, occ in occ_by_tv.items():
         T = occ.size
         cap = np.asarray(capacities_by_tv.get(tv_id, np.zeros(T, dtype=np.int64)), dtype=np.float64)
@@ -510,7 +519,46 @@ def _compute_J_cap(
                 alpha = np.pad(alpha, (0, T - alpha.size), mode="constant", constant_values=0.0)
             else:
                 alpha = alpha[:T]
-        J_cap += float(np.sum(alpha * exceed))
+        contrib = alpha * exceed
+        J_cap += float(np.sum(contrib))
+
+        if audit_exceedances:
+            # Print audit lines for each exceedance cell
+            if not printed_header:
+                printed_header = True
+                bin_minutes = getattr(indexer, "time_bin_minutes", None)
+                print("\n[Audit] Capacity exceedance details (J_cap):")
+                print(f" - Rolling window K = {K} bins" + (f" (~{K * bin_minutes} minutes)" if bin_minutes else ""))
+            time_map = getattr(indexer, "time_window_map", {}) if indexer is not None else {}
+            any_for_tv = False
+            for t in range(T):
+                exc = float(exceed[t])
+                if exc <= 0.0:
+                    continue
+                any_for_tv = True
+                # Classification by membership in provided cell sets
+                cell = (str(tv_id), int(t))
+                if cell in tgt_cells:
+                    cls = "target"
+                elif cell in rip_cells:
+                    cls = "ripple"
+                else:
+                    cls = "context"
+                weight = float(alpha[t])
+                rh_val = float(rh[t])
+                cap_val = float(cap[t])
+                contrib_val = float(contrib[t])
+                human_time = time_map.get(int(t)) if isinstance(time_map, dict) else None
+                time_str = human_time if human_time is not None else f"bin {t}"
+                print(
+                    f"   • TV '{tv_id}', {time_str}: class={cls.upper()}, weight α={weight:.6g}; "
+                    f"rolling occupancy={rh_val:.6g}, capacity={cap_val:.6g}, exceedance={exc:.6g} -> contribution={contrib_val:.6g}"
+                )
+            if audit_exceedances and any_for_tv:
+                subtotal = float(np.sum(contrib))
+                print(f"   = Subtotal for TV '{tv_id}': {subtotal:.6g}")
+    if audit_exceedances:
+        print(f"[Audit] J_cap total: {J_cap:.6g}\n")
     return J_cap
 
 
@@ -528,6 +576,7 @@ def score(
     flight_list: Optional[object] = None,
     weights: Optional[ObjectiveWeights] = None,
     tv_filter: Optional[Iterable[str]] = None,
+    audit_exceedances: bool = True,  # if true, print audit lines for each exceedance cell
 ) -> Tuple[float, Dict[str, float], Dict[str, Any]]:
     """
     Evaluate the objective J for a given per-flow schedule matrix n_f_t.
@@ -663,7 +712,16 @@ def score(
 
     # J components ------------------------------------------------------------
     # Capacity exceedance
-    J_cap = _compute_J_cap(occ_by_tv, capacities_by_tv, alpha_by_tv, K)
+    J_cap = _compute_J_cap(
+        occ_by_tv,
+        capacities_by_tv,
+        alpha_by_tv,
+        K,
+        audit_exceedances=audit_exceedances,
+        indexer=indexer,
+        target_cells=target_cells,
+        ripple_cells=ripple_cells,
+    )
 
     # Delay cost
     total_delay_min = sum(int(v) for v in delays_min.values())
