@@ -10,6 +10,7 @@ from .deepflow.flows_api_wrapper import FlowsWrapper
 from .CountAPIWrapper import CountAPIWrapper
 from .core.resources import get_resources
 from parrhesia.api.base_evaluation import compute_base_evaluation
+from parrhesia.api.automatic_rate_adjustment import compute_automatic_rate_adjustment
 try:
     import parrhesia.api.resources as parr_res
 except Exception:
@@ -367,6 +368,26 @@ def post_base_evaluation(payload: dict):
         print(f"Exception in /base_evaluation: {e}")
         print(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Failed to compute base evaluation: {e}")
+    return result
+
+
+@app.post("/automatic_rate_adjustment")
+def post_automatic_rate_adjustment(payload: dict):
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON body required")
+    if not payload.get("targets"):
+        raise HTTPException(status_code=400, detail="'targets' is required")
+    if not payload.get("flows"):
+        raise HTTPException(status_code=400, detail="'flows' is required")
+    try:
+        result = compute_automatic_rate_adjustment(payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        print(f"Exception in /automatic_rate_adjustment: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to optimize: {e}")
     return result
 
 

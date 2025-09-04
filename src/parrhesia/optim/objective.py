@@ -91,7 +91,7 @@ from .occupancy import compute_occupancy
 from .capacity import rolling_hour_sum
 # --------------------------------- Public API --------------------------------
 # Optional timing logs (set True for debug)
-DEBUG_TIMING = False
+DEBUG_TIMING = True
 
 
 @dataclass
@@ -194,6 +194,7 @@ def score_with_context(
     context: ScoreContext,
     audit_exceedances: bool = False,
 ) -> Tuple[float, Dict[str, float], Dict[str, Any]]:
+    # Use module-level DEBUG_TIMING; do not override here
     weights = context.weights
     indexer = context.indexer
     T = int(indexer.num_time_bins)
@@ -210,12 +211,16 @@ def score_with_context(
         time_end = time.time(); print(f"assign_delays_flowful(pre) time: {time_end - time_start} seconds")
 
     # Occupancy only for TVs of interest
+    if DEBUG_TIMING:
+        time_start = time.time()
     occ_by_tv = compute_occupancy(
         flight_list if flight_list is not None else type("_Dummy", (), {"flight_metadata": {}})(),
         delays_min,
         indexer,
         tv_filter=context.tvs_of_interest,
     )
+    if DEBUG_TIMING:
+        time_end = time.time(); print(f"compute_occupancy time: {time_end - time_start} seconds for {len(context.tvs_of_interest)} TVs")
 
     # J_cap (vectorized) using cached alpha
     if DEBUG_TIMING:
@@ -455,10 +460,18 @@ def _compute_median_offsets(
     earliest baseline bin at TV v* from the flight's footprints.
     """
     result: Dict[Any, Dict[str, float]] = {}
-    # Build per-flight earliest-bin maps once
+    # Build per-flight earliest-bin maps once, but restrict to flights in the provided flows
     earliest_by_flight: Dict[str, Dict[str, int]] = {}
     tv_filter = list(tv_ids_of_interest)
-    for fid, meta in getattr(flight_list, "flight_metadata", {}).items():
+    allowed_fids: set[str] = set()
+    for flow_id in flights_by_flow.keys():
+        for fid in (fids_by_flow.get(flow_id) or []):
+            allowed_fids.add(str(fid))
+    fm = getattr(flight_list, "flight_metadata", {})
+    for fid in allowed_fids:
+        meta = fm.get(fid)
+        if not meta:
+            continue
         earliest_by_flight[str(fid)] = _earliest_bins_by_tv_for_flight(meta, indexer, tv_filter)
 
     for flow_id in flights_by_flow.keys():
