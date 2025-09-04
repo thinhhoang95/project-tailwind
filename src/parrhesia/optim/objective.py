@@ -898,7 +898,7 @@ def score(
     flight_list: Optional[object] = None,
     weights: Optional[ObjectiveWeights] = None,
     tv_filter: Optional[Iterable[str]] = None,
-    audit_exceedances: bool = False,  # if true, print audit lines for each exceedance cell
+    audit_exceedances: bool = True,  # if true, print audit lines for each exceedance cell
 ) -> Tuple[float, Dict[str, float], Dict[str, Any]]:
     """
     Evaluate the objective J for a given per-flow schedule matrix n_f_t.
