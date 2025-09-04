@@ -1,5 +1,6 @@
 import json
 from typing import Dict, Tuple, Optional, List
+import numpy as np
 from datetime import datetime, timedelta
 
 def create_time_window_mapping(time_bin_minutes: int = 30) -> Dict[int, str]:
@@ -191,3 +192,26 @@ class TVTWIndexer:
         if 60 % self.time_bin_minutes != 0:
             raise ValueError("60 is not divisible by time_bin_minutes; cannot form hour window")
         return 60 // self.time_bin_minutes
+
+    # --- Batch helpers (performance) ------------------------------------------
+    def get_tvtw_from_indices_batch(self, indices) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Vectorized inverse mapping: global indices -> (tv_row_idx, time_window_idx).
+
+        Returns two int32 NumPy arrays of the same shape as `indices`.
+        """
+        idx = np.asarray(indices, dtype=np.int64)
+        T = int(self.num_time_bins)
+        tv_rows = (idx // T).astype(np.int32, copy=False)
+        time_windows = (idx % T).astype(np.int32, copy=False)
+        return tv_rows, time_windows
+
+    def get_tvtw_indices_batch(self, tv_rows, time_windows) -> np.ndarray:
+        """
+        Vectorized forward mapping: (tv_row_idx, time_window_idx) -> global indices.
+        Accepts array-like inputs; returns int32 NumPy array broadcasted over inputs.
+        """
+        tv_rows_arr = np.asarray(tv_rows, dtype=np.int64)
+        tw_arr = np.asarray(time_windows, dtype=np.int64)
+        T = int(self.num_time_bins)
+        return (tv_rows_arr * T + tw_arr).astype(np.int32, copy=False)
