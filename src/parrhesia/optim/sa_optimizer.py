@@ -50,6 +50,14 @@ from ..fcfs.flowful import _normalize_flight_spec, preprocess_flights_for_schedu
 
 logger = logging.getLogger(__name__)
 
+# Prefer accelerated occupancy if available by wiring it into the objective module
+try:
+    from occupance import compute_occupancy as _accelerated_compute_occupancy  # type: ignore
+    from . import objective as _objective_module
+    _objective_module.compute_occupancy = _accelerated_compute_occupancy  # type: ignore[attr-defined]
+except Exception:
+    pass
+
 # ---------------------------- Controlled volumes ----------------------------
 
 

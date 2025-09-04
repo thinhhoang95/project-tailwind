@@ -87,7 +87,12 @@ import numpy as np
 
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from ..fcfs.flowful import assign_delays_flowful, _normalize_flight_spec, preprocess_flights_for_scheduler, assign_delays_flowful_preparsed
-from .occupancy import compute_occupancy
+try:
+    # Prefer accelerated C++ implementation if available
+    from occupance import compute_occupancy as compute_occupancy  # type: ignore
+except Exception:
+    # Fallback to pure Python implementation
+    from .occupancy import compute_occupancy
 from .capacity import rolling_hour_sum
 # --------------------------------- Public API --------------------------------
 # Optional timing logs (set True for debug)
