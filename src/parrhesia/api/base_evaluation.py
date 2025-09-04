@@ -113,6 +113,7 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
     # 1a) Capacities: prefer explicit path; else reuse AppResources cache when available.
     cap_path = payload.get("capacities_path")
     if cap_path:
+        print(f"Warning: Using capacities from {cap_path}")
         capacities_by_tv = build_bin_capacities(str(cap_path), idx)
     else:
         # Try to use shared resources from server_tailwind if available
@@ -138,6 +139,7 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
             # Fallback to project default path
             capacities_by_tv = build_bin_capacities(str(cap_path_default), idx)
 
+    
     # 2) Parse and validate targets / ripples
     targets_in = payload.get("targets") or {}
     if not isinstance(targets_in, Mapping) or not targets_in:
@@ -174,13 +176,18 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 # Unknown flight id; skip
                 pass
 
+    import time 
+    time_start = time.time()
     # 4) Controlled volume selection and requested bins
     hotspot_ids = tvs  # strictly among targets
     flights_by_flow, ctrl_by_flow = prepare_flow_scheduling_inputs(
         flight_list=fl, flow_map=flow_map, hotspot_ids=hotspot_ids
     )
+    time_end = time.time()
+    print(f"prepare_flow_scheduling_inputs time: {time_end - time_start} seconds")
 
     # 5) Baseline n0 and demand
+    time_start = time.time()
     T = int(idx.num_time_bins)
     n0: Dict[int, List[int]] = {}
     demand: Dict[int, List[int]] = {}
@@ -195,11 +202,14 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 arr[rb] += 1
         n0[int(f)] = arr
         demand[int(f)] = arr[:T]
+    time_end = time.time()
+    print(f"n0 and demand time: {time_end - time_start} seconds")
 
     # 5a) Per-TV demand vectors for targets and ripples (length T, no overflow)
     target_tv_ids = list(dict.fromkeys(str(tv) for tv in tvs))  # preserve order from targets
     ripple_tv_ids = sorted({str(tv) for (tv, _b) in ripple_cells})
 
+    time_start = time.time()
     # Precompute earliest crossing bin per flight for union(targets ∪ ripples)
     tv_union: set[str] = set(target_tv_ids) | set(ripple_tv_ids)
     earliest_bin_by_flight: Dict[str, Dict[str, int]] = {}
@@ -226,7 +236,10 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 if cur is None or tb < cur:
                     d[s_tv] = tb
             earliest_bin_by_flight[str(fid)] = d
+    time_end = time.time()
+    print(f"earliest_bin_by_flight time: {time_end - time_start} seconds")
 
+    time_start = time.time()
     # Build per-flow per-TV demand arrays
     target_demands_by_flow: Dict[int, Dict[str, List[int]]] = {}
     ripple_demands_by_flow: Dict[int, Dict[str, List[int]]] = {}
@@ -248,6 +261,8 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
                     r_map[tv][int(b)] += 1
         target_demands_by_flow[int(f)] = t_map
         ripple_demands_by_flow[int(f)] = r_map
+    time_end = time.time()
+    print(f"target_demands_by_flow and ripple_demands_by_flow time: {time_end - time_start} seconds")
 
     # 6) Score baseline
     weights = ObjectiveWeights(**(payload.get("weights") or {}))

@@ -210,28 +210,28 @@ def _compute_demands(
 
     for f, specs in flights_by_flow.items():
         ids, rbins = _extract_requested_bins_for_flow(specs, indexer)
-        arr = np.zeros(T + 1, dtype=np.int64)
-        for b in rbins:
-            bb = int(b)
-            if 0 <= bb <= T:
-                arr[bb] += 1
-            else:
-                # Out-of-range bins are ignored defensively
-                pass
+        # Fast histogram using np.bincount with clipping and explicit overflow bin at T
+        rb = np.asarray(rbins, dtype=np.int64)
+        if rb.size:
+            rb = np.clip(rb, 0, T)
+            arr = np.bincount(rb, minlength=T + 1)
+        else:
+            arr = np.zeros(T + 1, dtype=np.int64)
         d[f] = arr
         fids[f] = ids
-        bins_map[f] = [min(max(int(b), 0), T) for b in rbins]
+        bins_map[f] = rb.tolist() if rb.size else []
     return d, fids, bins_map
 
 
 def _earliest_bins_by_tv_for_flight(
-    flight_meta: Mapping[str, Any], indexer: TVTWIndexer
+    flight_meta: Mapping[str, Any], indexer: TVTWIndexer, tv_filter: Optional[Iterable[str]] = None
 ) -> Dict[str, int]:
     """
     From a flight's occupancy intervals, derive the earliest bin index for
     each TV encountered. Unknown/malformed intervals are ignored.
     """
     earliest: Dict[str, int] = {}
+    whitelist = set(str(x) for x in (tv_filter or []))
     for iv in flight_meta.get("occupancy_intervals", []) or []:
         try:
             tvtw_idx = int(iv.get("tvtw_index"))
@@ -241,6 +241,8 @@ def _earliest_bins_by_tv_for_flight(
         if not decoded:
             continue
         tv_id, tbin = decoded
+        if whitelist and str(tv_id) not in whitelist:
+            continue
         tbin = int(tbin)
         cur = earliest.get(tv_id)
         if cur is None or tbin < cur:
@@ -265,8 +267,9 @@ def _compute_median_offsets(
     result: Dict[Any, Dict[str, float]] = {}
     # Build per-flight earliest-bin maps once
     earliest_by_flight: Dict[str, Dict[str, int]] = {}
+    tv_filter = list(tv_ids_of_interest)
     for fid, meta in getattr(flight_list, "flight_metadata", {}).items():
-        earliest_by_flight[str(fid)] = _earliest_bins_by_tv_for_flight(meta, indexer)
+        earliest_by_flight[str(fid)] = _earliest_bins_by_tv_for_flight(meta, indexer, tv_filter)
 
     for flow_id in flights_by_flow.keys():
         ids = [str(x) for x in (fids_by_flow.get(flow_id) or [])]
@@ -294,35 +297,109 @@ def _build_alpha_weights(
     restrict_to_tvs: Optional[Iterable[str]] = None,
 ) -> Dict[str, np.ndarray]:
     """
-    Build per-TV per-bin alpha weights based on target/ripple cells; others use
-    context weight.
+    Build per-TV per-bin alpha weights based on target/ripple cells using a
+    vectorized layout internally, then convert back to dict-of-arrays.
     """
     T = int(indexer.num_time_bins)
-    alpha: Dict[str, np.ndarray] = {}
-
-    # Normalize cell sets
-    tgt = set((str(tv), int(t)) for (tv, t) in (target_cells or []))
-    rip = set((str(tv), int(t)) for (tv, t) in (ripple_cells or []))
-
-    # Determine TVs to cover
     if restrict_to_tvs is None:
-        tvs: Iterable[str] = indexer.tv_id_to_idx.keys()
+        tv_ids: List[str] = [str(x) for x in indexer.tv_id_to_idx.keys()]
     else:
-        tvs = [str(x) for x in restrict_to_tvs]
+        tv_ids = [str(x) for x in restrict_to_tvs]
 
-    for tv in tvs:
-        arr = np.full(T, float(weights.alpha_ctx), dtype=np.float64)
-        for t in range(T):
-            cell = (str(tv), int(t))
-            if cell in tgt:
-                arr[t] = float(weights.alpha_gt)
-            elif cell in rip:
-                arr[t] = float(weights.alpha_rip)
+    V = len(tv_ids)
+    tv_to_row = {tv: i for i, tv in enumerate(tv_ids)}
+    A = np.full((V, T), float(weights.alpha_ctx), dtype=np.float32)
+
+    if target_cells:
+        for tv, t in target_cells:
+            i = tv_to_row.get(str(tv))
+            tt = int(t)
+            if i is not None and 0 <= tt < T:
+                A[i, tt] = float(weights.alpha_gt)
+    if ripple_cells:
+        for tv, t in ripple_cells:
+            i = tv_to_row.get(str(tv))
+            tt = int(t)
+            if i is not None and 0 <= tt < T and A[i, tt] != float(weights.alpha_gt):
+                A[i, tt] = float(weights.alpha_rip)
+
+    return {tv: A[i].astype(np.float64, copy=True) for tv, i in tv_to_row.items()}
+
+
+def _build_cell_masks_2d(
+    tv_ids: Sequence[str],
+    T: int,
+    target_cells: Optional[Iterable[Cell]],
+    ripple_cells: Optional[Iterable[Cell]],
+    tol_w: int,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, int]]:
+    """
+    Build boolean masks [V, T] for target and ripple cells and dilate them by
+    +/- tol_w along the time axis.
+    """
+    tv_to_row = {str(tv): i for i, tv in enumerate(tv_ids)}
+    V = len(tv_ids)
+    tgt = np.zeros((V, T), dtype=bool)
+    rip = np.zeros((V, T), dtype=bool)
+    if target_cells:
+        for tv, t in target_cells:
+            i = tv_to_row.get(str(tv))
+            tt = int(t)
+            if i is not None and 0 <= tt < T:
+                tgt[i, tt] = True
+    if ripple_cells:
+        for tv, t in ripple_cells:
+            i = tv_to_row.get(str(tv))
+            tt = int(t)
+            if i is not None and 0 <= tt < T:
+                rip[i, tt] = True
+
+    if tol_w > 0:
+        base_tgt = tgt.copy()
+        base_rip = rip.copy()
+        for dt in range(1, int(tol_w) + 1):
+            tgt[:, dt:] |= base_tgt[:, :-dt]
+            tgt[:, :-dt] |= base_tgt[:, dt:]
+            rip[:, dt:] |= base_rip[:, :-dt]
+            rip[:, :-dt] |= base_rip[:, dt:]
+
+    return tgt, rip, tv_to_row
+
+
+def _classify_flow_bins_from_masks(
+    offsets_for_flow: np.ndarray,
+    tgt_mask: np.ndarray,
+    rip_mask: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Classify bins using precomputed dilated cell masks shifted by per-TV median
+    offsets. Precedence: target > ripple > context.
+    """
+    V, T = tgt_mask.shape
+    is_gt = np.zeros(T, dtype=bool)
+    is_rip = np.zeros(T, dtype=bool)
+
+    def or_shift(acc: np.ndarray, row: np.ndarray, delta: int) -> None:
+        if delta >= T or delta <= -T:
+            return
+        if delta >= 0:
+            if delta == 0:
+                acc |= row
             else:
-                # leave as ctx
-                pass
-        alpha[str(tv)] = arr
-    return alpha
+                acc[delta:] |= row[:-delta]
+        else:
+            d = -delta
+            acc[: T - d] |= row[d:]
+
+    for i in range(V):
+        or_shift(is_gt, tgt_mask[i], int(offsets_for_flow[i]))
+
+    tmp = np.zeros(T, dtype=bool)
+    for i in range(V):
+        or_shift(tmp, rip_mask[i], int(offsets_for_flow[i]))
+    is_rip = np.logical_and(tmp, ~is_gt)
+    is_ctx = ~(is_gt | is_rip)
+    return is_gt, is_rip, is_ctx
 
 
 def _classify_flow_bins(
@@ -483,6 +560,57 @@ def _compute_J_spill(n_by_flow: Mapping[Any, np.ndarray], eta: float) -> float:
     return float(eta * spill)
 
 
+def _rolling_hour_sum_2d(O: np.ndarray, K: int) -> np.ndarray:
+    """
+    Forward-looking rolling sum to match capacity.rolling_hour_sum semantics.
+    RH[:, t] = sum_{u=t}^{min(t+K, T)-1} O[:, u]
+    """
+    V, T = O.shape
+    # cumsum with a zero prepended for easy range sums
+    zero = np.zeros((V, 1), dtype=np.int64)
+    cs = np.concatenate([zero, np.cumsum(O, axis=1, dtype=np.int64)], axis=1)  # [V, T+1]
+    idx_end = np.arange(T)
+    idx_end = np.minimum(idx_end + int(K), T)
+    s_end = np.take(cs, idx_end, axis=1)      # [V, T]
+    s_start = cs[:, :T]                       # [V, T]
+    return s_end - s_start
+
+
+def _compute_J_cap_fast(
+    occ_by_tv: Mapping[str, np.ndarray],
+    capacities_by_tv: Mapping[str, np.ndarray],
+    alpha_by_tv: Mapping[str, np.ndarray],
+    K: int,
+) -> float:
+    """
+    Vectorized J_cap across all TVs using 2D arrays and a single rolling sum.
+    """
+    tvs = list(occ_by_tv.keys())
+    if not tvs:
+        return 0.0
+    T = int(next(iter(occ_by_tv.values())).size)
+    V = len(tvs)
+    O = np.zeros((V, T), dtype=np.int32)
+    C = np.zeros((V, T), dtype=np.float32)
+    A = np.zeros((V, T), dtype=np.float32)
+    for i, tv in enumerate(tvs):
+        oi = np.asarray(occ_by_tv[tv])
+        O[i, : min(T, oi.size)] = oi[:T]
+        ci = capacities_by_tv.get(tv)
+        if ci is not None:
+            ci_arr = np.asarray(ci, dtype=np.float32)
+            C[i, : min(T, ci_arr.size)] = ci_arr[:T]
+        ai = alpha_by_tv.get(tv)
+        if ai is not None:
+            ai_arr = np.asarray(ai, dtype=np.float32)
+            A[i, : min(T, ai_arr.size)] = ai_arr[:T]
+    RH = _rolling_hour_sum_2d(O, int(K)).astype(np.float32, copy=False)
+    exceed = RH - C
+    np.maximum(exceed, 0.0, out=exceed)
+    J_cap = float(np.sum(exceed * A, dtype=np.float64))
+    return J_cap
+
+
 def _compute_J_cap(
     occ_by_tv: Mapping[str, np.ndarray],
     capacities_by_tv: Mapping[str, np.ndarray],
@@ -497,6 +625,10 @@ def _compute_J_cap(
     """
     Compute weighted exceedance across TVs with provided alpha weights.
     """
+    # Fast path: no auditing requested -> vectorized
+    if not audit_exceedances:
+        return _compute_J_cap_fast(occ_by_tv, capacities_by_tv, alpha_by_tv, K)
+
     J_cap = 0.0
     # Precompute classification sets for auditing
     tgt_cells = set((str(tv), int(t)) for (tv, t) in (target_cells or []))
@@ -576,7 +708,7 @@ def score(
     flight_list: Optional[object] = None,
     weights: Optional[ObjectiveWeights] = None,
     tv_filter: Optional[Iterable[str]] = None,
-    audit_exceedances: bool = True,  # if true, print audit lines for each exceedance cell
+    audit_exceedances: bool = False,  # if true, print audit lines for each exceedance cell
 ) -> Tuple[float, Dict[str, float], Dict[str, Any]]:
     """
     Evaluate the objective J for a given per-flow schedule matrix n_f_t.
@@ -668,7 +800,11 @@ def score(
     d_by_flow, fids_by_flow, bins_by_flow = _compute_demands(flights_by_flow, indexer)
 
     # SCHEDULE: FIFO per flow -> delays and realised starts
+    import time
+    time_start = time.time()
     delays_min, realised_start = assign_delays_flowful(flights_by_flow, n_by_flow, indexer)
+    time_end = time.time()
+    print(f"assign_delays_flowful time: {time_end - time_start} seconds")
 
     # OCCUPANCY: after delays, only for TVs of interest
     # Determine TVs to compute: from tv_filter, or from union of cell sets, or from capacities
@@ -704,14 +840,29 @@ def score(
         median_offsets = {f: {tv: 0.0 for tv in attn_tv_ids} for f in flights_by_flow.keys()}
 
     beta_gamma_by_flow: Dict[Any, Tuple[np.ndarray, np.ndarray]] = {}
-    for f in flights_by_flow.keys():
-        beta, gamma = _weights_for_flow_bins(
-            f, T, attn_tv_ids, median_offsets, target_cells, ripple_cells, weights
+    if attn_tv_ids:
+        tgt_mask, rip_mask, tv_row_map = _build_cell_masks_2d(
+            attn_tv_ids, T, target_cells, ripple_cells, int(weights.class_tolerance_w)
         )
-        beta_gamma_by_flow[f] = (beta, gamma)
+        for f in flights_by_flow.keys():
+            offs_map = median_offsets.get(f, {})
+            offs = np.array([int(round(float(offs_map.get(tv, 0.0)))) for tv in attn_tv_ids], dtype=np.int32)
+            is_gt, is_rip, _is_ctx = _classify_flow_bins_from_masks(offs, tgt_mask, rip_mask)
+            beta = np.where(is_gt, weights.beta_gt, np.where(is_rip, weights.beta_rip, weights.beta_ctx)).astype(np.float32)
+            gamma = np.where(is_gt, weights.gamma_gt, np.where(is_rip, weights.gamma_rip, weights.gamma_ctx)).astype(np.float32)
+            beta_gamma_by_flow[f] = (beta, gamma)
+    else:
+        # No attention TVs -> all context
+        for f in flights_by_flow.keys():
+            beta_gamma_by_flow[f] = (
+                np.full(T, float(weights.beta_ctx), dtype=np.float32),
+                np.full(T, float(weights.gamma_ctx), dtype=np.float32),
+            )
 
     # J components ------------------------------------------------------------
     # Capacity exceedance
+    import time
+    time_start = time.time()
     J_cap = _compute_J_cap(
         occ_by_tv,
         capacities_by_tv,
@@ -722,7 +873,10 @@ def score(
         target_cells=target_cells,
         ripple_cells=ripple_cells,
     )
+    time_end = time.time()
+    print(f"J_cap time: {time_end - time_start} seconds")
 
+    time_start = time.time()
     # Delay cost
     total_delay_min = sum(int(v) for v in delays_min.values())
     J_delay = float(weights.lambda_delay) * float(total_delay_min)
@@ -731,9 +885,16 @@ def score(
     J_reg, J_tv = _compute_J_reg_and_J_tv(
         n_by_flow, d_by_flow, beta_gamma_by_flow, weights.beta_ctx, weights.gamma_ctx
     )
+    time_end = time.time()
+    print(f"J_reg, J_delay and J_tv time: {time_end - time_start} seconds")
 
     # Fair-share and spill
+    time_start = time.time()
     J_share = _compute_J_share(n_by_flow, d_by_flow, weights.theta_share) if weights.theta_share > 0 else 0.0
+    time_end = time.time()
+    print(f"J_share time: {time_end - time_start} seconds")
+
+    time_start = time.time()
     J_spill = _compute_J_spill(n_by_flow, weights.eta_spill) if weights.eta_spill > 0 else 0.0
 
     J_total = J_cap + J_delay + J_reg + J_tv + J_share + J_spill
