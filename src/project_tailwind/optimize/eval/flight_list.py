@@ -3,11 +3,66 @@ FlightList class for loading and managing occupancy matrix data from SO6 flight 
 """
 
 import json
-from typing import Dict, List, Any, Optional, Sequence
+from typing import Dict, List, Any, Optional, Sequence, Iterable, Tuple, Union
 import numpy as np
 from scipy import sparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from copy import deepcopy
+
+
+def _parse_naive_utc(dt_str: str) -> datetime:
+    """Parse a datetime string into a timezone-naive UTC datetime.
+
+    Handles trailing 'Z' and common ISO formats; falls back to fromisoformat.
+    """
+    s = str(dt_str or "").strip()
+    if s.endswith("Z"):
+        s = s[:-1]
+    s = s.replace("T", " ")
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            dt = datetime.fromisoformat(s)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+class _IndexerProxy:
+    """Lightweight proxy exposing minimal TVTW indexer API used by FlightList.
+
+    Exposes:
+      - tv_id_to_idx: Dict[str, int]
+      - idx_to_tv_id: Dict[int, str]
+      - num_time_bins: int
+      - get_tvtw_from_index(tvtw_index) -> Optional[Tuple[str, int]]
+    """
+
+    def __init__(self, tv_id_to_idx: Dict[str, int], idx_to_tv_id: Dict[int, str], num_time_bins: int):
+        self.tv_id_to_idx = tv_id_to_idx
+        self.idx_to_tv_id = idx_to_tv_id
+        self._num_time_bins = int(num_time_bins)
+
+    @property
+    def num_time_bins(self) -> int:
+        return self._num_time_bins
+
+    def get_tvtw_from_index(self, tvtw_index: int) -> Optional[Tuple[str, int]]:
+        try:
+            tvtw_index = int(tvtw_index)
+        except Exception:
+            return None
+        if tvtw_index < 0:
+            return None
+        tv_index = tvtw_index // self._num_time_bins
+        time_idx = tvtw_index % self._num_time_bins
+        tv_id = self.idx_to_tv_id.get(int(tv_index))
+        if tv_id is None:
+            return None
+        return (tv_id, int(time_idx))
 
 
 class FlightList:
@@ -43,12 +98,164 @@ class FlightList:
         self.num_time_bins_per_tv: int = (24 * 60) // int(self.time_bin_minutes)
         # Reverse mapping from contiguous tv index -> traffic_volume_id
         self.idx_to_tv_id: Dict[int, str] = {idx: tv_id for tv_id, idx in self.tv_id_to_idx.items()}
+        # Lightweight indexer proxy for compatibility helpers
+        self._indexer = _IndexerProxy(self.tv_id_to_idx, self.idx_to_tv_id, self.num_time_bins_per_tv)
         
         # Load flight data
         self._load_flight_data()
         
         # Cache for per-flight TV index sequences (after de-duplicating consecutive repeats)
         self._flight_tv_sequence_cache: Dict[str, np.ndarray] = {}
+
+    # --- Indexer proxies / helpers ---
+    @property
+    def indexer(self):
+        """Return a lightweight proxy exposing TVTW index helpers.
+
+        Provides tv_id_to_idx, idx_to_tv_id, num_time_bins, and get_tvtw_from_index.
+        """
+        return self._indexer
+
+    @property
+    def num_time_bins(self) -> int:
+        """Number of time bins per day derived from time_bin_minutes."""
+        return int(self.num_time_bins_per_tv)
+
+    # --- Alternative loader: streaming JSON (ijson fallback) ---
+    @classmethod
+    def from_json(cls, path: str, indexer: Any) -> "FlightList":
+        """Build a FlightList by streaming a large JSON mapping flight_id -> data.
+
+        Prefer ijson for streaming; falls back to json.load. takeoff_time is parsed
+        to naive UTC. The resulting instance is fully initialized with an occupancy
+        matrix and metadata, similar to the standard constructor.
+        """
+        # Create uninitialized instance
+        self = cls.__new__(cls)
+
+        # Derive indexer mappings
+        tv_id_to_idx: Dict[str, int] = {}
+        idx_to_tv_id: Dict[int, str] = {}
+        num_time_bins = None
+        time_bin_minutes_val = None
+        try:
+            tv_id_to_idx = dict(getattr(indexer, 'tv_id_to_idx'))
+        except Exception:
+            tv_id_to_idx = {}
+        try:
+            idx_to_tv_id = dict(getattr(indexer, 'idx_to_tv_id'))
+        except Exception:
+            if tv_id_to_idx:
+                idx_to_tv_id = {int(v): str(k) for k, v in tv_id_to_idx.items()}
+            else:
+                idx_to_tv_id = {}
+        try:
+            num_time_bins = int(getattr(indexer, 'num_time_bins'))
+        except Exception:
+            num_time_bins = None
+        try:
+            time_bin_minutes_val = int(getattr(indexer, 'time_bin_minutes'))
+        except Exception:
+            time_bin_minutes_val = None
+        if num_time_bins is None:
+            if time_bin_minutes_val is not None and time_bin_minutes_val > 0:
+                num_time_bins = (24 * 60) // int(time_bin_minutes_val)
+            else:
+                num_time_bins = 1
+        if time_bin_minutes_val is None or time_bin_minutes_val <= 0:
+            time_bin_minutes_val = (24 * 60) // int(num_time_bins)
+
+        # Set basic attributes to mirror standard constructor
+        self.occupancy_file_path = path
+        self.tvtw_indexer_path = getattr(indexer, 'source_path', None) or ''
+        self.tvtw_indexer = {
+            'time_bin_minutes': int(time_bin_minutes_val),
+            'tv_id_to_idx': tv_id_to_idx,
+        }
+        self.time_bin_minutes = int(time_bin_minutes_val)
+        self.tv_id_to_idx = tv_id_to_idx
+        self.num_traffic_volumes = len(self.tv_id_to_idx)
+        self.num_time_bins_per_tv = int(num_time_bins)
+        self.idx_to_tv_id = idx_to_tv_id if idx_to_tv_id else {idx: tv for tv, idx in tv_id_to_idx.items()}
+        self._indexer = _IndexerProxy(self.tv_id_to_idx, self.idx_to_tv_id, self.num_time_bins_per_tv)
+
+        # Streaming ingest
+        self.flight_data = {}
+        self.flight_metadata = {}
+        max_tvtw_index = 0
+
+        def _ingest(fid: str, obj: Dict[str, Any]):
+            nonlocal max_tvtw_index
+            fid = str(fid)
+            intervals_in = obj.get('occupancy_intervals', []) or []
+            intervals: List[Dict[str, Any]] = []
+            for it in intervals_in:
+                try:
+                    tvtw_idx = int(it.get('tvtw_index'))
+                except Exception:
+                    continue
+                entry_s = it.get('entry_time_s', 0)
+                exit_s = it.get('exit_time_s', entry_s)
+                try:
+                    entry_s = float(entry_s)
+                except Exception:
+                    entry_s = 0.0
+                try:
+                    exit_s = float(exit_s)
+                except Exception:
+                    exit_s = entry_s
+                intervals.append({
+                    'tvtw_index': tvtw_idx,
+                    'entry_time_s': entry_s,
+                    'exit_time_s': exit_s,
+                })
+                if tvtw_idx > max_tvtw_index:
+                    max_tvtw_index = tvtw_idx
+            # Minimal flight_data used for matrix construction
+            self.flight_data[fid] = {
+                'occupancy_intervals': intervals,
+                'takeoff_time': obj.get('takeoff_time', ''),
+                'origin': obj.get('origin'),
+                'destination': obj.get('destination'),
+                'distance': obj.get('distance'),
+            }
+            # Store normalized metadata
+            self.flight_metadata[fid] = {
+                'takeoff_time': _parse_naive_utc(str(obj.get('takeoff_time', '1970-01-01T00:00:00'))),
+                'origin': obj.get('origin'),
+                'destination': obj.get('destination'),
+                'distance': obj.get('distance'),
+                'occupancy_intervals': intervals,
+            }
+
+        try:
+            import ijson  # type: ignore
+            with open(path, 'rb') as f:
+                for fid, obj in ijson.kvitems(f, ''):
+                    if isinstance(obj, dict):
+                        _ingest(fid, obj)
+        except Exception:
+            with open(path, 'r') as f:
+                data = json.load(f)
+            for fid, obj in data.items():
+                if isinstance(obj, dict):
+                    _ingest(fid, obj)
+
+        # Finalize internal structures
+        self.flight_ids = list(self.flight_data.keys())
+        self.num_flights = len(self.flight_ids)
+        self.flight_id_to_row = {fid: i for i, fid in enumerate(self.flight_ids)}
+        self.num_tvtws = int(max_tvtw_index) + 1
+
+        # Build sparse matrices
+        self._build_occupancy_matrix()
+
+        # Track state flags and buffers
+        self._lil_matrix_dirty = False
+        self._temp_occupancy_buffer = np.zeros(self.num_tvtws, dtype=np.float32)
+        self._flight_tv_sequence_cache = {}
+
+        return self
         
     def _load_flight_data(self):
         """Load flight occupancy data and build sparse matrix."""
@@ -403,22 +610,130 @@ class FlightList:
         return np.unique(seq)
 
     def get_footprints_for_flights(
-        self, flight_ids: Sequence[str], hotspot_tv_index: Optional[int]
+        self,
+        flight_ids: Sequence[str],
+        hotspot_tv_index: Optional[int] = None,
+        *,
+        trim_policy: Union[str, int, None] = None,
+        hotspots: Optional[Sequence[Union[str, int]]] = None,
     ) -> List[np.ndarray]:
-        """
-        Batch helper to compute footprints for multiple flights.
+        """Return per-flight unique TV index arrays, optionally trimmed.
 
-        Args:
-            flight_ids: Sequence of flight identifiers.
-            hotspot_tv_index: Optional TV index for prefix trimming.
+        Compatibility:
+          - When trim_policy is None (default), behavior matches previous
+            signature using hotspot_tv_index for prefix trimming.
 
-        Returns:
-            List of numpy arrays, one per flight, containing unique TV indices.
+        Extended behavior:
+          - trim_policy: "none" or "earliest_hotspot". If an int is provided,
+            it is treated as a single TV index to trim to (legacy support).
+          - hotspots: sequence of TV ids or indices when using
+            trim_policy="earliest_hotspot".
         """
-        footprints: List[np.ndarray] = []
+        # If no explicit trim policy, use legacy behavior
+        if trim_policy is None:
+            footprints: List[np.ndarray] = []
+            for fid in flight_ids:
+                footprints.append(self.get_flight_tv_footprint_indices(fid, hotspot_tv_index))
+            return footprints
+
+        # Normalize trim_policy if provided as int for backward-compat
+        if not isinstance(trim_policy, str) and trim_policy is not None:
+            try:
+                hotspot_tv_index = int(trim_policy)
+                trim_policy = "earliest_hotspot"
+                hotspots = [hotspot_tv_index]
+            except Exception:
+                trim_policy = "none"
+
+        # Normalize hotspot set to TV indices
+        hotspot_tv_indices: Optional[set[int]] = None
+        if hotspots is not None:
+            hotspot_tv_indices = set()
+            for h in hotspots:
+                if isinstance(h, str):
+                    idx = self.tv_id_to_idx.get(h)
+                    if idx is not None:
+                        hotspot_tv_indices.add(int(idx))
+                else:
+                    try:
+                        hotspot_tv_indices.add(int(h))
+                    except Exception:
+                        pass
+            if len(hotspot_tv_indices) == 0:
+                hotspot_tv_indices = None
+
+        out: List[np.ndarray] = []
         for fid in flight_ids:
-            footprints.append(self.get_flight_tv_footprint_indices(fid, hotspot_tv_index))
-        return footprints
+            seq = self.get_flight_tv_sequence_indices(fid)
+            if seq.size == 0:
+                out.append(seq)
+                continue
+            if isinstance(trim_policy, str) and trim_policy.lower() in {"earliest_hotspot", "earliest_hotspot(h)"} and hotspot_tv_indices:
+                hit = None
+                for i, v in enumerate(seq.tolist()):
+                    if int(v) in hotspot_tv_indices:
+                        hit = i
+                        break
+                if hit is not None:
+                    seq = seq[: hit + 1]
+            out.append(np.unique(seq))
+        return out
+
+    def iter_hotspot_crossings(
+        self,
+        hotspot_ids: Sequence[str],
+        active_windows: Optional[Union[Sequence[int], Dict[str, Sequence[int]]]] = None,
+    ) -> Iterable[Tuple[str, str, datetime, int]]:
+        """Iterate over crossings of the provided hotspots within active windows.
+
+        Yields (flight_id, hotspot_id, entry_dt, time_idx), where time_idx is in
+        [0, self.num_time_bins).
+
+        active_windows may be:
+          - None: all windows
+          - Sequence[int]: global set applied to all hotspots
+          - Dict[str, Sequence[int]]: per-hotspot windows
+        """
+        hotspot_set = set(str(h) for h in hotspot_ids)
+        global_windows: Optional[set[int]] = None
+        per_hotspot: Optional[Dict[str, set[int]]] = None
+        if active_windows is None:
+            pass
+        elif isinstance(active_windows, dict):
+            per_hotspot = {str(k): set(int(x) for x in v) for k, v in active_windows.items()}
+        else:
+            global_windows = set(int(x) for x in active_windows)
+
+        for fid, meta in self.flight_metadata.items():
+            takeoff = meta.get('takeoff_time')
+            if not isinstance(takeoff, datetime):
+                continue
+            for iv in meta.get('occupancy_intervals', []) or []:
+                try:
+                    tvtw_idx = int(iv['tvtw_index'])
+                except Exception:
+                    continue
+                decoded = self.indexer.get_tvtw_from_index(tvtw_idx)
+                if not decoded:
+                    continue
+                tv_id, time_idx = decoded
+                if tv_id not in hotspot_set:
+                    continue
+                allowed = True
+                if per_hotspot is not None:
+                    allowed_set = per_hotspot.get(tv_id)
+                    allowed = allowed_set is not None and int(time_idx) in allowed_set
+                elif global_windows is not None:
+                    allowed = int(time_idx) in global_windows
+                if not allowed:
+                    continue
+                entry_s = iv.get('entry_time_s', 0)
+                try:
+                    entry_s = float(entry_s)
+                except Exception:
+                    entry_s = 0.0
+                entry_dt = takeoff + timedelta(seconds=entry_s)
+                yield (fid, tv_id, entry_dt, int(time_idx))
     
     def update_flight(self, flight_id: str, updates: Dict[str, Any]):
         """Update flight data with new values."""
