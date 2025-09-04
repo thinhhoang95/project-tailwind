@@ -81,13 +81,203 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
+from datetime import datetime
 
 import numpy as np
 
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
-from ..fcfs.flowful import assign_delays_flowful, _normalize_flight_spec
+from ..fcfs.flowful import assign_delays_flowful, _normalize_flight_spec, preprocess_flights_for_scheduler, assign_delays_flowful_preparsed
 from .occupancy import compute_occupancy
 from .capacity import rolling_hour_sum
+# --------------------------------- Public API --------------------------------
+# Optional timing logs (set True for debug)
+DEBUG_TIMING = False
+
+
+@dataclass
+class ScoreContext:
+    indexer: TVTWIndexer
+    weights: ObjectiveWeights
+    target_cells: Optional[Iterable[Cell]]
+    ripple_cells: Optional[Iterable[Cell]]
+    tvs_of_interest: Iterable[str]
+    alpha_by_tv: Dict[str, np.ndarray]
+    d_by_flow: Dict[Any, np.ndarray]
+    fids_by_flow: Dict[Any, List[str]]
+    bins_by_flow: Dict[Any, List[int]]
+    flights_sorted_by_flow: Dict[Any, List[Tuple[str, Optional[object], int]]]
+    attn_tv_ids: List[str]
+    beta_gamma_by_flow: Dict[Any, Tuple[np.ndarray, np.ndarray]]
+
+
+def build_score_context(
+    flights_by_flow: Mapping[Any, Sequence[Any]],
+    *,
+    indexer: TVTWIndexer,
+    capacities_by_tv: Mapping[str, np.ndarray],
+    target_cells: Optional[Iterable[Cell]] = None,
+    ripple_cells: Optional[Iterable[Cell]] = None,
+    flight_list: Optional[object] = None,
+    weights: Optional[ObjectiveWeights] = None,
+    tv_filter: Optional[Iterable[str]] = None,
+) -> ScoreContext:
+    weights = weights or ObjectiveWeights()
+    T = int(indexer.num_time_bins)
+
+    # Static: demand and pre-parsed flights
+    d_by_flow, fids_by_flow, bins_by_flow = _compute_demands(flights_by_flow, indexer)
+    flights_sorted_by_flow = preprocess_flights_for_scheduler(flights_by_flow, indexer)
+
+    # TVs of interest
+    if tv_filter is not None:
+        tvs_of_interest = set(str(tv) for tv in tv_filter)
+    else:
+        tvs_of_interest = set(capacities_by_tv.keys())
+        for s in (target_cells or []):
+            tvs_of_interest.add(str(s[0]))
+        for s in (ripple_cells or []):
+            tvs_of_interest.add(str(s[0]))
+        if not tvs_of_interest:
+            tvs_of_interest = set(indexer.tv_id_to_idx.keys())
+
+    # Alpha weights
+    alpha_by_tv = _build_alpha_weights(indexer, target_cells, ripple_cells, weights, restrict_to_tvs=tvs_of_interest)
+
+    # Classification: beta/gamma per flow
+    attn_tv_ids = sorted({str(tv) for (tv, _t) in (target_cells or [])} | {str(tv) for (tv, _t) in (ripple_cells or [])})
+    beta_gamma_by_flow: Dict[Any, Tuple[np.ndarray, np.ndarray]] = {}
+    if attn_tv_ids:
+        if flight_list is not None:
+            median_offsets = _compute_median_offsets(
+                flights_by_flow, fids_by_flow, bins_by_flow, flight_list, indexer, attn_tv_ids
+            )
+        else:
+            median_offsets = {f: {tv: 0.0 for tv in attn_tv_ids} for f in flights_by_flow.keys()}
+
+        tgt_mask, rip_mask, _ = _build_cell_masks_2d(attn_tv_ids, T, target_cells, ripple_cells, int(weights.class_tolerance_w))
+        for f in flights_by_flow.keys():
+            offs_map = median_offsets.get(f, {})
+            offs = np.array([int(round(float(offs_map.get(tv, 0.0)))) for tv in attn_tv_ids], dtype=np.int32)
+            is_gt, is_rip, _ = _classify_flow_bins_from_masks(offs, tgt_mask, rip_mask)
+            beta = np.where(is_gt, weights.beta_gt, np.where(is_rip, weights.beta_rip, weights.beta_ctx)).astype(np.float32)
+            gamma = np.where(is_gt, weights.gamma_gt, np.where(is_rip, weights.gamma_rip, weights.gamma_ctx)).astype(np.float32)
+            beta_gamma_by_flow[f] = (beta, gamma)
+    else:
+        for f in flights_by_flow.keys():
+            beta_gamma_by_flow[f] = (
+                np.full(T, float(weights.beta_ctx), dtype=np.float32),
+                np.full(T, float(weights.gamma_ctx), dtype=np.float32),
+            )
+
+    return ScoreContext(
+        indexer=indexer,
+        weights=weights,
+        target_cells=target_cells,
+        ripple_cells=ripple_cells,
+        tvs_of_interest=list(tvs_of_interest),
+        alpha_by_tv=alpha_by_tv,
+        d_by_flow=d_by_flow,
+        fids_by_flow=fids_by_flow,
+        bins_by_flow=bins_by_flow,
+        flights_sorted_by_flow=flights_sorted_by_flow,
+        attn_tv_ids=attn_tv_ids,
+        beta_gamma_by_flow=beta_gamma_by_flow,
+    )
+
+
+def score_with_context(
+    n_f_t: Mapping[Any, Union[Sequence[int], Mapping[int, int]]],
+    *,
+    flights_by_flow: Mapping[Any, Sequence[Any]],
+    capacities_by_tv: Mapping[str, np.ndarray],
+    flight_list: Optional[object],
+    context: ScoreContext,
+    audit_exceedances: bool = False,
+) -> Tuple[float, Dict[str, float], Dict[str, Any]]:
+    weights = context.weights
+    indexer = context.indexer
+    T = int(indexer.num_time_bins)
+
+    # Normalize n
+    n_by_flow: Dict[Any, np.ndarray] = {f: _to_len_T_plus_1_array(arr, T) for f, arr in n_f_t.items()}
+
+    # Delays using preprocessed sorted flights
+    import time
+    if DEBUG_TIMING:
+        time_start = time.time()
+    delays_min, realised_start = assign_delays_flowful_preparsed(context.flights_sorted_by_flow, n_by_flow, indexer)
+    if DEBUG_TIMING:
+        time_end = time.time(); print(f"assign_delays_flowful(pre) time: {time_end - time_start} seconds")
+
+    # Occupancy only for TVs of interest
+    occ_by_tv = compute_occupancy(
+        flight_list if flight_list is not None else type("_Dummy", (), {"flight_metadata": {}})(),
+        delays_min,
+        indexer,
+        tv_filter=context.tvs_of_interest,
+    )
+
+    # J_cap (vectorized) using cached alpha
+    if DEBUG_TIMING:
+        time_start = time.time()
+    K = int(indexer.rolling_window_size())
+    J_cap = _compute_J_cap(
+        occ_by_tv,
+        capacities_by_tv,
+        context.alpha_by_tv,
+        K,
+        audit_exceedances=audit_exceedances,
+        indexer=indexer,
+        target_cells=context.target_cells,
+        ripple_cells=context.ripple_cells,
+    )
+    if DEBUG_TIMING:
+        time_end = time.time(); print(f"J_cap time: {time_end - time_start} seconds")
+
+    # J_delay, J_reg, J_tv
+    if DEBUG_TIMING:
+        time_start = time.time()
+    total_delay_min = sum(int(v) for v in delays_min.values())
+    J_delay = float(weights.lambda_delay) * float(total_delay_min)
+    J_reg, J_tv = _compute_J_reg_and_J_tv(n_by_flow, context.d_by_flow, context.beta_gamma_by_flow, weights.beta_ctx, weights.gamma_ctx)
+    if DEBUG_TIMING:
+        time_end = time.time(); print(f"J_reg, J_delay and J_tv time: {time_end - time_start} seconds")
+
+    # Optional terms
+    if DEBUG_TIMING:
+        time_start = time.time()
+    J_share = _compute_J_share(n_by_flow, context.d_by_flow, weights.theta_share) if weights.theta_share > 0 else 0.0
+    if DEBUG_TIMING:
+        time_end = time.time(); print(f"J_share time: {time_end - time_start} seconds")
+    J_spill = _compute_J_spill(n_by_flow, weights.eta_spill) if weights.eta_spill > 0 else 0.0
+
+    J_total = J_cap + J_delay + J_reg + J_tv + J_share + J_spill
+
+    components: Dict[str, float] = {
+        "J_cap": float(J_cap),
+        "J_delay": float(J_delay),
+        "J_reg": float(J_reg),
+        "J_tv": float(J_tv),
+    }
+    if weights.theta_share > 0:
+        components["J_share"] = float(J_share)
+    if weights.eta_spill > 0:
+        components["J_spill"] = float(J_spill)
+
+    artifacts: Dict[str, Any] = {
+        "delays_min": delays_min,
+        "realised_start": realised_start,
+        "occupancy": occ_by_tv,
+        "demand": context.d_by_flow,
+        "n": n_by_flow,
+        "beta_gamma": context.beta_gamma_by_flow,
+        "alpha": context.alpha_by_tv,
+    }
+
+    return float(J_total), components, artifacts
+
+
+# --------------------------------- Public API --------------------------------
 
 
 # ------------------------------- Data classes -------------------------------
@@ -801,10 +991,11 @@ def score(
 
     # SCHEDULE: FIFO per flow -> delays and realised starts
     import time
-    time_start = time.time()
+    if DEBUG_TIMING:
+        time_start = time.time()
     delays_min, realised_start = assign_delays_flowful(flights_by_flow, n_by_flow, indexer)
-    time_end = time.time()
-    print(f"assign_delays_flowful time: {time_end - time_start} seconds")
+    if DEBUG_TIMING:
+        time_end = time.time(); print(f"assign_delays_flowful time: {time_end - time_start} seconds")
 
     # OCCUPANCY: after delays, only for TVs of interest
     # Determine TVs to compute: from tv_filter, or from union of cell sets, or from capacities
@@ -862,7 +1053,8 @@ def score(
     # J components ------------------------------------------------------------
     # Capacity exceedance
     import time
-    time_start = time.time()
+    if DEBUG_TIMING:
+        time_start = time.time()
     J_cap = _compute_J_cap(
         occ_by_tv,
         capacities_by_tv,
@@ -873,10 +1065,11 @@ def score(
         target_cells=target_cells,
         ripple_cells=ripple_cells,
     )
-    time_end = time.time()
-    print(f"J_cap time: {time_end - time_start} seconds")
+    if DEBUG_TIMING:
+        time_end = time.time(); print(f"J_cap time: {time_end - time_start} seconds")
 
-    time_start = time.time()
+    if DEBUG_TIMING:
+        time_start = time.time()
     # Delay cost
     total_delay_min = sum(int(v) for v in delays_min.values())
     J_delay = float(weights.lambda_delay) * float(total_delay_min)
@@ -885,14 +1078,15 @@ def score(
     J_reg, J_tv = _compute_J_reg_and_J_tv(
         n_by_flow, d_by_flow, beta_gamma_by_flow, weights.beta_ctx, weights.gamma_ctx
     )
-    time_end = time.time()
-    print(f"J_reg, J_delay and J_tv time: {time_end - time_start} seconds")
+    if DEBUG_TIMING:
+        time_end = time.time(); print(f"J_reg, J_delay and J_tv time: {time_end - time_start} seconds")
 
     # Fair-share and spill
-    time_start = time.time()
+    if DEBUG_TIMING:
+        time_start = time.time()
     J_share = _compute_J_share(n_by_flow, d_by_flow, weights.theta_share) if weights.theta_share > 0 else 0.0
-    time_end = time.time()
-    print(f"J_share time: {time_end - time_start} seconds")
+    if DEBUG_TIMING:
+        time_end = time.time(); print(f"J_share time: {time_end - time_start} seconds")
 
     time_start = time.time()
     J_spill = _compute_J_spill(n_by_flow, weights.eta_spill) if weights.eta_spill > 0 else 0.0
@@ -926,4 +1120,7 @@ def score(
 __all__ = [
     "ObjectiveWeights",
     "score",
+    "ScoreContext",
+    "build_score_context",
+    "score_with_context",
 ]

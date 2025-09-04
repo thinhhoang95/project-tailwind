@@ -235,61 +235,45 @@ def _normalize_flight_spec(
     return str(fid), r_dt, int(r_bin)
 
 
-def assign_delays_flowful(
+def preprocess_flights_for_scheduler(
     flights_by_flow: Mapping[Any, Sequence[Any]],
+    indexer: TVTWIndexer,
+) -> Dict[Any, List[Tuple[str, Optional[datetime], int]]]:
+    """
+    Normalize and sort flights once per flow for scheduling.
+
+    Returns a mapping flow_id -> list of tuples (flight_id, requested_dt | None, requested_bin)
+    sorted by (requested_bin, within-bin seconds, flight_id).
+    """
+    bin_minutes = _bin_len_minutes(indexer)
+    out: Dict[Any, List[Tuple[str, Optional[datetime], int]]] = {}
+
+    def _sort_key(item: Tuple[str, Optional[datetime], int]):
+        fid, r_dt, r_bin = item
+        if isinstance(r_dt, datetime):
+            mod_minutes = (r_dt.hour * 60 + r_dt.minute) % bin_minutes
+            within_bin_s = mod_minutes * 60 + r_dt.second + r_dt.microsecond / 1e6
+        else:
+            within_bin_s = 0.0
+        return (int(r_bin), float(within_bin_s), str(fid))
+
+    for flow_id, specs in flights_by_flow.items():
+        flights_norm: List[Tuple[str, Optional[datetime], int]] = []
+        for sp in specs or []:
+            fid, r_dt, r_bin = _normalize_flight_spec(sp, indexer)
+            flights_norm.append((fid, r_dt, r_bin))
+        flights_norm.sort(key=_sort_key)
+        out[flow_id] = flights_norm
+    return out
+
+
+def assign_delays_flowful_preparsed(
+    flights_sorted_by_flow: Mapping[Any, Sequence[Tuple[str, Optional[datetime], int]]],
     n_f_t: Mapping[Any, Union[Sequence[int], Mapping[int, int]]],
     indexer: TVTWIndexer,
 ) -> Tuple[Dict[str, int], Dict[str, object]]:
     """
-    Assign per‑flight delays and realised start times under per‑flow integer
-    release plans `n_f(t)` with FIFO within each flow.
-
-    Parameters
-    ----------
-    flights_by_flow : Mapping[Any, Sequence[Any]]
-        For each flow identifier, a sequence of flight specs. Each spec must
-        provide at least a flight id and its baseline requested time at the
-        controlled volume (as a datetime or a bin index). See module docstring
-        for accepted formats.
-    n_f_t : Mapping[Any, Sequence[int] | Mapping[int, int]]
-        For each flow identifier, per‑bin release counts of length T+1, where
-        T = indexer.num_time_bins and index T denotes the overflow bin.
-    indexer : TVTWIndexer
-        Provider of time bin parameters (bin length and T).
-
-    Returns
-    -------
-    (delays_min, realised_start)
-        delays_min: Dict[flight_id, int minutes]
-        realised_start: Dict[flight_id, datetime | { 'bin': int }]
-
-    Notes
-    -----
-    - Releases in each bin are capped at the number of ready flights. If
-      `n_f(t)` attempts to release more than are ready, a warning is logged.
-    - Flights not released by the end of bin T‑1 are released in the overflow
-      bin T per `n_f(T)`.
-    - This function does not mutate its inputs.
-
-    Examples
-    --------
-    FIFO with a one‑bin spill for the third flight:
-
-    >>> import datetime as dt
-    >>> idx = TVTWIndexer(time_bin_minutes=30)
-    >>> base = dt.datetime(2025, 1, 1, 9, 0, 0)
-    >>> flights = {
-    ...   "flow": [
-    ...     ("A1", base + dt.timedelta(seconds=0)),
-    ...     ("A2", base + dt.timedelta(seconds=5)),
-    ...     ("A3", base + dt.timedelta(minutes=1)),
-    ...   ]
-    ... }
-    >>> sched = [0] * (idx.num_time_bins + 1)
-    >>> sched[18] = 2; sched[19] = 1
-    >>> dly, rs = assign_delays_flowful(flights, {"flow": sched}, idx)
-    >>> dly["A1"], dly["A2"], dly["A3"], (rs["A3"].hour, rs["A3"].minute)
-    (0, 0, 29, (9, 30))
+    Variant of assign_delays_flowful that assumes flights are pre-normalized and sorted.
     """
     T = int(indexer.num_time_bins)
     bin_minutes = _bin_len_minutes(indexer)
@@ -299,14 +283,9 @@ def assign_delays_flowful(
     delays_min: Dict[str, int] = {}
     realised_start: Dict[str, object] = {}
 
-    for flow_id, specs in flights_by_flow.items():
+    for flow_id, flights_norm_in in flights_sorted_by_flow.items():
         schedule = _to_len_T_plus_1_array(n_f_t.get(flow_id, []), T)
-
-        # Normalize all flight specs
-        flights_norm: List[Tuple[str, Optional[datetime], int]] = []
-        for sp in specs or []:
-            fid, r_dt, r_bin = _normalize_flight_spec(sp, indexer)
-            flights_norm.append((fid, r_dt, r_bin))
+        flights_norm: List[Tuple[str, Optional[datetime], int]] = list(flights_norm_in)
 
         # Sanity: completeness (soft check)
         demanded = len(flights_norm)
@@ -316,20 +295,6 @@ def assign_delays_flowful(
                 "Flow %s: schedule sum (%d) != number of flights (%d)",
                 str(flow_id), scheduled_total, demanded,
             )
-
-        # Order flights by (requested_bin, requested_dt within the bin, flight_id)
-        def _sort_key(item: Tuple[str, Optional[datetime], int]):
-            fid, r_dt, r_bin = item
-            # Use offset within bin to stabilise order; missing dt -> 0
-            if isinstance(r_dt, datetime):
-                # Compute within‑bin seconds for finer FIFO within the same bin
-                mod_minutes = (r_dt.hour * 60 + r_dt.minute) % bin_minutes
-                within_bin_s = mod_minutes * 60 + r_dt.second + r_dt.microsecond / 1e6
-            else:
-                within_bin_s = 0.0
-            return (int(r_bin), float(within_bin_s), str(fid))
-
-        flights_norm.sort(key=_sort_key)
 
         # Two‑phase queueing: push flights into 'ready' as bins advance
         ready = deque()  # type: deque[Tuple[str, Optional[datetime], int]]
@@ -404,7 +369,6 @@ def assign_delays_flowful(
                 delays_min[fid] = int(delay_minutes)
 
         # Sanity: ensure we produced outputs for all flights in this flow
-        # (best‑effort; if schedule infeasible, some flights might be absent)
         produced = sum(1 for fid, _, _ in flights_norm if fid in delays_min)
         if produced != len(flights_norm):
             logging.warning(
@@ -415,4 +379,70 @@ def assign_delays_flowful(
     return delays_min, realised_start
 
 
-__all__ = ["assign_delays_flowful"]
+def assign_delays_flowful(
+    flights_by_flow: Mapping[Any, Sequence[Any]],
+    n_f_t: Mapping[Any, Union[Sequence[int], Mapping[int, int]]],
+    indexer: TVTWIndexer,
+) -> Tuple[Dict[str, int], Dict[str, object]]:
+    """
+    Assign per‑flight delays and realised start times under per‑flow integer
+    release plans `n_f(t)` with FIFO within each flow.
+
+    Parameters
+    ----------
+    flights_by_flow : Mapping[Any, Sequence[Any]]
+        For each flow identifier, a sequence of flight specs. Each spec must
+        provide at least a flight id and its baseline requested time at the
+        controlled volume (as a datetime or a bin index). See module docstring
+        for accepted formats.
+    n_f_t : Mapping[Any, Sequence[int] | Mapping[int, int]]
+        For each flow identifier, per‑bin release counts of length T+1, where
+        T = indexer.num_time_bins and index T denotes the overflow bin.
+    indexer : TVTWIndexer
+        Provider of time bin parameters (bin length and T).
+
+    Returns
+    -------
+    (delays_min, realised_start)
+        delays_min: Dict[flight_id, int minutes]
+        realised_start: Dict[flight_id, datetime | { 'bin': int }]
+
+    Notes
+    -----
+    - Releases in each bin are capped at the number of ready flights. If
+      `n_f(t)` attempts to release more than are ready, a warning is logged.
+    - Flights not released by the end of bin T‑1 are released in the overflow
+      bin T per `n_f(T)`.
+    - This function does not mutate its inputs.
+
+    Examples
+    --------
+    FIFO with a one‑bin spill for the third flight:
+
+    >>> import datetime as dt
+    >>> idx = TVTWIndexer(time_bin_minutes=30)
+    >>> base = dt.datetime(2025, 1, 1, 9, 0, 0)
+    >>> flights = {
+    ...   "flow": [
+    ...     ("A1", base + dt.timedelta(seconds=0)),
+    ...     ("A2", base + dt.timedelta(seconds=5)),
+    ...     ("A3", base + dt.timedelta(minutes=1)),
+    ...   ]
+    ... }
+    >>> sched = [0] * (idx.num_time_bins + 1)
+    >>> sched[18] = 2; sched[19] = 1
+    >>> dly, rs = assign_delays_flowful(flights, {"flow": sched}, idx)
+    >>> dly["A1"], dly["A2"], dly["A3"], (rs["A3"].hour, rs["A3"].minute)
+    (0, 0, 29, (9, 30))
+    """
+    T = int(indexer.num_time_bins)
+    bin_minutes = _bin_len_minutes(indexer)
+    if bin_minutes <= 0:
+        raise ValueError("TVTWIndexer.time_bin_minutes must be positive")
+
+    # Normalize and sort once, then delegate to fast path
+    flights_sorted = preprocess_flights_for_scheduler(flights_by_flow, indexer)
+    return assign_delays_flowful_preparsed(flights_sorted, n_f_t, indexer)
+
+
+__all__ = ["assign_delays_flowful", "assign_delays_flowful_preparsed", "preprocess_flights_for_scheduler", "_normalize_flight_spec"]
