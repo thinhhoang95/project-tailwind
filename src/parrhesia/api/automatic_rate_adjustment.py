@@ -18,8 +18,9 @@ Request JSON (keys optional unless noted):
   - sa_params (optional): partial overrides for SAParams
 
 Returns JSON with baseline vs optimized objectives, per-flow baseline n0 and
-optimized n_opt arrays, baseline per-TV demand vectors, and post-optimization
-per-TV occupancy arrays.
+optimized n_opt arrays, baseline per-TV demand vectors, post-optimization
+per-TV occupancy arrays, and per-flight delays in minutes under the optimized
+schedule.
 """
 
 from dataclasses import asdict
@@ -313,12 +314,15 @@ def compute_automatic_rate_adjustment(payload: Mapping[str, Any]) -> Dict[str, A
 
     improvement_abs = float(J0 - J_star)
     improvement_pct = (improvement_abs / J0 * 100.0) if J0 != 0 else 0.0
+    # Per-flight delays (minutes) under the optimized schedule
+    delays_out: Dict[str, int] = {str(fid): int(v) for fid, v in (delays or {}).items()}
     return {
         "num_time_bins": T,
         "tvs": list(hotspot_ids),
         "target_cells": [(str(tv), int(b)) for (tv, b) in target_cells],
         "ripple_cells": [(str(tv), int(b)) for (tv, b) in ripple_cells],
         "flows": flows_out,
+        "delays_min": delays_out,
         "objective_baseline": {"score": float(J0), "components": comps0},
         "objective_optimized": {"score": float(J_star), "components": comps_star},
         "improvement": {"absolute": improvement_abs, "percent": round(improvement_pct, 2)},

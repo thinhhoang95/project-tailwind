@@ -62,6 +62,7 @@ Top‑level fields:
 - `target_cells` (Array<[string, int]>): Explicit (tv, bin) pairs from `targets`.
 - `ripple_cells` (Array<[string, int]>): Explicit (tv, bin) pairs from `ripples` or auto‑ripple.
 - `flows` (FlowOpt[]): List of per‑flow results (see below).
+- `delays_min` (object): Mapping `flight_id -> delay_minutes` under the optimized schedule. Entries are integers (0 for on‑time, >0 if delayed).
 - `objective_baseline` (object): `{ "score": number, "components": {...} }` at baseline `n0`.
 - `objective_optimized` (object): `{ "score": number, "components": {...} }` at optimized `n_opt`.
 - `improvement` (object): `{ "absolute": number, "percent": number }` where `absolute = baseline - optimized`.
@@ -120,6 +121,7 @@ Example truncated response:
       "ripple_occupancy_opt": {"TV_B": [0,1,0,0,0, ...]}
     }
   ],
+  "delays_min": {"FL1": 0, "FL2": 5, "FL3": 0},
   "objective_baseline": {"score": 9521.1, "components": {"J_cap": 9000.5, "J_delay": 480.0, "J_reg": 32.6, "J_tv": 8.0}},
   "objective_optimized": {"score": 9215.4, "components": {"J_cap": 8705.9, "J_delay": 440.0, "J_reg": 61.5, "J_tv": 8.0}},
   "improvement": {"absolute": 305.7, "percent": 3.21},
@@ -149,6 +151,7 @@ Example truncated response:
 - Reading results:
   - `n0` vs `n_opt`: both length `T+1`. Compare distributions and overflow at index `T`.
   - `target_occupancy_opt` shows realized counts post‑optimization—compare to capacity externally if needed.
+  - `delays_min` gives per‑flight delay minutes under the optimized schedule. Filter values > 0 to list delayed flights.
   - `objective_optimized.score` should be ≤ `objective_baseline.score`; if not, increase `iterations` or adjust weights.
 
 ---
@@ -197,4 +200,3 @@ async def run():
 - Controlled volume and requested bins are produced by `prepare_flow_scheduling_inputs` restricted to target TVs.
 - Optimizer: `run_sa` evaluates candidates using `score_with_context`; attention masks are derived from beta/gamma classifications keyed on target/ripple cells.
 - Post‑optimization occupancy is computed on a reduced subset (per flow) for `target_occupancy_opt` and `ripple_occupancy_opt`.
-
