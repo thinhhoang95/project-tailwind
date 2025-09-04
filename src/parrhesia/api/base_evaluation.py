@@ -130,6 +130,7 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
                     arr = mat[int(row_idx), :]
                     # Replace missing capacity markers (-1) with zeros
                     capacities_by_tv[str(tv_id)] = (arr * (arr >= 0.0)).astype(int)
+                    capacities_by_tv[str(tv_id)][capacities_by_tv[str(tv_id)] == 0] = 9999
         except Exception:
             capacities_by_tv = None
 
