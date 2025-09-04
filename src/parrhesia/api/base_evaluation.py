@@ -11,6 +11,9 @@ Input payload schema (keys are optional unless noted):
   - flows (required): mapping of flow-id -> list of flight IDs
   - targets (required): mapping of TV id -> {"from": "HH:MM:SS", "to": "HH:MM:SS"}
   - ripples (optional): mapping like targets; used for reduced weights
+  - auto_ripple_time_bins (optional): non-negative int; when > 0, override
+    'ripples' by auto-deriving ripple cells from the union of all flight
+    footprints across TVs, dilated by ±window bins
   - indexer_path (optional): path to tvtw_indexer.json
   - flights_path (optional): path to so6_occupancy_matrix_with_times.json
   - capacities_path (optional): path to capacities GeoJSON
@@ -71,6 +74,80 @@ def _cells_from_ranges(
             cells.append((tv_id, int(b)))
         tvs.append(tv_id)
     return cells, tvs
+
+
+def _auto_ripple_cells_from_flows(
+    idx: TVTWIndexer,
+    fl: FlightList,
+    flight_ids: Iterable[str],
+    window: int,
+) -> List[Tuple[str, int]]:
+    """
+    Build ripple cells as the union of TVTW footprints for the provided flights,
+    optionally dilated by ±window bins along time for robustness.
+
+    Args:
+        idx: TVTW indexer providing bin/time mappings
+        fl: Flight list with metadata including occupancy intervals
+        flight_ids: Iterable of flight IDs to consider (typically all flights in all flows)
+        window: Non-negative integer time-bin dilation to apply on each footprint bin
+
+    Returns:
+        List of (tv_id, bin) pairs suitable for use as ripple_cells.
+    """
+    try:
+        w = int(window)
+    except Exception:
+        w = 0
+    if w < 0:
+        w = 0
+
+    T = int(idx.num_time_bins)
+    bins_by_tv: Dict[str, set] = {}
+
+    # 1) Collect base bins per TV across all provided flights
+    for fid in flight_ids:
+        meta = fl.flight_metadata.get(str(fid))
+        if not meta:
+            continue
+        for iv in (meta.get("occupancy_intervals") or []):
+            try:
+                tvtw_idx = int(iv.get("tvtw_index"))
+            except Exception:
+                continue
+            decoded = idx.get_tvtw_from_index(tvtw_idx)
+            if not decoded:
+                continue
+            tv_id, tbin = decoded
+            s_tv = str(tv_id)
+            if s_tv not in bins_by_tv:
+                bins_by_tv[s_tv] = set()
+            try:
+                tb = int(tbin)
+            except Exception:
+                continue
+            if 0 <= tb < T:
+                bins_by_tv[s_tv].add(tb)
+
+    # 2) Dilate by ±w bins along time for each TV
+    if w > 0:
+        for tv in list(bins_by_tv.keys()):
+            base_bins = bins_by_tv[tv]
+            expanded = set()
+            for b in base_bins:
+                start = 0 if (b - w) < 0 else (b - w)
+                end = (T - 1) if (b + w) > (T - 1) else (b + w)
+                # inclusive range
+                for t in range(start, end + 1):
+                    expanded.add(t)
+            bins_by_tv[tv] = expanded
+
+    # 3) Flatten to explicit cells sorted by tv then bin for determinism
+    cells: List[Tuple[str, int]] = []
+    for tv in sorted(bins_by_tv.keys()):
+        for b in sorted(bins_by_tv[tv]):
+            cells.append((tv, int(b)))
+    return cells
 
 
 def _default_paths_from_root() -> Tuple[Path, Path, Path]:
@@ -205,7 +282,15 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
     time_end = time.time()
     print(f"n0 and demand time: {time_end - time_start} seconds")
 
-    # 5a) Per-TV demand vectors for targets and ripples (length T, no overflow)
+    # 5a) Optionally override ripple cells using union-of-footprints with ±w dilation
+    try:
+        _auto_w = int(payload.get("auto_ripple_time_bins", 0))
+    except Exception:
+        _auto_w = 0
+    if _auto_w > 0:
+        ripple_cells = _auto_ripple_cells_from_flows(idx, fl, flow_map.keys(), _auto_w)
+
+    # 5b) Per-TV demand vectors for targets and ripples (length T, no overflow)
     target_tv_ids = list(dict.fromkeys(str(tv) for tv in tvs))  # preserve order from targets
     ripple_tv_ids = sorted({str(tv) for (tv, _b) in ripple_cells})
 

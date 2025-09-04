@@ -79,6 +79,7 @@ Additionally, for each flow it returns per-TV demand vectors for both target and
 - **flows** (required, object): Mapping of flow-id -> list of flight IDs. Flow IDs may be strings or numeric; they are coerced to integers deterministically.
 - **targets** (required, object): Mapping `TV_ID -> {"from": "HH:MM[:SS]", "to": "HH:MM[:SS]"}`. Defines attention cells for target TVs.
 - **ripples** (optional, object): Same schema as `targets`. Defines secondary attention cells.
+- **auto_ripple_time_bins** (optional, integer, default 0): If greater than 0, ripple cells are computed automatically as the union of TVTW footprints of all flights in all flows, dilated by ±`auto_ripple_time_bins` along time. When provided and > 0, this overrides `ripples`.
 - **indexer_path** (optional, string): Override path to `tvtw_indexer.json`. Default: `data/tailwind/tvtw_indexer.json`.
 - **flights_path** (optional, string): Override path to `so6_occupancy_matrix_with_times.json`. Default: `data/tailwind/so6_occupancy_matrix_with_times.json`.
 - **capacities_path** (optional, string): Override path to capacities GeoJSON. Default: `data/cirrus/wxm_sm_ih_maxpool.geojson`.
@@ -119,7 +120,7 @@ curl -X POST http://localhost:8000/base_evaluation \
   -d '{
     "flows": {"0": ["FLIGHT_1", "FLIGHT_2"], "1": ["FLIGHT_3"]},
     "targets": {"TV_A": {"from": "08:00", "to": "09:00"}},
-    "ripples": {"TV_B": {"from": "09:00", "to": "09:30"}},
+    "auto_ripple_time_bins": 2,
     "weights": {"alpha_gt": 10.0, "lambda_delay": 0.1}
   }'
 ```
@@ -130,7 +131,7 @@ Response (truncated):
   "num_time_bins": 48,
   "tvs": ["TV_A"],
   "target_cells": [["TV_A", 16], ["TV_A", 17]],
-  "ripple_cells": [["TV_B", 18]],
+  "ripple_cells": [["TV_X", 10], ["TV_X", 11], ["TV_Y", 22], ...],
   "flows": [
     {
       "flow_id": 0,
