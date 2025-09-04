@@ -35,6 +35,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+import os
+import logging
 import math
 import random
 
@@ -46,6 +48,7 @@ from project_tailwind.optimize.eval.flight_list import FlightList
 from .objective import score, ObjectiveWeights, build_score_context, score_with_context
 from ..fcfs.flowful import _normalize_flight_spec, preprocess_flights_for_scheduler
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------- Controlled volumes ----------------------------
 
@@ -240,6 +243,7 @@ class SAParams:
     max_shift: int = 4  # maximum Δ for shift-later
     pull_max: int = 2   # maximum Δ for pull-forward
     smooth_window_max: int = 3  # maximum window length for smoothing
+    verbose: bool = True  # if True (or env SA_VERBOSE truthy), print SA progress
 
 
 def _to_T_plus_1(arr: Iterable[int], T: int) -> np.ndarray:
@@ -421,9 +425,20 @@ def run_sa(
     Returns (n_best_by_flow, J_best, components, artifacts_of_best)
     where `n_best_by_flow` is a mapping to numpy int64 arrays of shape (T+1,).
     """
+    import time
+    
     params = params or SAParams()
     weights = weights or ObjectiveWeights()
     rng = random.Random(params.seed)
+
+    # Verbose flag: SAParams.verbose OR environment variable SA_VERBOSE in {1,true,yes,on}
+    env_v = os.getenv("SA_VERBOSE", "").strip().lower()
+    env_verbose = env_v in {"1", "true", "yes", "on", "y"}
+    is_verbose = bool(getattr(params, "verbose", False)) or env_verbose
+
+    if is_verbose:
+        start_time = time.time()
+        print(f"[SA] Starting SA optimization...")
 
     # Compute demands directly from flights_by_flow -> d_f(t)
     def _compute_demands_from_flights(
@@ -441,10 +456,17 @@ def run_sa(
             out[f] = arr
         return out
 
+    if is_verbose:
+        demand_start = time.time()
     d_by_flow = _compute_demands_from_flights(flights_by_flow, indexer)
     n_by_flow: Dict[Any, np.ndarray] = _build_initial_schedule_from_demands(d_by_flow)
+    if is_verbose:
+        demand_end = time.time()
+        print(f"[SA] Demand computation time: {demand_end - demand_start:.3f}s")
 
     # Build scoring context and evaluate baseline with n=d via fast path
+    if is_verbose:
+        context_start = time.time()
     context = build_score_context(
         flights_by_flow,
         indexer=indexer,
@@ -455,6 +477,12 @@ def run_sa(
         weights=weights,
         tv_filter=tv_filter,
     )
+    if is_verbose:
+        context_end = time.time()
+        print(f"[SA] Context building time: {context_end - context_start:.3f}s")
+
+    if is_verbose:
+        baseline_start = time.time()
     J_best, comps_best, arts_best = score_with_context(
         n_by_flow,
         flights_by_flow=flights_by_flow,
@@ -463,18 +491,52 @@ def run_sa(
         context=context,
     )
     n_best = {f: np.array(v, dtype=np.int64, copy=True) for f, v in n_by_flow.items()}
+    if is_verbose:
+        baseline_end = time.time()
+        print(f"[SA] Baseline scoring time: {baseline_end - baseline_start:.3f}s")
+        print(f"[SA] Baseline objective J0 = {J_best:.6f}")
 
     # Attention masks from artifacts
+    if is_verbose:
+        mask_start = time.time()
     attn_masks = _attention_masks_from_artifacts(arts_best.get("beta_gamma", {}), weights)
+    if is_verbose:
+        mask_end = time.time()
+        print(f"[SA] Attention mask time: {mask_end - mask_start:.3f}s")
 
     # Warm-up to estimate temperature scale
     deltas: List[float] = []
-    for _ in range(int(params.warmup_moves)):
+    successful_moves = 0
+    failed_moves = 0
+    
+    if is_verbose:
+        warmup_start = time.time()
+        print(f"[SA] Starting warmup with {int(params.warmup_moves)} moves...")
+    
+    for warmup_iter in range(int(params.warmup_moves)):
         # Copy schedule for a trial move
+        copy_start = time.time()
         trial = {f: np.array(v, dtype=np.int64, copy=True) for f, v in n_by_flow.items()}
+        copy_end = time.time()
+
+        if is_verbose:
+            print(f"[SA] Copy time: {copy_end - copy_start:.6f}s")
+        
+        propose_start = time.time()
         mv = _propose_move(rng, trial, d_by_flow, attn_masks, params)
+        propose_end = time.time()
+
+        if is_verbose:
+            print(f"[SA] Propose time: {propose_end - propose_start:.6f}s")
+        
         if mv is None:
+            failed_moves += 1
+            if is_verbose and warmup_iter % 10 == 0:
+                print(f"[SA] Warmup {warmup_iter+1}/{int(params.warmup_moves)}: failed to propose move")
+                print(f"[SA] Copy time: {copy_end - copy_start:.6f}s, Propose time: {propose_end - propose_start:.6f}s")
             continue
+        
+        score_start = time.time()
         J_trial, _c, _a = score_with_context(
             trial,
             flights_by_flow=flights_by_flow,
@@ -482,11 +544,37 @@ def run_sa(
             flight_list=flight_list,
             context=context,
         )
-        deltas.append(float(J_trial - J_best))
+        score_end = time.time()
+        
+        if is_verbose:
+            print(f"[SA] Score time: {score_end - score_start:.6f}s")
+        
+        delta = float(J_trial - J_best)
+        deltas.append(delta)
+        successful_moves += 1
+        
+        if is_verbose and warmup_iter % 10 == 0:
+            print(f"[SA] Warmup timing - Copy: {copy_end - copy_start:.6f}s, Propose: {propose_end - propose_start:.6f}s, Score: {score_end - score_start:.6f}s")
+        
+        if is_verbose and warmup_iter % 10 == 0:
+            print(f"[SA] Warmup {warmup_iter+1}/{int(params.warmup_moves)}: J_trial={J_trial:.6f}, delta={delta:.6f}")
+    
     sigma = float(np.std(np.asarray(deltas, dtype=np.float64))) if deltas else 1.0
     Tcur = 2.0 * sigma if sigma > 0 else 1.0
+    
+    if is_verbose:
+        warmup_end = time.time()
+        print(f"[SA] Warmup time: {warmup_end - warmup_start:.3f}s")
+        print(f"[SA] Warmup complete: {successful_moves} successful moves, {failed_moves} failed moves")
+        if deltas:
+            print(f"[SA] Delta statistics: min={min(deltas):.6f}, max={max(deltas):.6f}, mean={np.mean(deltas):.6f}")
+        print(f"[SA] Warmup: sigma={sigma:.6f}, T0={Tcur:.6f}, warmup_moves={int(params.warmup_moves)}")
 
     # Main SA loop
+    if is_verbose:
+        main_loop_start = time.time()
+        print(f"[SA] Starting main SA loop with {int(params.iterations)} iterations...")
+    
     for it in range(int(params.iterations)):
         candidate = {f: np.array(v, dtype=np.int64, copy=True) for f, v in n_by_flow.items()}
         mv = _propose_move(rng, candidate, d_by_flow, attn_masks, params)
@@ -504,10 +592,21 @@ def run_sa(
         if accept:
             n_by_flow = candidate
             if J_new <= J_best:
+                if is_verbose:
+                    print(f"[SA] it={it+1} improved best -> {J_new:.6f}")
                 J_best, comps_best, arts_best = J_new, comps_new, arts_new
                 n_best = {f: np.array(v, dtype=np.int64, copy=True) for f, v in n_by_flow.items()}
         if (it + 1) % int(params.L) == 0:
             Tcur *= float(params.alpha_T)
+            if is_verbose:
+                print(f"[SA] it={it+1} cooled: T={Tcur:.6f}, best={J_best:.6f}")
+
+    if is_verbose:
+        main_loop_end = time.time()
+        total_end = time.time()
+        print(f"[SA] Main loop time: {main_loop_end - main_loop_start:.3f}s")
+        print(f"[SA] Total SA time: {total_end - start_time:.3f}s")
+        print(f"[SA] Final best objective: {J_best:.6f}")
 
     return n_best, float(J_best), comps_best, arts_best
 

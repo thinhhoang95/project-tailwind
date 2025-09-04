@@ -156,3 +156,64 @@ Response (truncated):
 - Time windows map to bins via half-open intervals `[from, to)`. If `to <= from`, the window is ignored.
 - Capacities are loaded per TV from the GeoJSON and used in `J_cap` via rolling-hour exceedance.
 - `n0` includes an overflow bin at index `T` by design; `demand` excludes overflow.
+
+### POST `/automatic_rate_adjustment` (Simulated Annealing)
+
+Optimize per-flow release rates at the controlled volume using Simulated Annealing (SA). Reuses the baseline preparation from `/base_evaluation`, then runs SA to produce an improved schedule. Returns optimized `n_opt` per flow and realized occupancy per target/ripple TV.
+
+#### JSON body
+- **flows** (required, object): `flow_id -> [flight_id, ...]`. Flow IDs are coerced to deterministic integers.
+- **targets** (required, object): `TV_ID -> {"from": "HH:MM[:SS]", "to": "HH:MM[:SS]"}`. Controlled volumes restricted to these TVs.
+- **ripples** (optional, object): same schema as `targets` (secondary attention region).
+- **auto_ripple_time_bins** (optional, int, default 0): if > 0, overrides `ripples` using the union of footprints of all flights in `flows`, dilated by ±`auto_ripple_time_bins` bins.
+- **indexer_path**, **flights_path**, **capacities_path** (optional, string): artifact overrides; defaults mirror `/base_evaluation`.
+- **weights** (optional, object): partial `ObjectiveWeights` overrides.
+- **sa_params** (optional, object): partial `SAParams` overrides: `iterations`, `warmup_moves`, `alpha_T`, `L`, `seed`, `attention_bias`, `max_shift`, `pull_max`, `smooth_window_max`.
+
+Validation (HTTP 400):
+- `flows` missing/not object; `targets` missing/empty; malformed time ranges; non-integer `auto_ripple_time_bins`.
+
+Graceful ignoring:
+- Unknown TVs in `targets`/`ripples` are dropped; unknown flight IDs in `flows` are ignored.
+
+#### 200 OK response
+Top-level:
+- **num_time_bins** (int)
+- **tvs** (string[]): TVs from `targets`
+- **target_cells** (Array<[string, int]>)
+- **ripple_cells** (Array<[string, int]>)
+- **flows** (FlowOpt[]): per-flow results
+- **objective_baseline**: `{"score": number, "components": {...}}`
+- **objective_optimized**: `{"score": number, "components": {...}}`
+- **improvement**: `{"absolute": number, "percent": number}`
+- **weights_used** (object)
+- **sa_params_used** (object)
+
+FlowOpt:
+- **flow_id** (int)
+- **controlled_volume** (string|null)
+- **n0** (int[]): baseline schedule, length `T+1`
+- **demand** (int[]): baseline demand, length `T`
+- **n_opt** (int[]): optimized schedule, length `T+1`
+- **target_demands** (object): baseline earliest-crossing demand per target TV (same as `/base_evaluation`)
+- **ripple_demands** (object): baseline earliest-crossing demand per ripple TV
+- **target_occupancy_opt** (object): post-optimization realized occupancy per target TV (length `T`)
+- **ripple_occupancy_opt** (object): post-optimization realized occupancy per ripple TV (length `T`)
+
+#### Example
+```bash
+curl -X POST http://localhost:8000/automatic_rate_adjustment \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "flows": {"0": ["FL1","FL2"], "1": ["FL3"]},
+    "targets": {"TV_A": {"from": "08:00", "to": "09:00"}},
+    "auto_ripple_time_bins": 2,
+    "weights": {"alpha_gt": 10.0, "lambda_delay": 0.1},
+    "sa_params": {"iterations": 300, "seed": 0, "attention_bias": 0.8}
+  }'
+```
+
+#### Notes
+- Arrays are JSON-serializable (numpy arrays are converted to lists).
+- “Demands” mirror `/base_evaluation` (earliest crossings), while “occupancy_opt” reflects realized occupancy after delays with the optimized schedule.
+- Determinism controlled via `sa_params.seed`.
