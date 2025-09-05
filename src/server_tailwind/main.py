@@ -400,6 +400,7 @@ def post_autorate_occupancy(payload: dict):
     Request JSON:
       - autorate_result: object (required)
       - include_capacity: bool (optional; default true)
+      - rolling_hour: bool (optional; default true)
     """
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="JSON body required")
@@ -407,8 +408,9 @@ def post_autorate_occupancy(payload: dict):
         raise HTTPException(status_code=400, detail="'autorate_result' is required")
     try:
         include_capacity = bool(payload.get("include_capacity", True))
+        rolling_hour = bool(payload.get("rolling_hour", True))
         return count_wrapper.compute_autorate_occupancy(
-            payload.get("autorate_result") or {}, include_capacity=include_capacity
+            payload.get("autorate_result") or {}, include_capacity=include_capacity, rolling_hour=rolling_hour
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
