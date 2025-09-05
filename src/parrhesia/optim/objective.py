@@ -967,15 +967,16 @@ def _compute_J_cap(
                 contrib_val = float(contrib[t])
                 human_time = time_map.get(int(t)) if isinstance(time_map, dict) else None
                 time_str = human_time if human_time is not None else f"bin {t}"
-                print(
-                    f"   • TV '{tv_id}', {time_str}: class={cls.upper()}, weight α={weight:.6g}; "
-                    f"rolling occupancy={rh_val:.6g}, capacity={cap_val:.6g}, exceedance={exc:.6g} -> contribution={contrib_val:.6g}"
-                )
+                # print(
+                #     f"   • TV '{tv_id}', {time_str}: class={cls.upper()}, weight α={weight:.6g}; "
+                #     f"rolling occupancy={rh_val:.6g}, capacity={cap_val:.6g}, exceedance={exc:.6g} -> contribution={contrib_val:.6g}"
+                # )
             if audit_exceedances and any_for_tv:
                 subtotal = float(np.sum(contrib))
-                print(f"   = Subtotal for TV '{tv_id}': {subtotal:.6g}")
+                # print(f"   = Subtotal for TV '{tv_id}': {subtotal:.6g}")
     if audit_exceedances:
-        print(f"[Audit] J_cap total: {J_cap:.6g}\n")
+        # print(f"[Audit] J_cap total: {J_cap:.6g}\n")
+        pass
     return J_cap
 
 

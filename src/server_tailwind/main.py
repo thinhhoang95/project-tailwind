@@ -291,16 +291,16 @@ async def get_regulation_ranking_tv_flights_ordered(
     top_k: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Rank flights passing a traffic volume near a reference time using heuristic features.
+    Return flights passing a traffic volume near a reference time, ordered by proximity.
 
     Parameters:
     - traffic_volume_id: TV identifier
     - ref_time_str: reference time in HHMMSS (or HHMM) format
-    - seed_flight_ids: comma-separated seed flight IDs
-    - duration_min: optional positive integer; after ranking, keep only flights whose entry time into the TV is in [ref_time_str, ref_time_str + duration_min]
+    - seed_flight_ids: comma-separated seed flight IDs (accepted but not used)
+    - duration_min: optional positive integer; keep only flights whose entry time into the TV is in [ref_time_str, ref_time_str + duration_min]
     - top_k: optional limit on number of results
 
-    Returns ranked flights with arrival time, score and component breakdown.
+    Returns flights with arrival information. Scores and components are omitted.
     """
     try:
         result = await airspace_wrapper.get_regulation_ranking_tv_flights_ordered(
@@ -389,6 +389,36 @@ def post_automatic_rate_adjustment(payload: dict):
         print(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Failed to optimize: {e}")
     return result
+
+
+@app.post("/autorate_occupancy")
+def post_autorate_occupancy(payload: dict):
+    """
+    Aggregate pre/post occupancy across flows for TVs present in a prior
+    /automatic_rate_adjustment response. No optimization is run.
+
+    Request JSON:
+      - autorate_result: object (required)
+      - include_capacity: bool (optional; default true)
+      - rolling_hour: bool (optional; default true)
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON body required")
+    if not payload.get("autorate_result"):
+        raise HTTPException(status_code=400, detail="'autorate_result' is required")
+    try:
+        include_capacity = bool(payload.get("include_capacity", True))
+        rolling_hour = bool(payload.get("rolling_hour", True))
+        return count_wrapper.compute_autorate_occupancy(
+            payload.get("autorate_result") or {}, include_capacity=include_capacity, rolling_hour=rolling_hour
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        print(f"Exception in /autorate_occupancy: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to compute autorate occupancy: {e}")
 
 
 if __name__ == "__main__":

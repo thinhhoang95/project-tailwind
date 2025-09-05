@@ -14,6 +14,7 @@ import asyncio
 from pathlib import Path
 import numpy as np
 import geopandas as gpd
+from parrhesia.optim.occupancy import compute_occupancy
 
 # Ensure imports from project src are available
 import sys
@@ -34,6 +35,7 @@ class CountAPIWrapper:
         # Load once and reuse shared resources
         res = get_resources()
         self._flight_list = res.flight_list
+        self._indexer = res.indexer
 
         # Cached overall totals (across all flights)
         self._total_occupancy_vector: Optional[np.ndarray] = None
@@ -159,6 +161,9 @@ class CountAPIWrapper:
         start_str = f"{start_hour:02d}:{start_min:02d}"
         return f"{start_str}-{end_str}"
 
+    def _labels_for_all_bins(self, T: int) -> list:
+        return [self._format_time_window(i) for i in range(int(T))]
+
     def _get_or_build_total_vector(self) -> np.ndarray:
         if self._total_occupancy_vector is not None:
             return self._total_occupancy_vector
@@ -194,6 +199,145 @@ class CountAPIWrapper:
         for j in range(num_bins):
             j2 = min(num_bins, j + window_bins)
             out[:, j] = cs[:, j2] - cs[:, j]
+        return out
+
+    # ---------- Autorate occupancy aggregation ----------
+    def compute_autorate_occupancy(self, autorate_result: Dict[str, Any], include_capacity: bool = True, rolling_hour: bool = True) -> Dict[str, Any]:
+        """
+        Aggregate pre/post occupancy counts per TV using the full baseline across all flights,
+        then apply optimized delays (from autorate_result.delays_min) as deltas.
+
+        Args:
+            autorate_result: The JSON object returned by /automatic_rate_adjustment
+            include_capacity: When true, attach capacity arrays per TV per bin
+
+        Returns:
+            Dictionary with fields: time_bin_minutes, num_bins, tv_ids_order,
+            timebins.labels, pre_counts, post_counts, and capacity (optional).
+        """
+        if not isinstance(autorate_result, dict):
+            raise ValueError("'autorate_result' must be an object")
+
+        # Determine binning
+        try:
+            T = int(autorate_result.get("num_time_bins") or int(self.bins_per_tv))
+        except Exception:
+            T = int(self.bins_per_tv)
+        # Clamp to valid range
+        T = max(1, min(T, int(self.bins_per_tv)))
+        tbm = int(self.time_bin_minutes)
+
+        # TV set/order: targets then ripples (dedup)
+        targets_in = autorate_result.get("tvs") or []
+        targets = [str(t) for t in targets_in]
+        ripple_cells = autorate_result.get("ripple_cells") or []
+        ripples_order: list[str] = []
+        seen: set[str] = set()
+        for tup in ripple_cells:
+            try:
+                tv = str(tup[0])
+            except Exception:
+                continue
+            if tv not in seen:
+                ripples_order.append(tv)
+                seen.add(tv)
+        target_set = set(targets)
+        tv_ids_order: list[str] = targets + [tv for tv in ripples_order if tv not in target_set]
+        tv_ids_set = set(tv_ids_order)
+
+        # Baseline pre counts from total occupancy across all flights
+        tv_map = self._flight_list.tv_id_to_idx
+        num_total_tvs = len(tv_map)
+        base_vec = self._get_or_build_total_vector()
+        if base_vec.size != num_total_tvs * self.bins_per_tv:
+            raise ValueError("Inconsistent baseline occupancy dimensions")
+        base_matrix = base_vec.reshape((num_total_tvs, self.bins_per_tv))
+
+        pre: Dict[str, list[int]] = {}
+        post: Dict[str, list[int]] = {}
+        for tv in tv_ids_order:
+            row = tv_map.get(str(tv))
+            if row is None:
+                pre[str(tv)] = [0] * T
+                post[str(tv)] = [0] * T
+            else:
+                vec = base_matrix[int(row), :T]
+                lst = [int(x) for x in np.asarray(vec).ravel().tolist()]
+                pre[str(tv)] = list(lst)
+                post[str(tv)] = list(lst)
+
+        # Apply optimized delays as delta to baseline
+        delays_min_any = autorate_result.get("delays_min") or {}
+        if isinstance(delays_min_any, dict) and delays_min_any:
+            delayed_fids: list[str] = []
+            for k, v in delays_min_any.items():
+                try:
+                    if int(v) != 0:
+                        delayed_fids.append(str(k))
+                except Exception:
+                    continue
+
+            if delayed_fids:
+                sub_meta = {fid: self._flight_list.flight_metadata[fid] for fid in delayed_fids if fid in self._flight_list.flight_metadata}
+                if sub_meta:
+                    class _SubFL:
+                        pass
+                    sub = _SubFL()
+                    sub.flight_metadata = sub_meta
+
+                    zero_delays = {fid: 0 for fid in sub_meta.keys()}
+                    occ0_any = compute_occupancy(sub, zero_delays, self._indexer, tv_filter=tv_ids_set)
+                    occ1_delays = {fid: int(delays_min_any.get(fid, 0)) for fid in sub_meta.keys()}
+                    occ1_any = compute_occupancy(sub, occ1_delays, self._indexer, tv_filter=tv_ids_set)
+
+                    for tv in tv_ids_order:
+                        vec0 = occ0_any.get(tv, [])
+                        vec1 = occ1_any.get(tv, [])
+                        v0 = [int(vec0[i]) if i < len(vec0) else 0 for i in range(T)]
+                        v1 = [int(vec1[i]) if i < len(vec1) else 0 for i in range(T)]
+                        cur = post[str(tv)]
+                        for i in range(T):
+                            new_val = int(cur[i]) - int(v0[i]) + int(v1[i])
+                            cur[i] = new_val if new_val > 0 else 0
+                        post[str(tv)] = cur
+
+        # Capacity per bin
+        capacity: Dict[str, list[float]] = {}
+        if include_capacity:
+            mat = self._capacity_per_bin_matrix
+            for tv in tv_ids_order:
+                row = tv_map.get(str(tv))
+                if row is None or mat is None:
+                    capacity[str(tv)] = [-1.0] * T
+                else:
+                    vec = mat[int(row), :T]
+                    capacity[str(tv)] = [float(x) for x in np.asarray(vec).ravel().tolist()]
+
+        # Optional rolling-hour transform (forward-looking 60-minute window)
+        if rolling_hour:
+            window_bins = int(np.ceil(60.0 / float(self.time_bin_minutes)))
+            window_bins = max(1, window_bins)
+            if tv_ids_order:
+                pre_matrix = np.asarray([pre[tv] for tv in tv_ids_order], dtype=np.int32)
+                post_matrix = np.asarray([post[tv] for tv in tv_ids_order], dtype=np.int32)
+                pre_matrix = self._apply_rolling_hour(pre_matrix, window_bins)
+                post_matrix = self._apply_rolling_hour(post_matrix, window_bins)
+                for i, tv in enumerate(tv_ids_order):
+                    pre[tv] = [int(x) for x in np.asarray(pre_matrix[i, :]).ravel().tolist()]
+                    post[tv] = [int(x) for x in np.asarray(post_matrix[i, :]).ravel().tolist()]
+
+        labels = self._labels_for_all_bins(T)
+
+        out: Dict[str, Any] = {
+            "time_bin_minutes": tbm,
+            "num_bins": int(T),
+            "tv_ids_order": tv_ids_order,
+            "timebins": {"labels": labels},
+            "pre_counts": pre,
+            "post_counts": post,
+        }
+        if include_capacity:
+            out["capacity"] = capacity
         return out
     def _compute_counts(
         self,
