@@ -3,14 +3,34 @@ FastAPI server for airspace traffic analysis.
 Provides endpoints for traffic volume occupancy analysis.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from typing import Dict, Any, Optional
 from .airspace.airspace_api_wrapper import AirspaceAPIWrapper
+from .deepflow.flows_api_wrapper import FlowsWrapper
+from .CountAPIWrapper import CountAPIWrapper
+from .core.resources import get_resources
+from parrhesia.api.base_evaluation import compute_base_evaluation
+from parrhesia.api.automatic_rate_adjustment import compute_automatic_rate_adjustment
+try:
+    import parrhesia.api.resources as parr_res
+except Exception:
+    parr_res = None  # type: ignore[assignment]
+
 
 app = FastAPI(title="Airspace Traffic Analysis API", version="1.0.0", debug=True)
 
-# Initialize the airspace API wrapper
+# Preload global resources and initialize wrappers
+_res = get_resources().preload_all()
+# Register shared resources with parrhesia so its modules can reuse them
+if parr_res is not None:
+    try:
+        parr_res.set_global_resources(_res.indexer, _res.flight_list)
+    except Exception as _e:
+        # Non-fatal: parrhesia will fall back to disk loading
+        print(f"Warning: failed to register parrhesia resources: {_e}")
 airspace_wrapper = AirspaceAPIWrapper()
+flows_wrapper = FlowsWrapper()
+count_wrapper = CountAPIWrapper()
 
 @app.get("/")
 async def root():
@@ -171,6 +191,80 @@ async def get_flow_extraction(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+@app.get("/flows")
+async def get_flows(
+    tvs: str = Query(..., description="Comma-separated traffic volume IDs"),
+    from_time_str: Optional[str] = Query(None, description="Start time (HHMM or HHMMSS or HH:MM[:SS])"),
+    to_time_str: Optional[str] = Query(None, description="End time (HHMM or HHMMSS or HH:MM[:SS])"),
+    threshold: Optional[float] = Query(None, description="Jaccard cutoff in [0,1] for clustering (default 0.1)"),
+    resolution: Optional[float] = Query(None, description="Leiden resolution (>0), higher yields more clusters (default 1.0)"),
+) -> Any:
+    try:
+        return await flows_wrapper.get_flows(
+            tvs=tvs,
+            from_time_str=from_time_str,
+            to_time_str=to_time_str,
+            threshold=threshold,
+            resolution=resolution,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to compute flows: {str(e)}")
+
+@app.post("/original_counts")
+async def original_counts(request: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Compute occupancy counts over traffic volumes with optional time range, ranking and rolling-hour mode.
+
+    Request JSON:
+    - traffic_volume_ids: list[str] (optional). If provided, a dedicated 'mentioned_counts' field is returned for these TVs.
+    - from_time_str: str (optional; HHMM, HHMMSS, HH:MM, or HH:MM:SS)
+    - to_time_str: str (optional; same formats; required if from_time_str provided)
+    - categories: dict[str -> list[str]] (optional category -> flight_ids)
+    - flight_ids: list[str] (optional; ignored if categories present). When present and categories are absent, only these flights are counted.
+    - rank_by: str (optional; default "total_count")
+    - rolling_hour: bool (optional; default true). When true, each bin's count is the sum over the next hour.
+    - include_overall: bool (accepted for backward-compatibility; counts are always included for the top 50 TVs)
+
+    Always returns counts for the top_k=50 TVs ranked by 'rank_by' over the selected time range.
+    Also returns capacity arrays per bin aligned with the returned counts: 
+    - 'capacity' for the top-k TVs, and 'mentioned_capacity' when 'traffic_volume_ids' are provided.
+    """
+    try:
+        tvs = request.get("traffic_volume_ids")
+        if tvs is not None and not isinstance(tvs, list):
+            raise HTTPException(status_code=400, detail="'traffic_volume_ids' must be a list when provided")
+
+        from_time_str = request.get("from_time_str")
+        to_time_str = request.get("to_time_str")
+        categories = request.get("categories")
+        flight_ids = request.get("flight_ids")
+        include_overall = bool(request.get("include_overall", True))
+        rank_by = str(request.get("rank_by", "total_count"))
+        rolling_hour = bool(request.get("rolling_hour", True))
+
+        result = await count_wrapper.get_original_counts(
+            traffic_volume_ids=[str(x) for x in tvs] if isinstance(tvs, list) else None,
+            from_time_str=str(from_time_str) if from_time_str is not None else None,
+            to_time_str=str(to_time_str) if to_time_str is not None else None,
+            categories=categories if isinstance(categories, dict) else None,
+            flight_ids=[str(x) for x in flight_ids] if isinstance(flight_ids, list) else None,
+            include_overall=include_overall,
+            rank_by=rank_by,
+            rolling_hour=rolling_hour,
+        )
+        return result
+    except HTTPException:
+        raise
+    except ValueError as e:
+        msg = str(e)
+        if msg.startswith("Unknown traffic_volume_ids"):
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=400, detail=msg)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
 @app.get("/hotspots")
 async def get_hotspots(threshold: float = 0.0) -> Dict[str, Any]:
     """
@@ -255,6 +349,47 @@ async def regulation_plan_simulation(request: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/base_evaluation")
+def post_base_evaluation(payload: dict):
+    # Minimal validation: require targets and flows to be present
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+    if not payload.get("targets"):
+        raise HTTPException(status_code=400, detail="'targets' is required")
+    if not payload.get("flows"):
+        raise HTTPException(status_code=400, detail="'flows' is required")
+    try:
+        result = compute_base_evaluation(payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        print(f"Exception in /base_evaluation: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to compute base evaluation: {e}")
+    return result
+
+
+@app.post("/automatic_rate_adjustment")
+def post_automatic_rate_adjustment(payload: dict):
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON body required")
+    if not payload.get("targets"):
+        raise HTTPException(status_code=400, detail="'targets' is required")
+    if not payload.get("flows"):
+        raise HTTPException(status_code=400, detail="'flows' is required")
+    try:
+        result = compute_automatic_rate_adjustment(payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        print(f"Exception in /automatic_rate_adjustment: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to optimize: {e}")
+    return result
+
 
 if __name__ == "__main__":
     import uvicorn
