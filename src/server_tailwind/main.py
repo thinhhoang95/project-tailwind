@@ -291,16 +291,16 @@ async def get_regulation_ranking_tv_flights_ordered(
     top_k: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
-    Rank flights passing a traffic volume near a reference time using heuristic features.
+    Return flights passing a traffic volume near a reference time, ordered by proximity.
 
     Parameters:
     - traffic_volume_id: TV identifier
     - ref_time_str: reference time in HHMMSS (or HHMM) format
-    - seed_flight_ids: comma-separated seed flight IDs
-    - duration_min: optional positive integer; after ranking, keep only flights whose entry time into the TV is in [ref_time_str, ref_time_str + duration_min]
+    - seed_flight_ids: comma-separated seed flight IDs (accepted but not used)
+    - duration_min: optional positive integer; keep only flights whose entry time into the TV is in [ref_time_str, ref_time_str + duration_min]
     - top_k: optional limit on number of results
 
-    Returns ranked flights with arrival time, score and component breakdown.
+    Returns flights with arrival information. Scores and components are omitted.
     """
     try:
         result = await airspace_wrapper.get_regulation_ranking_tv_flights_ordered(
