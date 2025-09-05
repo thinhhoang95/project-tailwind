@@ -178,11 +178,16 @@ def prepare_flow_scheduling_inputs(
     flights_specs_by_flow: Dict[int, List[Dict[str, Any]]] = {}
     controlled_by_flow: Dict[int, Optional[str]] = {}
 
-    # Precompute earliest crossing per flight per hotspot
+    # Precompute earliest crossing per flight per hotspot, capturing entry_time_s
+    # - earliest_bin_by_flight_by_hotspot: fid -> tv -> earliest bin (int)
+    # - earliest_crossing_by_flight_by_tv: fid -> tv -> (earliest_bin, entry_time_s_at_that_bin)
     earliest_bin_by_flight_by_hotspot: Dict[str, Dict[str, int]] = {}
+    earliest_crossing_by_flight_by_tv: Dict[str, Dict[str, Tuple[int, float]]] = {}
     hotspot_set = set(str(h) for h in hotspot_ids)
+
     for fid, meta in flight_list.flight_metadata.items():
-        d: Dict[str, int] = {}
+        d_bin: Dict[str, int] = {}
+        d_full: Dict[str, Tuple[int, float]] = {}
         for iv in meta.get("occupancy_intervals", []) or []:
             try:
                 tvtw_idx = int(iv.get("tvtw_index"))
@@ -196,10 +201,18 @@ def prepare_flow_scheduling_inputs(
             if s_tv not in hotspot_set:
                 continue
             tb = int(tbin)
-            cur = d.get(s_tv)
-            if cur is None or tb < cur:
-                d[s_tv] = tb
-        earliest_bin_by_flight_by_hotspot[str(fid)] = d
+            # Normalize entry_time_s (seconds from takeoff)
+            raw_entry = iv.get("entry_time_s", 0)
+            try:
+                entry_s = float(raw_entry)
+            except Exception:
+                entry_s = 0.0
+            cur_bin = d_bin.get(s_tv)
+            if cur_bin is None or tb < cur_bin:
+                d_bin[s_tv] = tb
+                d_full[s_tv] = (tb, float(entry_s))
+        earliest_bin_by_flight_by_hotspot[str(fid)] = d_bin
+        earliest_crossing_by_flight_by_tv[str(fid)] = d_full
 
     for flow_id, fids in flights_by_flow.items():
         ctrl = _controlled_volume_for_flow(
@@ -219,11 +232,67 @@ def prepare_flow_scheduling_inputs(
                     rb = min(int(x) for x in eb.values())
             if rb is None:
                 # As last resort, use 0
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.warning(f"Flight {fid} has no crossing bin at controlled volume or hotspots, using bin 0. This can cause degradation of the objective.")
+                logger.warning(
+                    "Flight %s has no crossing bin at controlled volume or hotspots, using bin 0. This can cause degradation of the objective.",
+                    fid,
+                )
                 rb = 0
-            specs.append({"flight_id": fid, "requested_bin": int(rb)})
+
+            # Attempt to enrich with requested_dt using takeoff_time + entry_time_s
+            requested_dt = None
+            try:
+                meta = flight_list.flight_metadata.get(fid, {})
+                takeoff_time = meta.get("takeoff_time")
+            except Exception:
+                takeoff_time = None
+
+            if takeoff_time is not None and rb is not None:
+                # Identify the TV used to select rb and its entry_time_s
+                tv_to_pick: Optional[str] = None
+                entry_s: Optional[float] = None
+                if ctrl is not None:
+                    pair = earliest_crossing_by_flight_by_tv.get(fid, {}).get(ctrl)
+                    if pair is not None:
+                        tv_to_pick = ctrl
+                        b0, e0 = pair
+                        # Sanity: ensure we're using the earliest bin at ctrl
+                        if int(b0) == int(rb):
+                            entry_s = float(e0)
+                        else:
+                            # If mismatch, prefer the entry_s corresponding to rb among hotspots
+                            tv_to_pick = None
+                if tv_to_pick is None:
+                    # Fallback: pick the hotspot TV achieving the chosen rb
+                    candidates = []
+                    for tv, (b, e) in earliest_crossing_by_flight_by_tv.get(fid, {}).items():
+                        if tv in hotspot_set and int(b) == int(rb):
+                            candidates.append((tv, float(e)))
+                    if candidates:
+                        # Choose the smallest entry_s among candidates to represent within-bin ordering
+                        tv_to_pick, entry_s = min(candidates, key=lambda x: float(x[1]))
+                if entry_s is not None:
+                    from datetime import timedelta
+                    try:
+                        requested_dt = takeoff_time + timedelta(seconds=float(entry_s))  # type: ignore[operator]
+                    except Exception:
+                        requested_dt = None
+
+            spec: Dict[str, Any] = {"flight_id": fid, "requested_bin": int(rb)}
+            if requested_dt is not None:
+                # Provide within-bin time for minute-precise FIFO delays
+                spec["requested_dt"] = requested_dt
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Enriched flight %s with requested_dt from entry offset; bin=%d", fid, int(rb)
+                    )
+            else:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Flight %s missing takeoff/entry seconds for within-bin time; using bin-only (bin=%d)",
+                        fid,
+                        int(rb),
+                    )
+            specs.append(spec)
         flights_specs_by_flow[flow_id] = specs
 
     return flights_specs_by_flow, controlled_by_flow
