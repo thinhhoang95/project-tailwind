@@ -305,7 +305,8 @@ class FlightFeatures:
                         continue
 
         print(f'There are {len(self._hours_by_tv)} flights to compute features for')
-        for fid, by_tv in self._hours_by_tv.items():
+        from tqdm import tqdm
+        for fid, by_tv in tqdm(self._hours_by_tv.items()):
             footprint = set(by_tv.keys())
 
             # Multiplicity: count of overloaded (tv, hour) intersected
