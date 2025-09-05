@@ -1,3 +1,16 @@
+# Disclaimers
+
+- Demand (target/ripple “demands”): per‑bin counts of flights at their first/earliest crossing of that TV (or at the controlled volume). One flight contributes to exactly one bin. It’s an arrival histogram; it does not reflect how long the flight stays.
+
+- Occupancy (target/ripple “occupancy_opt”): per‑bin counts of flight presence after applying delays. Each “occupancy interval” for a flight contributes 1 to its TV/time‑window bin; if the flight spans multiple bins at that TV, it contributes 1 in each of those bins. It reflects dwell across bins, but not fractional minutes within a bin.
+
+#### Practical nuance
+
+Both are per‑bin arrays. To get an hourly view, sum across K bins where K = 60 / time_bin_minutes.
+
+Occupancy uses precomputed TV–time‑window footprints. If a flight occupies 2 consecutive bins at a TV, occupancy shows 1 in both; demand shows 1 only in the earliest of the two.
+
+
 ### GET `/flows`
 
 Compute flow partitions for flights crossing one or more traffic volumes (TVs) and return per-flow demand plus per-flight details.
@@ -111,6 +124,8 @@ FlowEval object:
 - **demand** (int[]): Length `T` array; `n0` without overflow.
  - **target_demands** (object): Mapping `TV_ID -> int[]` (length `T`) giving earliest-crossing demand per time bin for each target TV.
  - **ripple_demands** (object): Mapping `TV_ID -> int[]` (length `T`) giving earliest-crossing demand per time bin for each ripple TV.
+ - **target_occupancy** (object): Mapping `TV_ID -> int[]` (length `T`) giving realized per-bin occupancy at each target TV under the baseline schedule (no delays).
+ - **ripple_occupancy** (object): Mapping `TV_ID -> int[]` (length `T`) giving realized per-bin occupancy at each ripple TV under the baseline schedule (no delays).
 
 #### Example
 Request:

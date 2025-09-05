@@ -26,6 +26,7 @@ schedule.
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Sequence
+import numpy as np
 
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.optimize.eval.flight_list import FlightList
@@ -33,6 +34,7 @@ from parrhesia.optim.capacity import build_bin_capacities
 from parrhesia.optim.objective import ObjectiveWeights, score
 from parrhesia.optim.sa_optimizer import SAParams, prepare_flow_scheduling_inputs, run_sa
 from parrhesia.optim.occupancy import compute_occupancy
+from parrhesia.optim import occupancy as _occ
 
 from .base_evaluation import (
     _default_paths_from_root,
@@ -140,6 +142,92 @@ def _per_tv_earliest_demands(
     return target_demands_by_flow, ripple_demands_by_flow
 
 
+def _per_tv_earliest_demands_after_delays(
+    *,
+    idx: TVTWIndexer,
+    fl: FlightList,
+    T: int,
+    flights_by_flow: Mapping[Any, Sequence[Mapping[str, Any]]],
+    target_tv_ids: List[str],
+    ripple_tv_ids: List[str],
+    delays_min: Mapping[str, int],
+) -> Tuple[Dict[int, Dict[str, List[int]]], Dict[int, Dict[str, List[int]]]]:
+    """
+    Post-optimization per-TV earliest-crossing demand vectors using assigned delays.
+
+    For each flight, shift its occupancy intervals by the assigned delay and
+    record the earliest within-day bin it occupies at each TV. Aggregate per flow.
+    """
+    # Build/cache per-flight footprints (rows, base_bins, entry_mods)
+    cache = _occ._get_or_build_footprints_cache(fl, idx)  # type: ignore[attr-defined]
+    per_flight = cache["per_flight"]  # type: ignore[index]
+    bin_len_s = int(idx.time_bin_minutes) * 60
+
+    # Map TVs of interest to their row indices once
+    tv_to_row = {str(tv): int(idx.tv_id_to_idx[str(tv)]) for tv in (set(target_tv_ids) | set(ripple_tv_ids)) if str(tv) in idx.tv_id_to_idx}
+
+    # Precompute delays in seconds
+    delays_sec: Dict[str, int] = {str(k): int(v) * 60 for k, v in (delays_min or {}).items()}
+
+    tgt_out: Dict[int, Dict[str, List[int]]] = {}
+    rip_out: Dict[int, Dict[str, List[int]]] = {}
+
+    for f, specs in flights_by_flow.items():
+        tgt_map: Dict[str, List[int]] = {tv: [0] * T for tv in target_tv_ids}
+        rip_map: Dict[str, List[int]] = {tv: [0] * T for tv in ripple_tv_ids}
+
+        for sp in specs or []:
+            fid = str(sp.get("flight_id"))
+            triple = per_flight.get(fid)  # type: ignore[assignment]
+            if triple is None:
+                continue
+            rows_i, base_bins_i, entry_mods_i = triple  # np.ndarray[int32]
+            if rows_i.size == 0:
+                continue
+
+            dsec = int(delays_sec.get(fid, 0))
+            # Vectorized shift per interval, then compute realized bins
+            shift_i = (entry_mods_i.astype(np.int64, copy=False) + dsec) // int(bin_len_s)
+            bins_i = base_bins_i.astype(np.int64, copy=False) + shift_i
+
+            # Keep only within-day bins
+            valid_mask = (bins_i >= 0) & (bins_i < T)
+            if not bool(valid_mask.any()):
+                continue
+
+            rows_v = rows_i[valid_mask].astype(np.int64, copy=False)
+            bins_v = bins_i[valid_mask].astype(np.int64, copy=False)
+
+            # Compute earliest bin per row for this flight
+            earliest_by_row: Dict[int, int] = {}
+            for rr, bb in zip(rows_v.tolist(), bins_v.tolist()):
+                cur = earliest_by_row.get(int(rr))
+                if cur is None or int(bb) < cur:
+                    earliest_by_row[int(rr)] = int(bb)
+
+            # Update target and ripple maps using tv->row mapping
+            for tv in target_tv_ids:
+                r = tv_to_row.get(str(tv))
+                if r is None:
+                    continue
+                b = earliest_by_row.get(int(r))
+                if b is not None and 0 <= int(b) < T:
+                    tgt_map[str(tv)][int(b)] += 1
+
+            for tv in ripple_tv_ids:
+                r = tv_to_row.get(str(tv))
+                if r is None:
+                    continue
+                b = earliest_by_row.get(int(r))
+                if b is not None and 0 <= int(b) < T:
+                    rip_map[str(tv)][int(b)] += 1
+
+        tgt_out[int(f)] = tgt_map
+        rip_out[int(f)] = rip_map
+
+    return tgt_out, rip_out
+
+
 def compute_automatic_rate_adjustment(payload: Mapping[str, Any]) -> Dict[str, Any]:
     # 1) Load artifacts (paths may be overridden in payload)
     idx_path_default, fl_path_default, cap_path_default = _default_paths_from_root()
@@ -228,7 +316,7 @@ def compute_automatic_rate_adjustment(payload: Mapping[str, Any]) -> Dict[str, A
     # 5b) Per-TV baseline earliest-crossing demand (same as base_evaluation)
     target_tv_ids = list(dict.fromkeys(str(tv) for tv in tvs))
     ripple_tv_ids = sorted({str(tv) for (tv, _b) in ripple_cells})
-    target_demands_by_flow, ripple_demands_by_flow = _per_tv_earliest_demands(
+    pre_target_demands_by_flow, pre_ripple_demands_by_flow = _per_tv_earliest_demands(
         idx=idx,
         fl=fl,
         T=T,
@@ -291,6 +379,17 @@ def compute_automatic_rate_adjustment(payload: Mapping[str, Any]) -> Dict[str, A
         target_occ_by_flow[int(f)] = {tv: occ.get(tv, [0] * T) for tv in target_tv_ids}
         ripple_occ_by_flow[int(f)] = {tv: occ.get(tv, [0] * T) for tv in ripple_tv_ids}
 
+    # 8a) Post-optimization per-TV earliest-crossing demand under delays
+    post_target_demands_by_flow, post_ripple_demands_by_flow = _per_tv_earliest_demands_after_delays(
+        idx=idx,
+        fl=fl,
+        T=T,
+        flights_by_flow=flights_by_flow,
+        target_tv_ids=target_tv_ids,
+        ripple_tv_ids=ripple_tv_ids,
+        delays_min=delays,
+    )
+
     # 9) Assemble response
     flows_out: List[Dict[str, Any]] = []
     for f in sorted(flights_by_flow.keys(), key=lambda x: int(x)):
@@ -305,8 +404,13 @@ def compute_automatic_rate_adjustment(payload: Mapping[str, Any]) -> Dict[str, A
                 "n0": n0[int(f)],
                 "demand": demand[int(f)],
                 "n_opt": n_opt_list,
-                "target_demands": target_demands_by_flow.get(int(f), {}),
-                "ripple_demands": ripple_demands_by_flow.get(int(f), {}),
+                # Baseline (pre-optimization) earliest demands per TV
+                "pre_target_demands": pre_target_demands_by_flow.get(int(f), {}),
+                "pre_ripple_demands": pre_ripple_demands_by_flow.get(int(f), {}),
+                # Post-optimization earliest demands per TV (under delays)
+                "target_demands": post_target_demands_by_flow.get(int(f), {}),
+                "ripple_demands": post_ripple_demands_by_flow.get(int(f), {}),
+                # Realized occupancy after delays
                 "target_occupancy_opt": target_occ_by_flow.get(int(f), {}),
                 "ripple_occupancy_opt": ripple_occ_by_flow.get(int(f), {}),
             }

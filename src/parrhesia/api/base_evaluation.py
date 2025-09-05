@@ -36,6 +36,7 @@ from project_tailwind.optimize.eval.flight_list import FlightList
 from parrhesia.optim.capacity import build_bin_capacities
 from parrhesia.optim.objective import ObjectiveWeights, score
 from parrhesia.optim.sa_optimizer import prepare_flow_scheduling_inputs
+from parrhesia.optim.occupancy import compute_occupancy
 from .flows import _load_indexer_and_flights  # reuse helper for defaults
 from .resources import get_global_resources
 
@@ -349,8 +350,35 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
     time_end = time.time()
     print(f"target_demands_by_flow and ripple_demands_by_flow time: {time_end - time_start} seconds")
 
+    # 5c) Baseline per-TV occupancy on targets/ripples (zero delays)
+    time_start = time.time()
+    tv_filter_for_occ = set(target_tv_ids) | set(ripple_tv_ids)
+
+    def _occ_for_flow(fid_list: List[str]) -> Dict[str, List[int]]:
+        sub_meta = {fid: fl.flight_metadata[fid] for fid in fid_list if fid in fl.flight_metadata}
+        class _SubFL:
+            pass
+        sub = _SubFL()
+        sub.flight_metadata = sub_meta
+        zero_delays = {fid: 0 for fid in fid_list}
+        occ = compute_occupancy(sub, zero_delays, idx, tv_filter=tv_filter_for_occ)
+        # Ensure plain Python lists
+        return {tv: (arr.tolist() if hasattr(arr, "tolist") else list(arr or [])) for tv, arr in occ.items()}
+
+    target_occ_by_flow: Dict[int, Dict[str, List[int]]] = {}
+    ripple_occ_by_flow: Dict[int, Dict[str, List[int]]] = {}
+    for f, specs in flights_by_flow.items():
+        fids = [str(sp.get("flight_id")) for sp in (specs or [])]
+        occ_all = _occ_for_flow(fids)
+        target_occ_by_flow[int(f)] = {tv: occ_all.get(tv, [0] * T) for tv in target_tv_ids}
+        ripple_occ_by_flow[int(f)] = {tv: occ_all.get(tv, [0] * T) for tv in ripple_tv_ids}
+    time_end = time.time()
+    print(f"target_occupancy and ripple_occupancy time: {time_end - time_start} seconds")
+
     # 6) Score baseline
     weights = ObjectiveWeights(**(payload.get("weights") or {}))
+    # Restrict scoring to TVs of interest (targets ∪ ripples) to align with /automatic_rate_adjustment
+    tv_filter = set(target_tv_ids) | set(ripple_tv_ids)
     J, components, _arts = score(
         n0,
         flights_by_flow=flights_by_flow,
@@ -360,6 +388,7 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
         ripple_cells=ripple_cells,
         flight_list=fl,
         weights=weights,
+        tv_filter=tv_filter,
     )
 
     # 7) Assemble response
@@ -373,6 +402,8 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 "demand": demand[int(f)],
                 "target_demands": target_demands_by_flow.get(int(f), {}),
                 "ripple_demands": ripple_demands_by_flow.get(int(f), {}),
+                "target_occupancy": target_occ_by_flow.get(int(f), {}),
+                "ripple_occupancy": ripple_occ_by_flow.get(int(f), {}),
             }
         )
 
