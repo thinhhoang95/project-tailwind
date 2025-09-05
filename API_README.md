@@ -7,7 +7,7 @@ This FastAPI server provides endpoints for analyzing traffic volume occupancy da
 - **`/tv_count`** - Get occupancy counts for all time windows of a specific traffic volume
 - **`/tv_flights`** - Get flight identifiers grouped by time window for a specific traffic volume
 - **`/tv_flights_ordered`** - Get all flights for a traffic volume ordered by proximity to a reference time
-- **`/regulation_ranking_tv_flights_ordered`** - Rank ordered TV flights by heuristic features with scores and components
+- **`/regulation_ranking_tv_flights_ordered`** - Ordered TV flights near ref time (no scores/components)
 - **`/flow_extraction`** - Compute community assignments for flights near a reference time using Jaccard similarity and Leiden clustering
 - **`/traffic_volumes`** - List all available traffic volume IDs
 - **`/tv_count_with_capacity`** - Get occupancy counts along with hourly capacity for a traffic volume
@@ -149,9 +149,9 @@ Use `ref_time_str` in numeric `HHMMSS` format (e.g., `084510` for 08:45:10). `HH
 
 ### GET `/regulation_ranking_tv_flights_ordered?traffic_volume_id={id}&ref_time_str={HHMMSS}&seed_flight_ids={csv}&duration_min={m}&top_k={n}`
 
-Ranks flights that pass through the specified traffic volume near a reference time using heuristic features from `FlightFeatures`. It reuses the ordered flights list and augments with a score and component breakdown. If `duration_min` is provided, results are filtered post-ranking to include only flights whose entry time into the TV lies between the reference time and `ref_time_str + duration_min` minutes. Remaining candidates are sorted by descending score.
+Returns flights that pass through the specified traffic volume near a reference time, ordered by proximity to the reference time. No ranking scores or component breakdown are computed (heavy `FlightFeatures` computations are skipped). If `duration_min` is provided, results are filtered to include only flights whose entry time into the TV lies between the reference time and `ref_time_str + duration_min` minutes. Results retain the proximity ordering.
 
-Use `ref_time_str` in numeric `HHMMSS` format (e.g., `084510` for 08:45:10). `HHMM` is also accepted (seconds assumed 00). Provide `seed_flight_ids` as a comma-separated list.
+Use `ref_time_str` in numeric `HHMMSS` format (e.g., `084510` for 08:45:10). `HHMM` is also accepted (seconds assumed 00). `seed_flight_ids` is accepted (comma-separated) but not used.
 
 **Parameters:**
 - `traffic_volume_id` (string): The traffic volume ID to analyze
@@ -171,25 +171,13 @@ Use `ref_time_str` in numeric `HHMMSS` format (e.g., `084510` for 08:45:10). `HH
       "flight_id": "0200AFRAM650E",
       "arrival_time": "08:00:12",
       "time_window": "08:00-08:15",
-      "delta_seconds": 2,
-      "score": 0.873,
-      "components": {
-        "multiplicity": 1.0,
-        "similarity": 0.75,
-        "slack": 0.62
-      }
+      "delta_seconds": 2
     },
     {
       "flight_id": "1234XYZZY",
       "arrival_time": "08:02:30",
       "time_window": "08:00-08:15",
-      "delta_seconds": 140,
-      "score": 0.721,
-      "components": {
-        "multiplicity": 0.6,
-        "similarity": 0.50,
-        "slack": 0.58
-      }
+      "delta_seconds": 140
     }
   ],
   "metadata": {
@@ -527,4 +515,3 @@ For production deployment, consider:
 - Using a production WSGI server like Gunicorn
 - Adding authentication and rate limiting
 - Implementing proper logging
-
