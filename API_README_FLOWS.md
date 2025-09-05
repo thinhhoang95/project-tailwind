@@ -232,5 +232,5 @@ curl -X POST http://localhost:8000/automatic_rate_adjustment \
 #### Notes
 - Arrays are JSON-serializable (numpy arrays are converted to lists).
 - “Demands” mirror `/base_evaluation` (earliest crossings), while “occupancy_opt” reflects realized occupancy after delays with the optimized schedule.
-- Use `delays_min` to retrieve per-flight delays (in minutes). Filter values > 0 to list only delayed flights.
+- Use `delays_min` to retrieve per-flight delays (in minutes). Filter values > 0 to list only delayed flights. When flight metadata includes `takeoff_time` and segment `entry_time_s`, the SA path now provides within‑bin requested times (`requested_dt`), so `delays_min` can be non‑multiples of the bin length (minute‑precision).
 - Determinism controlled via `sa_params.seed`.

@@ -14,6 +14,7 @@ This document describes the request/response schema, validation behavior, exampl
   - Objective evaluation via `parrhesia.optim.objective.score`.
   - Optimization via `parrhesia.optim.sa_optimizer.run_sa`.
   - Post‑optimization realized occupancy via `parrhesia.optim.occupancy.compute_occupancy`.
+  - Minute‑precision delays when flight specs include within‑bin times (`requested_dt`). SA now enriches specs using `takeoff_time + entry_time_s` for the chosen controlled volume.
 
 ---
 
