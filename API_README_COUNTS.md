@@ -299,6 +299,7 @@ Aggregate pre/post occupancy counts per traffic volume across flows, using only 
 
 - `autorate_result` (object, required): The exact JSON object returned by `/automatic_rate_adjustment`.
 - `include_capacity` (boolean, optional, default `true`): Whether to include per-bin capacity arrays.
+- `rolling_hour` (boolean, optional, default `true`): When true, `pre_counts` and `post_counts` are transformed into rolling-hour sums (forward-looking window of 60 minutes), consistent with `/original_counts`.
 
 Notes
 - TV set adheres strictly to the prior result:
@@ -313,8 +314,8 @@ Notes
 - `num_bins` (int): Number of bins per TV.
 - `tv_ids_order` (list[string]): Targets first in given order, then ripples (deduped).
 - `timebins.labels` (list[string]): Labels `HH:MM-HH:MM` for all bins `[0..T-1]`.
-- `pre_counts` (object): `{ tv_id: int[T] }` aggregated baseline earliest-crossing counts (sum over flows).
-- `post_counts` (object): `{ tv_id: int[T] }` aggregated realized occupancy under optimized delays (sum over flows).
+- `pre_counts` (object): `{ tv_id: int[T] }` baseline occupancy across all flights for each TV. When `rolling_hour` is true, counts are rolling-hour aggregates.
+- `post_counts` (object): `{ tv_id: int[T] }` baseline adjusted by the optimized delays (applied only to affected flights). When `rolling_hour` is true, counts are rolling-hour aggregates.
 - `capacity` (object, optional): `{ tv_id: float[T] }` capacity per bin (hourly value repeated; `-1` if unknown).
 
 ### Example
