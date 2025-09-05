@@ -41,6 +41,8 @@ Optional keys:
   - `max_shift` (int, default 4): Max Δ for shift‑later move.
   - `pull_max` (int, default 2): Max Δ for pull‑forward move.
   - `smooth_window_max` (int, default 3): Max window for smoothing move.
+  - `rate_change_lower_bound_min` (int, default 0): Minutes to expand below the earliest target bin; only bins within the expanded window are allowed to change.
+  - `rate_change_upper_bound_min` (int, default 0): Minutes to expand above the latest target bin; only bins within the expanded window are allowed to change.
 
 Validation (HTTP 400):
 - `flows` missing/not an object
@@ -148,6 +150,7 @@ Example truncated response:
 - SA parameters:
   - `iterations`: increase for quality; SA is stochastic—use a fixed `seed` for repeatability.
   - `attention_bias`: values closer to 1.0 bias moves into bins classified as target/ripple (faster convergence towards the attention regions).
+  - Time‑window guard for changes: the optimizer will only modify release rates within the window spanning from the minimum target bin to the maximum target bin, expanded by `rate_change_lower_bound_min` and `rate_change_upper_bound_min`. For example, if targets cover 08:15–09:30 and both bounds are 15 minutes, changes are allowed only from 08:00 to 09:45.
 
 - Reading results:
   - `n0` vs `n_opt`: both length `T+1`. Compare distributions and overflow at index `T`.
@@ -200,4 +203,5 @@ async def run():
 - Artifacts load precedence: explicit paths → app‑level cached resources → default files under `data/`.
 - Controlled volume and requested bins are produced by `prepare_flow_scheduling_inputs` restricted to target TVs.
 - Optimizer: `run_sa` evaluates candidates using `score_with_context`; attention masks are derived from beta/gamma classifications keyed on target/ripple cells.
+- Change window enforcement: `run_sa` computes an allowed‑change mask from `target_cells` and the minute margins in `SAParams` and restricts all SA moves so both source and destination bins lie within this mask. The overflow bin is never altered by SA moves.
 - Post‑optimization occupancy is computed on a reduced subset (per flow) for `target_occupancy_opt` and `ripple_occupancy_opt`.

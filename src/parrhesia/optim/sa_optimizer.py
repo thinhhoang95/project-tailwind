@@ -313,6 +313,10 @@ class SAParams:
     pull_max: int = 2   # maximum Δ for pull-forward
     smooth_window_max: int = 3  # maximum window length for smoothing
     verbose: bool = False  # if True (or env SA_VERBOSE truthy), print SA progress
+    # Minutes to expand allowed change window relative to the min/max target bins.
+    # Only bins within the expanded window are allowed to change during SA.
+    rate_change_lower_bound_min: int = 0
+    rate_change_upper_bound_min: int = 0
 
 
 def _to_T_plus_1(arr: Iterable[int], T: int) -> np.ndarray:
@@ -395,6 +399,7 @@ def _propose_move(
     n_by_flow: Dict[Any, np.ndarray],
     d_by_flow: Dict[Any, np.ndarray],
     attn_bins_by_flow: Dict[Any, np.ndarray],
+    allowed_mask: np.ndarray,
     params: SAParams,
 ) -> Optional[Tuple[Any, str, Tuple[int, int, int]]]:
     """
@@ -415,16 +420,33 @@ def _propose_move(
             f = rng.choice(flows)
             attn_mask = attn_bins_by_flow.get(f)
             if isinstance(attn_mask, np.ndarray) and attn_mask.any():
-                idxs = np.nonzero(attn_mask)[0].tolist()
+                # Restrict attention to allowed change bins
+                T = n_by_flow[f].size - 1
+                allowed_T = np.asarray(allowed_mask[:T], dtype=bool)
+                idxs = np.nonzero(np.asarray(attn_mask, dtype=bool) & allowed_T)[0].tolist()
                 if not idxs:
-                    t = rng.randrange(0, n_by_flow[f].size - 1)
+                    # Fall back to any allowed bin
+                    allowed_idxs = np.nonzero(allowed_T)[0].tolist()
+                    if not allowed_idxs:
+                        continue
+                    t = rng.choice(allowed_idxs)
                 else:
                     t = rng.choice(idxs)
             else:
-                t = rng.randrange(0, n_by_flow[f].size - 1)
+                # Fall back to any allowed bin
+                T = n_by_flow[f].size - 1
+                allowed_idxs = np.nonzero(np.asarray(allowed_mask[:T], dtype=bool))[0].tolist()
+                if not allowed_idxs:
+                    continue
+                t = rng.choice(allowed_idxs)
         else:
             f = rng.choice(flows)
-            t = rng.randrange(0, n_by_flow[f].size - 1)
+            # Uniform among allowed bins
+            T = n_by_flow[f].size - 1
+            allowed_idxs = np.nonzero(np.asarray(allowed_mask[:T], dtype=bool))[0].tolist()
+            if not allowed_idxs:
+                continue
+            t = rng.choice(allowed_idxs)
 
         n = n_by_flow[f]
         d = d_by_flow[f]
@@ -438,6 +460,16 @@ def _propose_move(
 
         if move_kind == "shift_later":
             delta = rng.randint(1, int(params.max_shift))
+            # Enforce allowed window at both source and destination
+            dst = t + int(delta)
+            T = n.size - 1
+            if not (0 <= t <= T - 1):
+                continue
+            if not (0 <= dst <= T):
+                continue
+            if not (bool(allowed_mask[t]) and (dst < T and bool(allowed_mask[dst]))):
+                # Disallow moves touching overflow or outside allowed window
+                continue
             applied = _apply_shift_later(n, t, delta, q)
             if applied is not None:
                 return (f, move_kind, applied)
@@ -446,11 +478,22 @@ def _propose_move(
             if n[t] <= 0:
                 continue
             delta = rng.randint(1, int(params.pull_max))
+            dst = t - int(delta)
+            if dst < 0:
+                continue
+            if not (bool(allowed_mask[t]) and bool(allowed_mask[dst])):
+                continue
             applied = _apply_pull_forward(n, d_cum, t, delta, q)
             if applied is not None:
                 return (f, move_kind, applied)
         else:  # smooth
             window = rng.randint(2, int(params.smooth_window_max))
+            T = n.size - 1
+            t1 = t + window
+            if not (0 <= t < t1 <= T):
+                continue
+            if not (bool(allowed_mask[t]) and (t1 < T and bool(allowed_mask[t1]))):
+                continue
             applied = _apply_smoothing(n, d_cum, t, window, q)
             if applied is not None:
                 return (f, move_kind, applied)
@@ -474,6 +517,56 @@ def _attention_masks_from_artifacts(
         mask = (np.isclose(g, g_gt) | np.isclose(g, g_rip)).astype(bool)
         out[f] = mask
     return out
+
+
+def _compute_allowed_change_mask(
+    indexer: TVTWIndexer,
+    target_cells: Optional[Iterable[Tuple[str, int]]],
+    params: SAParams,
+) -> np.ndarray:
+    """
+    Build a boolean mask over time bins (length T+1 including overflow) that
+    indicates which bins are allowed to change. Only bins in the expanded
+    window [min_target_bin - lower_margin, max_target_bin + upper_margin]
+    are allowed. The overflow bin (index T) is never allowed.
+
+    If target_cells is None or empty, all non-overflow bins are allowed.
+    """
+    T = int(indexer.num_time_bins)
+    mask = np.zeros(T + 1, dtype=bool)
+    # Default: allow all non-overflow bins
+    allow_all = True
+    min_bin: Optional[int] = None
+    max_bin: Optional[int] = None
+
+    if target_cells is not None:
+        for _tv, b in target_cells:
+            try:
+                tb = int(b)
+            except Exception:
+                continue
+            if 0 <= tb < T:
+                allow_all = False
+                if min_bin is None or tb < min_bin:
+                    min_bin = tb
+                if max_bin is None or tb > max_bin:
+                    max_bin = tb
+
+    if allow_all or min_bin is None or max_bin is None:
+        # Allow all non-overflow bins
+        mask[:T] = True
+        mask[T] = False
+        return mask
+
+    tbm = int(getattr(indexer, "time_bin_minutes", 30))
+    lower_bins = int(math.ceil(float(params.rate_change_lower_bound_min) / float(max(tbm, 1))))
+    upper_bins = int(math.ceil(float(params.rate_change_upper_bound_min) / float(max(tbm, 1))))
+    lo = max(0, int(min_bin) - int(lower_bins))
+    hi = min(T - 1, int(max_bin) + int(upper_bins))
+    if lo <= hi:
+        mask[lo : hi + 1] = True
+    mask[T] = False
+    return mask
 
 
 def run_sa(
@@ -508,6 +601,21 @@ def run_sa(
     if is_verbose:
         start_time = time.time()
         print(f"[SA] Starting SA optimization...")
+
+    # Print optimization parameters
+    
+    print(f"[SA] Optimization parameters:")
+    print(f"  iterations: {params.iterations}")
+    print(f"  warmup_moves: {params.warmup_moves}")
+    print(f"  alpha_T: {params.alpha_T}")
+    print(f"  L: {params.L}")
+    print(f"  seed: {params.seed}")
+    print(f"  attention_bias: {params.attention_bias}")
+    print(f"  max_shift: {params.max_shift}")
+    print(f"  pull_max: {params.pull_max}")
+    print(f"  smooth_window_max: {params.smooth_window_max}")
+    print(f"  rate_change_lower_bound_min: {params.rate_change_lower_bound_min}")
+    print(f"  rate_change_upper_bound_min: {params.rate_change_upper_bound_min}")
 
     # Compute demands directly from flights_by_flow -> d_f(t)
     def _compute_demands_from_flights(
@@ -569,6 +677,8 @@ def run_sa(
     if is_verbose:
         mask_start = time.time()
     attn_masks = _attention_masks_from_artifacts(arts_best.get("beta_gamma", {}), weights)
+    # Allowed-change mask derived from target cells and SAParams margins
+    allowed_mask = _compute_allowed_change_mask(indexer, target_cells, params)
     if is_verbose:
         mask_end = time.time()
         print(f"[SA] Attention mask time: {mask_end - mask_start:.3f}s")
@@ -592,7 +702,7 @@ def run_sa(
             print(f"[SA] Copy time: {copy_end - copy_start:.6f}s")
         
         propose_start = time.time()
-        mv = _propose_move(rng, trial, d_by_flow, attn_masks, params)
+        mv = _propose_move(rng, trial, d_by_flow, attn_masks, allowed_mask, params)
         propose_end = time.time()
 
         if is_verbose:
@@ -646,7 +756,7 @@ def run_sa(
     
     for it in range(int(params.iterations)):
         candidate = {f: np.array(v, dtype=np.int64, copy=True) for f, v in n_by_flow.items()}
-        mv = _propose_move(rng, candidate, d_by_flow, attn_masks, params)
+        mv = _propose_move(rng, candidate, d_by_flow, attn_masks, allowed_mask, params)
         if mv is None:
             continue
         J_new, comps_new, arts_new = score_with_context(
