@@ -1,10 +1,14 @@
-# Original Counts API
+# Counts APIs
 
-Endpoint for computing traffic-volume occupancy counts over the day, optionally restricted to a time window and/or broken down by user-supplied categories (e.g., flows). The server holds a single in‑memory FlightList, so requests reuse loaded data without re-reading large JSON files.
+This document covers two related endpoints:
+- Original Counts over TVs and time windows
+- Autorate Occupancy aggregation from a prior optimization result
+
+The server holds a single in‑memory FlightList, so requests reuse loaded data without re-reading large JSON files.
 
 ---
 
-## Endpoint
+## Original Counts Endpoint
 
 - Method: POST
 - Path: `/original_counts`
@@ -277,3 +281,73 @@ Example error response
 - Rolling-hour uses a forward-looking window of size `ceil(60 / time_bin_minutes)` bins (no wrap at day boundary).
 - Category counts sum over the selected flight rows of the sparse occupancy matrix and are returned for the same top‑50 TVs.
 - Time labels are generated purely from `time_bin_minutes` and bin indices.
+
+---
+
+## Autorate Occupancy Aggregation
+
+Aggregate pre/post occupancy counts per traffic volume across flows, using only the data already present in a prior `/automatic_rate_adjustment` response. No optimization is run here.
+
+### Endpoint
+
+- Method: POST
+- Path: `/autorate_occupancy`
+- Content-Type: `application/json`
+- Auth: none
+
+### Request Body
+
+- `autorate_result` (object, required): The exact JSON object returned by `/automatic_rate_adjustment`.
+- `include_capacity` (boolean, optional, default `true`): Whether to include per-bin capacity arrays.
+
+Notes
+- TV set adheres strictly to the prior result:
+  - Targets: `autorate_result.tvs` (order preserved)
+  - Ripples: unique TV order from `autorate_result.ripple_cells` (append after targets; dedup)
+- Binning is taken from the autorate result (`num_time_bins`) and the app indexer (`time_bin_minutes`).
+- Capacity per bin uses the server’s preloaded matrix; unknown TVs or missing capacity return `-1` per bin.
+
+### Response Body
+
+- `time_bin_minutes` (int): Bin size in minutes.
+- `num_bins` (int): Number of bins per TV.
+- `tv_ids_order` (list[string]): Targets first in given order, then ripples (deduped).
+- `timebins.labels` (list[string]): Labels `HH:MM-HH:MM` for all bins `[0..T-1]`.
+- `pre_counts` (object): `{ tv_id: int[T] }` aggregated baseline earliest-crossing counts (sum over flows).
+- `post_counts` (object): `{ tv_id: int[T] }` aggregated realized occupancy under optimized delays (sum over flows).
+- `capacity` (object, optional): `{ tv_id: float[T] }` capacity per bin (hourly value repeated; `-1` if unknown).
+
+### Example
+
+Request
+```json
+{
+  "autorate_result": { /* the full object returned by /automatic_rate_adjustment */ },
+  "include_capacity": true
+}
+```
+
+Response (shape, truncated)
+```json
+{
+  "time_bin_minutes": 15,
+  "num_bins": 96,
+  "tv_ids_order": ["TV_TARGET_A", "TV_TARGET_B", "TV_RIPPLE_X"],
+  "timebins": { "labels": ["00:00-00:15", "00:15-00:30", "..."] },
+  "pre_counts": {
+    "TV_TARGET_A": [3, 5, 4, "..."],
+    "TV_TARGET_B": [1, 2, 3, "..."],
+    "TV_RIPPLE_X": [0, 1, 1, "..."]
+  },
+  "post_counts": {
+    "TV_TARGET_A": [2, 4, 3, "..."],
+    "TV_TARGET_B": [1, 1, 2, "..."],
+    "TV_RIPPLE_X": [0, 1, 1, "..."]
+  },
+  "capacity": {
+    "TV_TARGET_A": [20, 20, 20, "..."],
+    "TV_TARGET_B": [18, 18, 18, "..."],
+    "TV_RIPPLE_X": [15, 15, 15, "..."]
+  }
+}
+```

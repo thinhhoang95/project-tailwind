@@ -159,6 +159,9 @@ class CountAPIWrapper:
         start_str = f"{start_hour:02d}:{start_min:02d}"
         return f"{start_str}-{end_str}"
 
+    def _labels_for_all_bins(self, T: int) -> list:
+        return [self._format_time_window(i) for i in range(int(T))]
+
     def _get_or_build_total_vector(self) -> np.ndarray:
         if self._total_occupancy_vector is not None:
             return self._total_occupancy_vector
@@ -194,6 +197,116 @@ class CountAPIWrapper:
         for j in range(num_bins):
             j2 = min(num_bins, j + window_bins)
             out[:, j] = cs[:, j2] - cs[:, j]
+        return out
+
+    # ---------- Autorate occupancy aggregation ----------
+    def compute_autorate_occupancy(self, autorate_result: Dict[str, Any], include_capacity: bool = True) -> Dict[str, Any]:
+        """
+        Aggregate pre/post occupancy counts per TV across flows from an existing
+        /automatic_rate_adjustment result; optionally include per-bin capacity.
+
+        Args:
+            autorate_result: The JSON object returned by /automatic_rate_adjustment
+            include_capacity: When true, attach capacity arrays per TV per bin
+
+        Returns:
+            Dictionary with fields: time_bin_minutes, num_bins, tv_ids_order,
+            timebins.labels, pre_counts, post_counts, and capacity (optional).
+        """
+        if not isinstance(autorate_result, dict):
+            raise ValueError("'autorate_result' must be an object")
+
+        # Determine binning
+        try:
+            T = int(autorate_result.get("num_time_bins") or int(self.bins_per_tv))
+        except Exception:
+            T = int(self.bins_per_tv)
+        tbm = int(self.time_bin_minutes)
+
+        # TV set/order: targets then ripples (dedup)
+        targets_in = autorate_result.get("tvs") or []
+        targets = [str(t) for t in targets_in]
+        ripple_cells = autorate_result.get("ripple_cells") or []
+        ripples_order: list[str] = []
+        seen: set[str] = set()
+        for tup in ripple_cells:
+            try:
+                tv = str(tup[0])
+            except Exception:
+                continue
+            if tv not in seen:
+                ripples_order.append(tv)
+                seen.add(tv)
+        target_set = set(targets)
+        tv_ids_order: list[str] = targets + [tv for tv in ripples_order if tv not in target_set]
+
+        # Initialize aggregation buffers
+        pre: Dict[str, list[int]] = {tv: [0] * T for tv in tv_ids_order}
+        post: Dict[str, list[int]] = {tv: [0] * T for tv in tv_ids_order}
+
+        def _add_into(dst: list[int], src_any: Any) -> None:
+            if not isinstance(src_any, (list, tuple)):
+                return
+            lim = min(T, len(src_any))
+            for i in range(lim):
+                try:
+                    dst[i] += int(src_any[i])
+                except Exception:
+                    continue
+
+        flows = autorate_result.get("flows") or []
+        if not isinstance(flows, list):
+            flows = []
+        for f in flows:
+            pre_t = f.get("pre_target_demands") or {}
+            pre_r = f.get("pre_ripple_demands") or {}
+            occ_t = f.get("target_occupancy_opt") or {}
+            occ_r = f.get("ripple_occupancy_opt") or {}
+            if not isinstance(pre_t, dict):
+                pre_t = {}
+            if not isinstance(pre_r, dict):
+                pre_r = {}
+            if not isinstance(occ_t, dict):
+                occ_t = {}
+            if not isinstance(occ_r, dict):
+                occ_r = {}
+
+            for tv in tv_ids_order:
+                src_pre = pre_t.get(tv)
+                if src_pre is None:
+                    src_pre = pre_r.get(tv)
+                _add_into(pre[tv], src_pre)
+
+                src_post = occ_t.get(tv)
+                if src_post is None:
+                    src_post = occ_r.get(tv)
+                _add_into(post[tv], src_post)
+
+        # Capacity per bin
+        capacity: Dict[str, list[float]] = {}
+        if include_capacity:
+            mat = self._capacity_per_bin_matrix
+            tv_map = self._flight_list.tv_id_to_idx
+            for tv in tv_ids_order:
+                row = tv_map.get(str(tv))
+                if row is None or mat is None:
+                    capacity[str(tv)] = [-1.0] * T
+                else:
+                    vec = mat[int(row), :]
+                    capacity[str(tv)] = [float(x) for x in vec.tolist()[:T]]
+
+        labels = self._labels_for_all_bins(T)
+
+        out: Dict[str, Any] = {
+            "time_bin_minutes": tbm,
+            "num_bins": int(T),
+            "tv_ids_order": tv_ids_order,
+            "timebins": {"labels": labels},
+            "pre_counts": pre,
+            "post_counts": post,
+        }
+        if include_capacity:
+            out["capacity"] = capacity
         return out
     def _compute_counts(
         self,

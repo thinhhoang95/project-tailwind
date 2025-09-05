@@ -391,6 +391,34 @@ def post_automatic_rate_adjustment(payload: dict):
     return result
 
 
+@app.post("/autorate_occupancy")
+def post_autorate_occupancy(payload: dict):
+    """
+    Aggregate pre/post occupancy across flows for TVs present in a prior
+    /automatic_rate_adjustment response. No optimization is run.
+
+    Request JSON:
+      - autorate_result: object (required)
+      - include_capacity: bool (optional; default true)
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON body required")
+    if not payload.get("autorate_result"):
+        raise HTTPException(status_code=400, detail="'autorate_result' is required")
+    try:
+        include_capacity = bool(payload.get("include_capacity", True))
+        return count_wrapper.compute_autorate_occupancy(
+            payload.get("autorate_result") or {}, include_capacity=include_capacity
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        print(f"Exception in /autorate_occupancy: {e}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to compute autorate occupancy: {e}")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
