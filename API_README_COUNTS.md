@@ -39,7 +39,11 @@ The server holds a single in‑memory FlightList, so requests reuse loaded data 
   - Ignored if `categories` is present.
 
 - `rank_by` (string, optional; default `"total_count"`):
-  - Ranks traffic volumes by total count over the selected time range.
+  - Supported values:
+    - `"total_count"`: Ranks by total count over the selected time range.
+    - `"total_excess"`: Ranks by total overload over the selected time range, consistent with `/hotspots` semantics.
+      - `excess_per_bin = max(count_per_bin − capacity_per_bin, 0)`; bins with `capacity_per_bin = -1` are ignored (contribute 0).
+      - When `rolling_hour=true` (default), `count_per_bin` is the forward-looking 60‑minute rolling sum per bin; otherwise raw per-bin counts are used.
 
 - `rolling_hour` (boolean, optional; default `true`):
   - When true, each bin’s count is the sum over the next hour from that bin (non-wrapping).
