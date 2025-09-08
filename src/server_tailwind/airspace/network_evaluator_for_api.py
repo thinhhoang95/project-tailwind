@@ -53,6 +53,65 @@ class NetworkEvaluator:
         self.hourly_capacity_by_tv: Dict[str, Dict[int, float]] = {}
         self._process_capacity_data()
 
+    # ---------------- Rolling-hour sliding helpers ----------------
+    def _apply_rolling_hour_forward(self, matrix_2d: np.ndarray, window_bins: int) -> np.ndarray:
+        """
+        Forward-looking rolling sum with window size 'window_bins' along axis=1.
+        For each bin j, result[:, j] = sum(matrix_2d[:, j : j+window_bins]) truncated at end.
+        """
+        if window_bins <= 1:
+            return matrix_2d.astype(np.float32, copy=False)
+        num_tvs, num_bins = matrix_2d.shape
+        # cumulative sum with zero at start for easy windowed differences
+        cs = np.cumsum(
+            np.concatenate([np.zeros((num_tvs, 1), dtype=np.float32), matrix_2d.astype(np.float32, copy=False)], axis=1),
+            axis=1,
+            dtype=np.float64,
+        )
+        out = np.empty_like(matrix_2d, dtype=np.float32)
+        for j in range(num_bins):
+            j2 = min(num_bins, j + window_bins)
+            out[:, j] = cs[:, j2] - cs[:, j]
+        return out
+
+    def _build_capacity_per_bin_matrix(self) -> np.ndarray:
+        """
+        Build per-bin capacity matrix shaped [num_tvs, bins_per_tv], repeating the hourly
+        capacity value across all bins within that hour. Unknown/missing capacity is -1.0.
+        """
+        num_tvs = len(self.tv_id_to_idx)
+        if num_tvs == 0:
+            return np.zeros((0, 0), dtype=np.float32)
+        num_tvtws = int(self.flight_list.num_tvtws)
+        bins_per_tv = int(num_tvtws // num_tvs)
+        if bins_per_tv <= 0:
+            return np.zeros((num_tvs, 0), dtype=np.float32)
+        # Integer bins per hour (assumed divisible in our datasets)
+        bins_per_hour = max(1, 60 // int(self.time_bin_minutes))
+        cap = np.full((num_tvs, bins_per_tv), -1.0, dtype=np.float32)
+        # Fill by tv row index
+        for tv_id, row_idx in self.tv_id_to_idx.items():
+            per_hour = self.hourly_capacity_by_tv.get(tv_id, {}) or {}
+            if not per_hour:
+                continue
+            for h, c in per_hour.items():
+                try:
+                    hh = int(h)
+                    start = hh * bins_per_hour
+                    end = min(start + bins_per_hour, bins_per_tv)
+                    if 0 <= start < bins_per_tv:
+                        cap[int(row_idx), start:end] = float(c)
+                except Exception:
+                    continue
+        return cap
+
+    def _format_bin_start_label(self, bin_offset: int) -> str:
+        """Format a bin start time label "HH:MM" from a bin offset within a TV."""
+        start_total_min = int(bin_offset * int(self.time_bin_minutes))
+        start_hour = (start_total_min // 60) % 24
+        start_min = start_total_min % 60
+        return f"{start_hour:02d}:{start_min:02d}"
+
     def update_flight_list(self, new_flight_list: FlightList) -> None:
         """
         Update the flight_list reference for evaluation with a new state.
@@ -963,6 +1022,116 @@ class NetworkEvaluator:
         results.sort(key=lambda x: x["z_sum"], reverse=True)
         
         return results
+
+    def get_hotspot_segments(self, threshold: float = 0.0) -> List[Dict[str, Any]]:
+        """
+        Detect hotspots using a sliding rolling-hour count at each bin (stride = time_bin_minutes).
+        A bin is overloaded when (rolling_count - capacity_per_bin) > threshold and capacity_per_bin >= 0.
+        Consecutive overloaded bins for the same TV are merged into contiguous segments.
+
+        Returns:
+            List of segment dicts with keys:
+              - traffic_volume_id: str
+              - start_bin: int (inclusive)
+              - end_bin: int (inclusive)
+              - start_label: "HH:MM" (bin start)
+              - end_label: "HH:MM" (bin start)
+              - time_bin_minutes: int
+              - window_minutes: int (rolling window, 60)
+              - max_excess: float
+              - sum_excess: float
+              - peak_rolling_count: float
+              - capacity_stats: {"min": float, "max": float}
+        """
+        # Dimensions and base arrays
+        num_tvs = len(self.tv_id_to_idx)
+        if num_tvs == 0:
+            return []
+        total_occ = self.flight_list.get_total_occupancy_by_tvtw().astype(np.float32, copy=False)
+        num_tvtws = int(self.flight_list.num_tvtws)
+        bins_per_tv = int(num_tvtws // num_tvs)
+        if bins_per_tv <= 0:
+            return []
+
+        # Reshape to [num_tvs, bins_per_tv]
+        per_tv = np.zeros((num_tvs, bins_per_tv), dtype=np.float32)
+        # Build stable row order mapping
+        tv_items = sorted(self.tv_id_to_idx.items(), key=lambda kv: kv[1])
+        for tv_id, row_idx in tv_items:
+            start = int(row_idx) * bins_per_tv
+            end = start + bins_per_tv
+            per_tv[int(row_idx), :] = total_occ[start:end]
+
+        # Rolling-hour window
+        window_bins = int(np.ceil(60.0 / float(int(self.time_bin_minutes))))
+        window_bins = max(1, window_bins)
+        rolling = self._apply_rolling_hour_forward(per_tv, window_bins)
+
+        # Capacity per bin matrix (hourly value repeated across bins in that hour)
+        cap = self._build_capacity_per_bin_matrix()
+
+        segments: List[Dict[str, Any]] = []
+        thr = float(threshold)
+        # Iterate TVs in row order for stable output
+        for tv_id, row_idx in tv_items:
+            r = int(row_idx)
+            cap_row = cap[r, :]
+            roll_row = rolling[r, :]
+            # diff only where capacity is valid (>=0); otherwise mark as -inf to avoid inclusion
+            valid = cap_row >= 0.0
+            diff = np.where(valid, roll_row - cap_row, -np.inf)
+            # Build boolean mask for overloaded bins
+            overloaded = diff > thr
+
+            # Find contiguous segments of True values
+            i = 0
+            while i < bins_per_tv:
+                if not overloaded[i]:
+                    i += 1
+                    continue
+                # start of a segment
+                start_bin = i
+                j = i + 1
+                while j < bins_per_tv and overloaded[j]:
+                    j += 1
+                end_bin = j - 1  # inclusive
+
+                # Stats across the segment
+                seg_slice = slice(start_bin, end_bin + 1)
+                seg_diff = diff[seg_slice]
+                seg_roll = roll_row[seg_slice]
+                seg_cap = cap_row[seg_slice]
+                max_excess = float(np.max(seg_diff)) if seg_diff.size > 0 else 0.0
+                sum_excess = float(np.sum(seg_diff[seg_diff > -np.inf])) if seg_diff.size > 0 else 0.0
+                peak_rolling = float(np.max(seg_roll)) if seg_roll.size > 0 else 0.0
+                cap_min = float(np.min(seg_cap)) if seg_cap.size > 0 else -1.0
+                cap_max = float(np.max(seg_cap)) if seg_cap.size > 0 else -1.0
+
+                start_label = self._format_bin_start_label(start_bin)
+                end_label = self._format_bin_start_label(end_bin)
+
+                segments.append(
+                    {
+                        "traffic_volume_id": tv_id,
+                        "start_bin": int(start_bin),
+                        "end_bin": int(end_bin),
+                        "start_label": start_label,
+                        "end_label": end_label,
+                        "time_bin_minutes": int(self.time_bin_minutes),
+                        "window_minutes": 60,
+                        "max_excess": float(max_excess),
+                        "sum_excess": float(sum_excess),
+                        "peak_rolling_count": float(peak_rolling),
+                        "capacity_stats": {"min": float(cap_min), "max": float(cap_max)},
+                    }
+                )
+
+                # Move to next after this segment
+                i = j
+
+        # Sort by severity (max_excess), then by tv and start bin for stability
+        segments.sort(key=lambda s: (-float(s.get("max_excess", 0.0)), str(s.get("traffic_volume_id", "")), int(s.get("start_bin", 0))))
+        return segments
 
     def get_traffic_volume_flights_ordered_by_ref_time(
         self, traffic_volume_id: str, ref_time_str: str

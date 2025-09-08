@@ -443,32 +443,58 @@ class AirspaceAPIWrapper:
 
     async def get_hotspots(self, threshold: float = 0.0) -> Dict[str, Any]:
         """
-        Get list of hotspots (traffic volumes where capacity exceeds demand).
+        Get sliding rolling-hour hotspots as contiguous overloaded segments per TV.
         
         Args:
             threshold: Minimum excess traffic to consider as overloaded
             
         Returns:
-            Dictionary with hotspot information including traffic_volume_id, 
-            time_bin, z_max, z_sum, and other statistics
+            Dictionary with segment-based hotspot information. Each segment groups
+            consecutive overloaded bins where rolling-hour count exceeds per-bin capacity.
         """
         self._ensure_evaluator_ready()
         
         loop = asyncio.get_event_loop()
         try:
-            hotspots = await loop.run_in_executor(
+            segments = await loop.run_in_executor(
                 self._executor,
-                self._evaluator.get_hotspots,
+                self._evaluator.get_hotspot_segments,
                 threshold
             )
-            
+            # Map segments into the legacy-like "hotspots" list while preserving new semantics
+            hotspots = []
+            for seg in segments:
+                try:
+                    time_bin = f"{seg.get('start_label')}-{seg.get('end_label')}"
+                    cap_stats = seg.get("capacity_stats", {}) or {}
+                    # Maintain legacy keys: map rolling metrics into analogous fields
+                    peak_rolling = float(seg.get("peak_rolling_count", 0.0))
+                    # Use conservative capacity across the segment
+                    cap_min = float(cap_stats.get("min", -1.0)) if cap_stats else -1.0
+                    hotspots.append(
+                        {
+                            "traffic_volume_id": seg.get("traffic_volume_id"),
+                            "time_bin": time_bin,
+                            "z_max": float(seg.get("max_excess", 0.0)),
+                            "z_sum": float(seg.get("sum_excess", 0.0)),
+                            # Legacy naming: provide peak rolling occupancy under hourly_occupancy
+                            "hourly_occupancy": peak_rolling,
+                            # Provide a single capacity value; choose min across segment for safety
+                            "hourly_capacity": cap_min,
+                            # Always overloaded for returned segments
+                            "is_overloaded": True,
+                        }
+                    )
+                except Exception:
+                    continue
+
             return {
                 "hotspots": hotspots,
                 "count": len(hotspots),
                 "metadata": {
                     "threshold": threshold,
                     "time_bin_minutes": self._evaluator.time_bin_minutes,
-                    "analysis_type": "hourly_excess_capacity"
+                    "analysis_type": "rolling_hour_sliding"
                 }
             }
             
