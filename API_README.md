@@ -11,7 +11,7 @@ This FastAPI server provides endpoints for analyzing traffic volume occupancy da
 - **`/flow_extraction`** - Compute community assignments for flights near a reference time using Jaccard similarity and Leiden clustering
 - **`/traffic_volumes`** - List all available traffic volume IDs
 - **`/tv_count_with_capacity`** - Get occupancy counts along with hourly capacity for a traffic volume
-- **`/hotspots`** - Get list of hotspots where traffic volume exceeds capacity with detailed statistics
+- **`/hotspots`** - Get list of hotspots detected via sliding rolling-hour counts (contiguous overloaded segments per TV) with detailed statistics
 - **`/slack_distribution`** - For a source TV and reference time, returns per-TV slack at the query bin shifted by nominal travel time (475 kts), with an optional additional shift `delta_min` (minutes)
 - **`/regulation_plan_simulation`** - Simulate a regulation plan to get per-flight delays, objective metrics, and top-K busiest TVs (rolling-hour occupancy) ranked over the union of the plan's active time windows (pre/post)
 - **Data Science Integration** - Uses `NetworkEvaluator` for computational analysis
@@ -244,7 +244,9 @@ Returns list of available traffic volume IDs.
 
 ### GET `/hotspots?threshold={value}`
 
-Returns list of hotspots (traffic volume and time bin combinations where capacity exceeds demands) with detailed statistics including z_max and z_sum metrics.
+Returns hotspots detected using a sliding rolling-hour window at each time bin (stride = `time_bin_minutes`).
+- A bin is overloaded when `rolling_count(bin) − capacity_per_bin(bin) > threshold` and capacity is defined.
+- Consecutive overloaded bins for the same TV are merged into one contiguous segment.
 
 **Parameters:**
 - `threshold` (float, optional): Minimum excess traffic to consider as overloaded (default: 0.0)
@@ -255,18 +257,18 @@ Returns list of hotspots (traffic volume and time bin combinations where capacit
   "hotspots": [
     {
       "traffic_volume_id": "MASB5KL",
-      "time_bin": "06:00-07:00",
+      "time_bin": "08:15-08:30",
       "z_max": 12.5,
-      "z_sum": 45.2,
+      "z_sum": 22.0,
       "hourly_occupancy": 67.0,
       "hourly_capacity": 55.0,
       "is_overloaded": true
     },
     {
       "traffic_volume_id": "TV001",
-      "time_bin": "08:00-09:00", 
+      "time_bin": "09:00-09:45",
       "z_max": 8.3,
-      "z_sum": 32.1,
+      "z_sum": 18.1,
       "hourly_occupancy": 43.0,
       "hourly_capacity": 35.0,
       "is_overloaded": true
@@ -276,7 +278,7 @@ Returns list of hotspots (traffic volume and time bin combinations where capacit
   "metadata": {
     "threshold": 0.0,
     "time_bin_minutes": 15,
-    "analysis_type": "hourly_excess_capacity"
+    "analysis_type": "rolling_hour_sliding"
   }
 }
 ```
@@ -344,12 +346,15 @@ Accepts flexible time formats for `ref_time_str`: `HHMMSS`, `HHMM`, `HH:MM`, `HH
 
 **Response Fields:**
 - `traffic_volume_id`: String identifier for the traffic volume
-- `time_bin`: Hourly time window in format "HH:00-HH+1:00"
-- `z_max`: Maximum excess traffic within the time bin
-- `z_sum`: Total excess traffic within the time bin  
-- `hourly_occupancy`: Actual traffic volume for the hour
-- `hourly_capacity`: Maximum capacity for the hour
-- `is_overloaded`: Boolean indicating if occupancy exceeds capacity
+- `time_bin`: Contiguous overloaded period labeled by bin starts, formatted `HH:MM-HH:MM` (e.g., `08:15-08:30`). This represents the union of overloaded bins detected by sliding a 60‑minute window across `time_bin_minutes` steps.
+- `z_max`: Maximum excess `(rolling_count − capacity_per_bin)` within the segment
+- `z_sum`: Sum of excess over all bins within the segment
+- `hourly_occupancy`: Peak rolling-hour occupancy within the segment (compatibility name)
+- `hourly_capacity`: Capacity baseline across the segment (minimum hourly capacity encountered within the segment)
+- `is_overloaded`: Always true for returned entries
+
+Notes
+- Capacity alignment is consistent with `/original_counts`: hourly capacity values are repeated across all bins within that hour, and bins without capacity use `-1` (not considered in overload detection and break segments).
 
 ### POST `/regulation_plan_simulation`
 
