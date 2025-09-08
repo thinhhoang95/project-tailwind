@@ -171,6 +171,19 @@ class CountAPIWrapper:
         self._total_occupancy_vector = vec
         return vec
 
+    def _get_capacity_slice(self, slice_start: int, slice_end_inclusive: int) -> np.ndarray:
+        """
+        Return a capacity-per-bin slice for all TVs over [slice_start, slice_end_inclusive].
+        If capacity is unavailable, return a matrix filled with -1.0 of shape [num_tvs, num_bins].
+        """
+        num_tvs = len(self._flight_list.tv_id_to_idx)
+        num_bins = int(slice_end_inclusive) - int(slice_start) + 1
+        if self._capacity_per_bin_matrix is None:
+            return np.full((int(num_tvs), int(num_bins)), -1.0, dtype=np.float32)
+        cap_slice = self._capacity_per_bin_matrix[:, int(slice_start) : int(slice_end_inclusive) + 1]
+        # Ensure dtype and contiguous behavior
+        return np.asarray(cap_slice, dtype=np.float32)
+
     # ---------- Core computation ----------
     def _aggregate_vector_for_rows(self, rows_arr: Optional[np.ndarray]) -> np.ndarray:
         """
@@ -442,10 +455,20 @@ class CountAPIWrapper:
         slice_start = int(start_bin)
         slice_end_inclusive = int(end_bin)
         sliced = rolled_matrix[:, slice_start : slice_end_inclusive + 1]
-        if rank_by != "total_count":
-            # For now only total_count supported; fall back to total_count
-            rank_by = "total_count"
-        scores = sliced.sum(axis=1)
+        if rank_by == "total_excess":
+            # Compute total excess = sum(max(count - capacity_per_bin, 0)) over bins with capacity defined
+            cap_slice = self._get_capacity_slice(slice_start, slice_end_inclusive)
+            diff = sliced.astype(np.float32, copy=False) - cap_slice
+            # Ignore bins without capacity (-1); clamp negatives to 0
+            valid = cap_slice >= 0.0
+            diff = np.where(valid, diff, 0.0)
+            excess = np.maximum(diff, 0.0)
+            scores = excess.sum(axis=1)
+        else:
+            # Default: total_count
+            if rank_by != "total_count":
+                rank_by = "total_count"
+            scores = sliced.sum(axis=1)
         # Top-K indices
         k = min(int(top_k), num_total_tvs)
         top_indices = np.argsort(-scores, kind="stable")[:k]
