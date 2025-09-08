@@ -223,7 +223,7 @@ async def original_counts(request: Dict[str, Any]) -> Dict[str, Any]:
     - to_time_str: str (optional; same formats; required if from_time_str provided)
     - categories: dict[str -> list[str]] (optional category -> flight_ids)
     - flight_ids: list[str] (optional; ignored if categories present). When present and categories are absent, only these flights are counted.
-    - rank_by: str (optional; default "total_count")
+    - rank_by: str (optional; default "total_count"). Supported: "total_count", "total_excess".
     - rolling_hour: bool (optional; default true). When true, each bin's count is the sum over the next hour.
     - include_overall: bool (accepted for backward-compatibility; counts are always included for the top 50 TVs)
 
@@ -241,7 +241,7 @@ async def original_counts(request: Dict[str, Any]) -> Dict[str, Any]:
         categories = request.get("categories")
         flight_ids = request.get("flight_ids")
         include_overall = bool(request.get("include_overall", True))
-        rank_by = str(request.get("rank_by", "total_count"))
+        rank_by = str(request.get("rank_by", "total_excess"))
         rolling_hour = bool(request.get("rolling_hour", True))
 
         result = await count_wrapper.get_original_counts(
