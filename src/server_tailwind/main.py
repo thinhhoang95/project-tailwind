@@ -43,7 +43,7 @@ from .auth import (
 )
 
 @app.get("/")
-async def root():
+async def root(current_user: dict = Depends(get_current_user)):
     """Root endpoint providing API information."""
     return {"message": "Airspace Traffic Analysis API", "version": "1.0.0"}
 
@@ -54,7 +54,12 @@ async def login(form: OAuth2PasswordRequestForm = Depends()):
     if not user:
         raise HTTPException(status_code=400, detail="Incorrect username or password")
     token = create_access_token({"sub": user["username"]}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    return {"access_token": token, "token_type": "bearer"}
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "display_name": user.get("display_name"),
+        "organization": user.get("organization"),
+    }
 
 
 @app.get("/protected")
@@ -62,7 +67,7 @@ async def protected_route(current_user: dict = Depends(get_current_user)):
     return {"hello": current_user["username"]}
 
 @app.get("/tv_count")
-async def get_tv_count(traffic_volume_id: str) -> Dict[str, Any]:
+async def get_tv_count(traffic_volume_id: str, current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Get occupancy count for all time windows of a specific traffic volume.
     
@@ -82,7 +87,7 @@ async def get_tv_count(traffic_volume_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/tv_count_with_capacity")
-async def get_tv_count_with_capacity(traffic_volume_id: str) -> Dict[str, Any]:
+async def get_tv_count_with_capacity(traffic_volume_id: str, current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Get occupancy counts for all time windows of a specific traffic volume,
     along with the hourly capacity from the GeoJSON.
@@ -103,7 +108,8 @@ async def get_tv_count_with_capacity(traffic_volume_id: str) -> Dict[str, Any]:
 
 @app.get("/slack_distribution")
 async def get_slack_distribution(
-    traffic_volume_id: str, ref_time_str: str, sign: str, delta_min: float = 0.0
+    traffic_volume_id: str, ref_time_str: str, sign: str, delta_min: float = 0.0,
+    current_user: dict = Depends(get_current_user)
 ) -> Dict[str, Any]:
     """
     Get slack distribution across all TVs by shifting the reference bin by nominal travel time.
@@ -131,7 +137,7 @@ async def get_slack_distribution(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/traffic_volumes")
-async def get_traffic_volumes() -> Dict[str, Any]:
+async def get_traffic_volumes(current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Get list of available traffic volume IDs.
     
@@ -145,7 +151,7 @@ async def get_traffic_volumes() -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/tv_flights")
-async def get_tv_flights(traffic_volume_id: str) -> Dict[str, Any]:
+async def get_tv_flights(traffic_volume_id: str, current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Get flight identifiers grouped by time window for a specific traffic volume.
 
@@ -160,7 +166,7 @@ async def get_tv_flights(traffic_volume_id: str) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/tv_flights_ordered")
-async def get_tv_flights_ordered(traffic_volume_id: str, ref_time_str: str) -> Dict[str, Any]:
+async def get_tv_flights_ordered(traffic_volume_id: str, ref_time_str: str, current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Get all flights for a traffic volume ordered by proximity to ref_time_str.
 
@@ -185,6 +191,7 @@ async def get_flow_extraction(
     flight_ids: Optional[str] = None,
     seed: Optional[int] = None,
     limit: Optional[int] = None,
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """
     Run flow extraction to assign community labels to flights near a reference time.
@@ -222,6 +229,7 @@ async def get_flows(
     to_time_str: Optional[str] = Query(None, description="End time (HHMM or HHMMSS or HH:MM[:SS])"),
     threshold: Optional[float] = Query(None, description="Jaccard cutoff in [0,1] for clustering (default 0.1)"),
     resolution: Optional[float] = Query(None, description="Leiden resolution (>0), higher yields more clusters (default 1.0)"),
+    current_user: dict = Depends(get_current_user),
 ) -> Any:
     try:
         return await flows_wrapper.get_flows(
@@ -237,7 +245,7 @@ async def get_flows(
         raise HTTPException(status_code=500, detail=f"Failed to compute flows: {str(e)}")
 
 @app.post("/original_counts")
-async def original_counts(request: Dict[str, Any]) -> Dict[str, Any]:
+async def original_counts(request: Dict[str, Any], current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Compute occupancy counts over traffic volumes with optional time range, ranking and rolling-hour mode.
 
@@ -290,7 +298,7 @@ async def original_counts(request: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/hotspots")
-async def get_hotspots(threshold: float = 0.0) -> Dict[str, Any]:
+async def get_hotspots(threshold: float = 0.0, current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Get list of hotspots (traffic volume and time bin where capacity exceeds demands).
     
@@ -313,6 +321,7 @@ async def get_regulation_ranking_tv_flights_ordered(
     seed_flight_ids: str,
     duration_min: Optional[int] = None,
     top_k: Optional[int] = None,
+    current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """
     Return flights passing a traffic volume near a reference time, ordered by proximity.
@@ -341,7 +350,7 @@ async def get_regulation_ranking_tv_flights_ordered(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/regulation_plan_simulation")
-async def regulation_plan_simulation(request: Dict[str, Any]) -> Dict[str, Any]:
+async def regulation_plan_simulation(request: Dict[str, Any], current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Simulate a regulation plan and return:
     - per-flight delays and delay stats
@@ -375,7 +384,7 @@ async def regulation_plan_simulation(request: Dict[str, Any]) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/base_evaluation")
-def post_base_evaluation(payload: dict):
+def post_base_evaluation(payload: dict, current_user: dict = Depends(get_current_user)):
     # Minimal validation: require targets and flows to be present
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="JSON body must be an object")
@@ -396,7 +405,7 @@ def post_base_evaluation(payload: dict):
 
 
 @app.post("/automatic_rate_adjustment")
-def post_automatic_rate_adjustment(payload: dict):
+def post_automatic_rate_adjustment(payload: dict, current_user: dict = Depends(get_current_user)):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="JSON body required")
     if not payload.get("targets"):
@@ -416,7 +425,7 @@ def post_automatic_rate_adjustment(payload: dict):
 
 
 @app.post("/autorate_occupancy")
-def post_autorate_occupancy(payload: dict):
+def post_autorate_occupancy(payload: dict, current_user: dict = Depends(get_current_user)):
     """
     Aggregate pre/post occupancy across flows for TVs present in a prior
     /automatic_rate_adjustment response. No optimization is run.
