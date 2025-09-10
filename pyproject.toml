@@ -38,7 +38,9 @@ dependencies = [
     "tqdm",
     "pyroaring",
     "orjson",
-    "alns"
+    "alns",
+    "python-jose[cryptography]",
+    "passlib[bcrypt]"
 ]
 
 [project.optional-dependencies]

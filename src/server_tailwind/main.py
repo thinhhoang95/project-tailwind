@@ -3,7 +3,9 @@ FastAPI server for airspace traffic analysis.
 Provides endpoints for traffic volume occupancy analysis.
 """
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi.security import OAuth2PasswordRequestForm
+from datetime import timedelta
 from typing import Dict, Any, Optional
 from .airspace.airspace_api_wrapper import AirspaceAPIWrapper
 from .deepflow.flows_api_wrapper import FlowsWrapper
@@ -32,10 +34,32 @@ airspace_wrapper = AirspaceAPIWrapper()
 flows_wrapper = FlowsWrapper()
 count_wrapper = CountAPIWrapper()
 
+# Auth utilities (kept separate so endpoints remain pure)
+from .auth import (
+    authenticate_user,
+    create_access_token,
+    get_current_user,
+    ACCESS_TOKEN_EXPIRE_MINUTES,
+)
+
 @app.get("/")
 async def root():
     """Root endpoint providing API information."""
     return {"message": "Airspace Traffic Analysis API", "version": "1.0.0"}
+
+
+@app.post("/token")
+async def login(form: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate_user(form.username, form.password)
+    if not user:
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+    token = create_access_token({"sub": user["username"]}, timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.get("/protected")
+async def protected_route(current_user: dict = Depends(get_current_user)):
+    return {"hello": current_user["username"]}
 
 @app.get("/tv_count")
 async def get_tv_count(traffic_volume_id: str) -> Dict[str, Any]:
