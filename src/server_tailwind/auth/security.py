@@ -6,7 +6,7 @@ from passlib.context import CryptContext
 # Configurable via env var in real deployments; use default for dev
 SECRET_KEY = os.getenv("TAILWIND_SECRET_KEY", "change-me")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("TAILWIND_ACCESS_TOKEN_MINUTES", "30"))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("TAILWIND_ACCESS_TOKEN_MINUTES", "1440"))
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
