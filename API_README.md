@@ -14,6 +14,9 @@ This FastAPI server provides endpoints for analyzing traffic volume occupancy da
 - **`/hotspots`** - Get list of hotspots detected via sliding rolling-hour counts (contiguous overloaded segments per TV) with detailed statistics
 - **`/slack_distribution`** - For a source TV and reference time, returns per-TV slack at the query bin shifted by nominal travel time (475 kts), with an optional additional shift `delta_min` (minutes)
 - **`/regulation_plan_simulation`** - Simulate a regulation plan to get per-flight delays, objective metrics, and top-K busiest TVs (rolling-hour occupancy) ranked over the union of the plan's active time windows (pre/post)
+- **Authentication** - OAuth2 password flow with JWT access tokens
+- **`/token`** - Issue access token (demo user: `alice` / `secret123`)
+- **`/protected`** - Example protected endpoint requiring `Authorization: Bearer <token>`
 - **Data Science Integration** - Uses `NetworkEvaluator` for computational analysis
 - **Network Abstraction** - `AirspaceAPIWrapper` handles network layer and JSON serialization
 
@@ -38,6 +41,52 @@ The server will start on `http://localhost:8000`
 Visit `http://localhost:8000/docs` for Swagger UI documentation
 
 ## API Endpoints
+
+### Authentication
+
+JWT bearer authentication is available using the OAuth2 password flow. In development, a demo user is provided.
+
+Environment variables (optional):
+- `TAILWIND_SECRET_KEY`: Secret key used to sign JWTs (default: `change-me`).
+- `TAILWIND_ACCESS_TOKEN_MINUTES`: Token expiry in minutes (default: `30`).
+
+Demo credentials:
+- `username`: `alice`
+- `password`: `secret123`
+
+#### POST `/token`
+
+Obtain an access token using form data.
+
+Content type: `application/x-www-form-urlencoded`
+
+Form fields:
+- `username`: user name
+- `password`: user password
+
+Response:
+```json
+{ "access_token": "<jwt>", "token_type": "bearer" }
+```
+
+Example:
+```bash
+curl -X POST "http://localhost:8000/token" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "username=alice&password=secret123"
+```
+
+#### GET `/protected`
+
+Example protected route. Requires header `Authorization: Bearer <token>`.
+
+Example:
+```bash
+TOKEN=$(curl -s -X POST http://localhost:8000/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'username=alice&password=secret123' | python -c 'import sys, json; print(json.load(sys.stdin)["access_token"])')
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/protected
+```
 
 ### GET `/tv_count?traffic_volume_id={id}`
 
