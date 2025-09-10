@@ -2,6 +2,30 @@
 
 This FastAPI server provides endpoints for analyzing traffic volume occupancy data in airspace management systems.
 
+## Authentication Quickstart
+
+All endpoints (except `POST /token`) require a JWT bearer token.
+
+- Get a token:
+  - `POST /token` with form fields `username` and `password` (`application/x-www-form-urlencoded`).
+  - Demo users (for local dev):
+    - `nm@intuelle.com` / `nm123`
+    - `thinh.hoangdinh@enac.fr` / `Vy011195`
+- Use the token: add header `Authorization: Bearer <token>` to every request.
+
+Examples:
+```bash
+# Obtain a token
+TOKEN=$(curl -s -X POST http://localhost:8000/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'username=nm@intuelle.com&password=nm123' | \
+  python -c 'import sys, json; print(json.load(sys.stdin)["access_token"])')
+
+# Call a protected endpoint
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/traffic_volumes"
+```
+
 ## Features
 
 - **`/tv_count`** - Get occupancy counts for all time windows of a specific traffic volume
@@ -15,7 +39,7 @@ This FastAPI server provides endpoints for analyzing traffic volume occupancy da
 - **`/slack_distribution`** - For a source TV and reference time, returns per-TV slack at the query bin shifted by nominal travel time (475 kts), with an optional additional shift `delta_min` (minutes)
 - **`/regulation_plan_simulation`** - Simulate a regulation plan to get per-flight delays, objective metrics, and top-K busiest TVs (rolling-hour occupancy) ranked over the union of the plan's active time windows (pre/post)
 - **Authentication** - OAuth2 password flow with JWT access tokens
-- **`/token`** - Issue access token (demo user: `alice` / `secret123`)
+- **`/token`** - Issue access token and user info (`display_name`, `organization`) (demo users: `nm@intuelle.com` / `nm123`, `thinh.hoangdinh@enac.fr` / `Vy011195`)
 - **`/protected`** - Example protected endpoint requiring `Authorization: Bearer <token>`
 - **Data Science Integration** - Uses `NetworkEvaluator` for computational analysis
 - **Network Abstraction** - `AirspaceAPIWrapper` handles network layer and JSON serialization
@@ -51,8 +75,8 @@ Environment variables (optional):
 - `TAILWIND_ACCESS_TOKEN_MINUTES`: Token expiry in minutes (default: `30`).
 
 Demo credentials:
-- `username`: `alice`
-- `password`: `secret123`
+- `username`: `nm@intuelle.com`, `password`: `nm123`
+- `username`: `thinh.hoangdinh@enac.fr`, `password`: `Vy011195`
 
 #### POST `/token`
 
@@ -66,14 +90,19 @@ Form fields:
 
 Response:
 ```json
-{ "access_token": "<jwt>", "token_type": "bearer" }
+{
+  "access_token": "<jwt>",
+  "token_type": "bearer",
+  "display_name": "<display name>",
+  "organization": "<organization>"
+}
 ```
 
 Example:
 ```bash
 curl -X POST "http://localhost:8000/token" \
   -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "username=alice&password=secret123"
+  -d "username=nm@intuelle.com&password=nm123"
 ```
 
 #### GET `/protected`
@@ -84,7 +113,7 @@ Example:
 ```bash
 TOKEN=$(curl -s -X POST http://localhost:8000/token \
   -H 'Content-Type: application/x-www-form-urlencoded' \
-  -d 'username=alice&password=secret123' | python -c 'import sys, json; print(json.load(sys.stdin)["access_token"])')
+  -d 'username=nm@intuelle.com&password=nm123' | python -c 'import sys, json; print(json.load(sys.stdin)["access_token"])')
 curl -H "Authorization: Bearer $TOKEN" http://localhost:8000/protected
 ```
 
@@ -527,25 +556,33 @@ python test_api.py
 ```
 
 ### HTTP Client Testing
-With server running:
+With server running (and a valid token in `$TOKEN`):
 ```bash
-curl "http://localhost:8000/tv_count?traffic_volume_id=MASB5KL"
+TOKEN=$(curl -s -X POST http://localhost:8000/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'username=nm@intuelle.com&password=nm123' | python -c 'import sys, json; print(json.load(sys.stdin)["access_token"])')
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/tv_count?traffic_volume_id=MASB5KL"
 ```
 
 ```bash
-curl "http://localhost:8000/tv_flights?traffic_volume_id=MASB5KL"
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/tv_flights?traffic_volume_id=MASB5KL"
 ```
 
 ```bash
-curl "http://localhost:8000/tv_flights_ordered?traffic_volume_id=MASB5KL&ref_time_str=080010"
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/tv_flights_ordered?traffic_volume_id=MASB5KL&ref_time_str=080010"
 ```
 
 ```bash
-curl "http://localhost:8000/regulation_ranking_tv_flights_ordered?traffic_volume_id=MASB5KL&ref_time_str=080010&seed_flight_ids=0200AFRAM650E,3944E1AFR96RF&top_k=20"
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/regulation_ranking_tv_flights_ordered?traffic_volume_id=MASB5KL&ref_time_str=080010&seed_flight_ids=0200AFRAM650E,3944E1AFR96RF&top_k=20"
 ```
 
 ```bash
-curl "http://localhost:8000/hotspots?threshold=0.0"
+curl -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8000/hotspots?threshold=0.0"
 ```
 
 ## Configuration
