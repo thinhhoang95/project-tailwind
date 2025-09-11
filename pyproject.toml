@@ -40,7 +40,8 @@ dependencies = [
     "orjson",
     "alns",
     "python-jose[cryptography]",
-    "passlib[bcrypt]"
+    "passlib[bcrypt]",
+    "python-multipart"
 ]
 
 [project.optional-dependencies]
