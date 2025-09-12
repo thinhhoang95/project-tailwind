@@ -182,8 +182,8 @@ async def get_tv_flights_ordered(traffic_volume_id: str, ref_time_str: str, curr
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@app.get("/flow_extraction")
-async def get_flow_extraction(
+@app.get("/flow_extraction_legacy")
+async def get_flow_extraction_legacy(
     traffic_volume_id: str,
     ref_time_str: str,
     threshold: float = 0.8,
@@ -194,7 +194,7 @@ async def get_flow_extraction(
     current_user: dict = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """
-    Run flow extraction to assign community labels to flights near a reference time.
+    Legacy flow extraction using the original implementation under project_tailwind.
 
     Parameters:
     - traffic_volume_id: TV identifier
@@ -207,6 +207,47 @@ async def get_flow_extraction(
     """
     try:
         result = await airspace_wrapper.get_flow_extraction(
+            traffic_volume_id=traffic_volume_id,
+            ref_time_str=ref_time_str,
+            threshold=threshold,
+            resolution=resolution,
+            flight_ids=flight_ids,
+            seed=seed,
+            limit=limit,
+        )
+        return result
+    except ValueError as e:
+        # invalid TV id or invalid ref time, etc.
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.get("/flow_extraction")
+async def get_flow_extraction(
+    traffic_volume_id: str,
+    ref_time_str: str,
+    threshold: float = 0.8,
+    resolution: float = 1.0,
+    flight_ids: Optional[str] = None,
+    seed: Optional[int] = None,
+    limit: Optional[int] = None,
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """
+    Flow extraction that uses parrhesia's implementation to assign community labels
+    to flights near a reference time.
+
+    Parameters:
+    - traffic_volume_id: TV identifier
+    - ref_time_str: reference time in HHMMSS (or HHMM) format; HH:MM and HH:MM:SS also accepted
+    - threshold: similarity threshold for graph edges (default 0.8)
+    - resolution: Leiden resolution parameter (default 1.0)
+    - flight_ids: optional comma-separated flight IDs to cluster; if provided, community detection runs only on these flights
+    - seed: optional random seed for Leiden
+    - limit: optional cap on number of closest flights to include
+    """
+    try:
+        result = await airspace_wrapper.get_flow_extraction_parrhesia(
             traffic_volume_id=traffic_volume_id,
             ref_time_str=ref_time_str,
             threshold=threshold,
