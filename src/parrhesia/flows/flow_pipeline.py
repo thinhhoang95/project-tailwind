@@ -7,7 +7,9 @@ from .flow_extractor import (
     compute_jaccard_similarity,
     run_leiden_from_similarity,
 )
-from project_tailwind.optimize.eval.flight_list import FlightList
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from project_tailwind.optimize.eval.flight_list import FlightList
 
 
 def collect_hotspot_flights(
@@ -251,6 +253,9 @@ def build_global_flows(
     >>> flows["F1"] == flows["F2"], flows["F3"] == flows["F4"], flows["F1"] != flows["F3"]
     (True, True, True)
     """
+
+    print(f"build_global_flows: {flight_list}, {union_flight_ids}, {hotspots}, {trim_policy}, {leiden_params}, {direction_opts}")
+
     ids = list(union_flight_ids)
     if len(ids) == 0:
         return {}
