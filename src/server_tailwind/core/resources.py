@@ -39,6 +39,7 @@ class AppResources:
         self._hourly_capacity_by_tv: Optional[Dict[str, Dict[int, float]]] = None
         self._capacity_per_bin_matrix: Optional[np.ndarray] = None
         self._travel_minutes: Optional[Dict[str, Dict[str, float]]] = None
+        self._tv_centroids: Optional[Dict[str, tuple]] = None
 
     def preload_all(self) -> "AppResources":
         _ = self.flight_list
@@ -143,15 +144,41 @@ class AppResources:
         with self._lock:
             if self._travel_minutes is not None:
                 return self._travel_minutes
+            # Reuse shared centroids
+            centers = self.tv_centroids
+            fl = self.flight_list
+            tv_ids = set(fl.tv_id_to_idx.keys())
+            ids = sorted(tv_ids & set(centers.keys()))
+            if not ids:
+                self._travel_minutes = {}
+                return self._travel_minutes
+            lat_arr = np.asarray([centers[i][0] for i in ids], dtype=np.float64)
+            lon_arr = np.asarray([centers[i][1] for i in ids], dtype=np.float64)
+            dist_nm = haversine_vectorized(lat_arr[:, None], lon_arr[:, None], lat_arr[None, :], lon_arr[None, :])
+            minutes = (dist_nm / float(speed_kts)) * 60.0
+            nested: Dict[str, Dict[str, float]] = {}
+            for i, src in enumerate(ids):
+                nested[src] = {ids[j]: float(minutes[i, j]) for j in range(len(ids))}
+            self._travel_minutes = nested
+            return self._travel_minutes
+
+    @property
+    def tv_centroids(self) -> Dict[str, tuple]:
+        """
+        Lazily compute and cache TV centroids in EPSG:4326 as a mapping
+        {tv_id: (lat, lon)} filtered to TVs present in the indexer/flight list.
+        """
+        with self._lock:
+            if self._tv_centroids is not None:
+                return self._tv_centroids
             gdf = self.traffic_volumes_gdf
             fl = self.flight_list
             try:
                 g = gdf.to_crs(epsg=4326) if gdf.crs and "4326" not in str(gdf.crs) else gdf
             except Exception:
                 g = gdf
-            lat: Dict[str, float] = {}
-            lon: Dict[str, float] = {}
             tv_ids = set(fl.tv_id_to_idx.keys())
+            out: Dict[str, tuple] = {}
             for _, row in g.iterrows():
                 tv_id = row.get("traffic_volume_id")
                 if tv_id is None:
@@ -164,23 +191,11 @@ class AppResources:
                     continue
                 try:
                     c = geom.centroid
-                    lat[tv_id] = float(c.y)
-                    lon[tv_id] = float(c.x)
+                    out[tv_id] = (float(c.y), float(c.x))
                 except Exception:
                     continue
-            ids = sorted(tv_ids & lat.keys() & lon.keys())
-            if not ids:
-                self._travel_minutes = {}
-                return self._travel_minutes
-            lat_arr = np.asarray([lat[i] for i in ids], dtype=np.float64)
-            lon_arr = np.asarray([lon[i] for i in ids], dtype=np.float64)
-            dist_nm = haversine_vectorized(lat_arr[:, None], lon_arr[:, None], lat_arr[None, :], lon_arr[None, :])
-            minutes = (dist_nm / float(speed_kts)) * 60.0
-            nested: Dict[str, Dict[str, float]] = {}
-            for i, src in enumerate(ids):
-                nested[src] = {ids[j]: float(minutes[i, j]) for j in range(len(ids))}
-            self._travel_minutes = nested
-            return self._travel_minutes
+            self._tv_centroids = out
+            return self._tv_centroids
 
 
 _GLOBAL_RESOURCES: Optional[AppResources] = None
@@ -193,5 +208,4 @@ def get_resources() -> AppResources:
         if _GLOBAL_RESOURCES is None:
             _GLOBAL_RESOURCES = AppResources()
         return _GLOBAL_RESOURCES
-
 

@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 # Import compute_flows directly from the parrhesia package
 from parrhesia.api.flows import compute_flows
 from server_tailwind.core.resources import get_resources
+from typing import Tuple
 
 
 class FlowsWrapper:
@@ -19,6 +20,14 @@ class FlowsWrapper:
         self._executor = ThreadPoolExecutor(max_workers=2)
         # Reuse shared TVTW indexer for time-bin conversion
         self._tvtw_indexer = get_resources().indexer
+        self._resources = get_resources()
+
+    def _retrieve_tv_centroids_from_resources(self) -> dict:
+        """Return shared centroid map {tv_id: (lat, lon)} from AppResources."""
+        try:
+            return dict(self._resources.tv_centroids)
+        except Exception:
+            return {}
 
     async def get_flows(
         self,
@@ -114,11 +123,14 @@ class FlowsWrapper:
         loop = asyncio.get_event_loop()
 
         def _compute() -> Any:
+            # Inject direction options with coord_cosine and tv_centroids
+            dir_opts = {"mode": "coord_cosine", "tv_centroids": self._retrieve_tv_centroids_from_resources()}
             return compute_flows(
                 tvs=tv_list,
                 timebins=bins_list,
                 threshold=threshold,
                 resolution=resolution,
+                direction_opts=dir_opts,
             )
 
         try:
@@ -130,5 +142,4 @@ class FlowsWrapper:
     def __del__(self):
         if hasattr(self, "_executor"):
             self._executor.shutdown(wait=True)
-
 

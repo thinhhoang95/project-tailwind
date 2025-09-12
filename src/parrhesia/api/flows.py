@@ -164,6 +164,7 @@ def compute_flows(
     flights_path: Optional[str] = None,
     threshold: Optional[float] = None,
     resolution: Optional[float] = None,
+    direction_opts: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Core implementation for the /flows endpoint.
@@ -173,6 +174,9 @@ def compute_flows(
     - timebins: optional list of time-bin indices (global filter applied to all TVs).
     - threshold: optional Jaccard cutoff in [0,1] for Leiden graph.
     - resolution: optional Leiden resolution parameter (>0).
+    - direction_opts: optional dict to control direction-aware reweighting in
+      clustering. Example:
+        {"mode": "coord_cosine", "tv_centroids": {tv_id: (lat, lon), ...}}
 
     Returns a JSON-serializable dict with:
     - num_time_bins
@@ -202,17 +206,22 @@ def compute_flows(
     _thr = 0.1 if threshold is None else float(threshold)
     _res = 1.0 if resolution is None else float(resolution)
 
+    # Directional options default to coord_cosine; allow callers to inject tv_centroids
+    _dir_opts: Dict[str, Any]
+    if isinstance(direction_opts, dict):
+        _dir_opts = dict(direction_opts)
+        if "mode" not in _dir_opts or _dir_opts.get("mode") is None:
+            _dir_opts["mode"] = "coord_cosine"
+    else:
+        _dir_opts = {"mode": "coord_cosine"}
+
     flow_map = build_global_flows(
         fl,
         union_ids,
         hotspots=hotspot_ids,
         trim_policy="earliest_hotspot",
         leiden_params={"threshold": _thr, "resolution": _res, "seed": 0},
-        direction_opts={
-            "mode": "coord_cosine",
-            # tv_centroids is optional; if not provided here, no reweighting occurs.
-            # Server layer can inject a mapping {tv_id: (lat, lon)} when available.
-        },
+        direction_opts=_dir_opts,
     )
 
     # Controlled volume and requested bins per flight in each flow

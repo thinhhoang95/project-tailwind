@@ -31,6 +31,7 @@ from project_tailwind.optimize.regulation import Regulation
 from project_tailwind.optimize.parser.regulation_parser import RegulationParser
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.subflows.flow_extractor import assign_communities_for_hotspot
+from parrhesia.flows.flow_pipeline import build_global_flows
 from server_tailwind.core.resources import get_resources
 
 
@@ -111,33 +112,13 @@ class AirspaceAPIWrapper:
         start_str = f"{start_hour:02d}:{start_min:02d}"
         return f"{start_str}-{end_str}"
 
-    def _compute_tv_centroid_latlon_map(self) -> Dict[str, Dict[str, float]]:
-        """Return mapping of tv_id -> {"lat": float, "lon": float} using centroid in EPSG:4326."""
-        gdf = self._traffic_volumes_gdf
-        if gdf.crs is None or str(gdf.crs).lower() not in ("epsg:4326", "epsg: 4326", "wgs84", "wgs 84"):
-            try:
-                gdf = gdf.to_crs(epsg=4326)
-            except Exception:
-                # Best effort: proceed without reprojection
-                pass
-
-        tv_ids = set(self._evaluator.tv_id_to_idx.keys())
-        result: Dict[str, Dict[str, float]] = {}
-        for _, row in gdf.iterrows():
-            tv_id = row.get("traffic_volume_id")
-            if tv_id not in tv_ids:
-                continue
-            geom = row.get("geometry")
-            if geom is None:
-                continue
-            try:
-                c = geom.centroid
-                lat = float(c.y)
-                lon = float(c.x)
-                result[str(tv_id)] = {"lat": lat, "lon": lon}
-            except Exception:
-                continue
-        return result
+    def _retrieve_tv_centroid_latlon_map_from_resources(self) -> Dict[str, Dict[str, float]]:
+        """Return mapping of tv_id -> {"lat": float, "lon": float} using shared resources."""
+        try:
+            centers = get_resources().tv_centroids  # {tv_id: (lat, lon)}
+            return {str(k): {"lat": float(v[0]), "lon": float(v[1])} for k, v in centers.items()}
+        except Exception:
+            return {}
 
     def _ensure_travel_minutes(self, speed_kts: float = 475.0) -> Dict[str, Dict[str, float]]:
         """
@@ -611,7 +592,7 @@ class AirspaceAPIWrapper:
             },
         }
 
-    async def get_flow_extraction(
+    async def get_flow_extraction_legacy(
         self,
         traffic_volume_id: str,
         ref_time_str: str,
@@ -623,10 +604,10 @@ class AirspaceAPIWrapper:
         limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
-        Assign community labels to flights that pass through a given traffic volume,
-        using Jaccard similarity over TV footprints and Leiden clustering.
+        LEGACY: Assign community labels using the original flow extractor
+        (project_tailwind.subflows.flow_extractor.assign_communities_for_hotspot).
 
-        This composes the existing ordered-flights query with the subflows flow_extractor.
+        This composes the existing ordered-flights query with the legacy subflows extractor.
 
         Args:
             traffic_volume_id: TV identifier
@@ -706,7 +687,7 @@ class AirspaceAPIWrapper:
             raise
         except Exception as e:
             print(
-                f"Error computing flow extraction for {traffic_volume_id} at {ref_time_str}: {e}"
+                f"Error computing legacy flow extraction for {traffic_volume_id} at {ref_time_str}: {e}"
             )
             raise e
 
@@ -719,6 +700,163 @@ class AirspaceAPIWrapper:
             groups[lab].append(fid)
 
         # Sort groups' flight lists by their proximity order when available
+        order_index: Dict[str, int] = {fid: i for i, fid in enumerate(candidate_flight_ids)}
+        for lab in list(groups.keys()):
+            groups[lab].sort(key=lambda x: order_index.get(x, 1_000_000))
+
+        return {
+            "traffic_volume_id": traffic_volume_id,
+            "ref_time_str": ref_time_str,
+            "flight_ids": candidate_flight_ids,
+            "communities": assignments,
+            "groups": {int(k): v for k, v in groups.items()},
+            "metadata": {
+                "num_flights": len(candidate_flight_ids),
+                "time_bin_minutes": self._evaluator.time_bin_minutes,
+                "threshold": float(threshold),
+                "resolution": float(resolution),
+                "source": used_source,
+            },
+        }
+
+    async def get_flow_extraction(
+        self,
+        traffic_volume_id: str,
+        ref_time_str: str,
+        *,
+        threshold: float = 0.8,
+        resolution: float = 1.0,
+        flight_ids: Optional[str] = None,
+        seed: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Assign community labels to flights passing a traffic volume, using the
+        unified Jaccard + Leiden pipeline shared with /flows (build_global_flows).
+
+        Parameters mirror the legacy method for API compatibility.
+        """
+        self._ensure_evaluator_ready()
+
+        # Normalize ref_time_str into HHMMSS for ordered ranking, but accept HH:MM[:SS]
+        s_ref = str(ref_time_str).strip()
+        if s_ref.isdigit() and len(s_ref) in (4, 6):
+            _hour = int(s_ref[0:2]); _minute = int(s_ref[2:4]); _second = int(s_ref[4:6]) if len(s_ref) == 6 else 0
+        else:
+            parts_ref = s_ref.split(":")
+            if len(parts_ref) not in (2, 3):
+                raise ValueError("ref_time_str must be numeric 'HHMM' or 'HHMMSS' or formatted 'HH:MM'/'HH:MM:SS'")
+            _hour = int(parts_ref[0]); _minute = int(parts_ref[1]); _second = int(parts_ref[2]) if len(parts_ref) == 3 else 0
+        if not (0 <= _hour < 24 and 0 <= _minute < 60 and 0 <= _second < 60):
+            raise ValueError("ref_time_str contains invalid time components")
+        normalized_ref_str = f"{_hour:02d}{_minute:02d}{_second:02d}"
+
+        # Candidate selection logic preserved: prefer explicit flight_ids; else rank by ref time
+        candidate_flight_ids: List[str]
+        used_source: str
+        if flight_ids is not None and str(flight_ids).strip() != "":
+            parsed = [s.strip() for s in str(flight_ids).split(",") if s.strip()]
+            candidate_flight_ids = list(parsed)
+            used_source = "provided_flight_ids"
+        else:
+            ordered = await self.get_traffic_volume_flights_ordered_by_ref_time(
+                traffic_volume_id, normalized_ref_str
+            )
+            candidate_flight_ids = list(ordered.get("ordered_flights", []))
+            if limit is not None:
+                try:
+                    lmt = int(limit)
+                    if lmt > 0:
+                        candidate_flight_ids = candidate_flight_ids[:lmt]
+                except Exception:
+                    pass
+            used_source = "ordered_by_ref_time"
+
+        # Early exit for trivial cases consistent with pipeline behavior
+        if len(candidate_flight_ids) == 0:
+            return {
+                "traffic_volume_id": traffic_volume_id,
+                "ref_time_str": ref_time_str,
+                "flight_ids": [],
+                "communities": {},
+                "groups": {},
+                "metadata": {
+                    "num_flights": 0,
+                    "time_bin_minutes": self._evaluator.time_bin_minutes,
+                    "threshold": float(threshold),
+                    "resolution": float(resolution),
+                    "source": used_source,
+                },
+            }
+        if len(candidate_flight_ids) == 1:
+            fid0 = candidate_flight_ids[0]
+            return {
+                "traffic_volume_id": traffic_volume_id,
+                "ref_time_str": ref_time_str,
+                "flight_ids": [fid0],
+                "communities": {fid0: 0},
+                "groups": {0: [fid0]},
+                "metadata": {
+                    "num_flights": 1,
+                    "time_bin_minutes": self._evaluator.time_bin_minutes,
+                    "threshold": float(threshold),
+                    "resolution": float(resolution),
+                    "source": used_source,
+                },
+            }
+
+        # Directional options: always set mode; include tv_centroids when readily available
+        dir_opts: Dict[str, Any] = {"mode": "coord_cosine"}
+        try:
+            gdf = getattr(self, "_traffic_volumes_gdf", None)
+            if gdf is not None:
+                centroids_latlon = self._retrieve_tv_centroid_latlon_map_from_resources()
+                if isinstance(centroids_latlon, dict) and centroids_latlon:
+                    # Convert to (lat, lon) tuple mapping
+                    dir_opts["tv_centroids"] = {
+                        str(k): (float(v.get("lat", 0.0)), float(v.get("lon", 0.0)))
+                        for k, v in centroids_latlon.items()
+                        if isinstance(v, dict) and "lat" in v and "lon" in v
+                    }
+        except Exception:
+            # Optional enrichment only; ignore failures
+            pass
+
+        # Compute assignments via the shared pipeline
+        loop = asyncio.get_event_loop()
+
+        def _compute_assignments() -> Dict[str, int]:
+            return build_global_flows(
+                flight_list=self._flight_list,
+                union_flight_ids=candidate_flight_ids,
+                hotspots=[traffic_volume_id],
+                trim_policy="earliest_hotspot",
+                leiden_params={
+                    "threshold": float(threshold),
+                    "resolution": float(resolution),
+                    "seed": seed,
+                },
+                direction_opts=dir_opts,
+            )
+
+        try:
+            assignments = await loop.run_in_executor(self._executor, _compute_assignments)
+        except ValueError:
+            raise
+        except Exception as e:
+            print(
+                f"Error computing flow extraction (pipeline) for {traffic_volume_id} at {ref_time_str}: {e}"
+            )
+            raise e
+
+        # Build groups and order by proximity order
+        groups: Dict[int, List[str]] = {}
+        for fid, label in assignments.items():
+            lab = int(label)
+            if lab not in groups:
+                groups[lab] = []
+            groups[lab].append(str(fid))
+
         order_index: Dict[str, int] = {fid: i for i, fid in enumerate(candidate_flight_ids)}
         for lab in list(groups.keys()):
             groups[lab].sort(key=lambda x: order_index.get(x, 1_000_000))
