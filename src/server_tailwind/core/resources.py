@@ -22,6 +22,7 @@ class ResourcePaths:
     tvtw_indexer_path: Path = Path("output/tvtw_indexer.json")
     traffic_volumes_path: Path = Path("/Volumes/CrucialX/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson")
     fallback_traffic_volumes_path: Path = Path("D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson")
+    fallback_traffic_volumes_path_2: Path = Path("/mnt/d/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson")
 
 
 class AppResources:
@@ -71,6 +72,8 @@ class AppResources:
                 p = self.paths.traffic_volumes_path
                 if not p.exists():
                     p = self.paths.fallback_traffic_volumes_path
+                if not p.exists():
+                    p = self.paths.fallback_traffic_volumes_path_2
                 self._traffic_volumes_gdf = gpd.read_file(str(p))
             return self._traffic_volumes_gdf
 
