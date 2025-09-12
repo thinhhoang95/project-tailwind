@@ -208,6 +208,11 @@ def compute_flows(
         hotspots=hotspot_ids,
         trim_policy="earliest_hotspot",
         leiden_params={"threshold": _thr, "resolution": _res, "seed": 0},
+        direction_opts={
+            "mode": "coord_cosine",
+            # tv_centroids is optional; if not provided here, no reweighting occurs.
+            # Server layer can inject a mapping {tv_id: (lat, lon)} when available.
+        },
     )
 
     # Controlled volume and requested bins per flight in each flow
