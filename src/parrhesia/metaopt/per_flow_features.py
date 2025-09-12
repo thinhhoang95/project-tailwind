@@ -59,29 +59,72 @@ def price_kernel_vG(
     *,
     w_sum: float = 1.0,
     w_max: float = 1.0,
+    verbose_debug: bool = False,
+    idx_to_tv_id: Optional[Mapping[int, str]] = None,
 ) -> float:
     """
     v_G(t_G) = sum_s [w_sum + w_max θ_{s, t_G + τ_{G,s}}] · 1{overload(s, t_G+τ)}.
     """
+    if verbose_debug:
+        print(f"\n--- Computing price_kernel_vG for t_G={t_G} ---")
     overloaded, rows = _gather_bool_at_offsets(hourly_excess_bool, tau_row_to_bins, int(t_G))
     if not np.any(overloaded):
+        if verbose_debug:
+            print("No overloaded TVs at phase-shifted times. v_G = 0.0")
         return 0.0
     V, T = hourly_excess_bool.shape
+
+    overloaded_rows_indices = rows[overloaded]
+
+    # Build gather indices per row to get t_s = t_G + tau_s
+    tau = np.zeros(V, dtype=np.int32)
+    for r, off in tau_row_to_bins.items():
+        if 0 <= int(r) < V:
+            tau[int(r)] = int(off)
+    t_idx = np.clip(int(t_G) + tau, 0, T - 1)
+
+    if verbose_debug:
+        print(f"Found {len(overloaded_rows_indices)} overloaded TVs at their phase-shifted times:")
+        if idx_to_tv_id:
+            details = [
+                f"  - {idx_to_tv_id.get(int(r_idx), f'Row {r_idx}')} @ bin {t_idx[int(r_idx)]}"
+                for r_idx in overloaded_rows_indices
+            ]
+            print("\n".join(details))
+        else:
+            # Fallback to original if no map is provided
+            print(f"  Indices: {overloaded_rows_indices.tolist()}")
+
     # Sum base weights over overloaded rows
     base = float(w_sum) * float(np.sum(overloaded))
+    if verbose_debug:
+        print(f"Base price component: w_sum * num_overloaded = {w_sum} * {np.sum(overloaded)} = {base}")
+
     theta_sum = 0.0
     if theta_mask:
-        # Build gather indices per row to get t_s
-        tau = np.zeros(V, dtype=np.int32)
-        for r, off in tau_row_to_bins.items():
-            if 0 <= int(r) < V:
-                tau[int(r)] = int(off)
-        t_idx = np.clip(int(t_G) + tau, 0, T - 1)
-        for r in rows[overloaded]:
-            w = theta_mask.get((int(r), int(t_idx[int(r)])))
+        if verbose_debug:
+            print("Theta mask component calculation:")
+        for r in overloaded_rows_indices:
+            r_int = int(r)
+            t_s = int(t_idx[r_int])
+            w = theta_mask.get((r_int, t_s))
             if w is not None:
                 theta_sum += float(w)
-    return float(base + float(w_max) * float(theta_sum))
+                if verbose_debug:
+                    print(
+                        f"  - TV row {r_int}: t_s = t_G + τ_{{G,s={r_int}}} = {t_G} + {tau[r_int]} = {t_s}, "
+                        f"θ({r_int}, {t_s}) = {w:.4f}. Cumulative theta_sum = {theta_sum:.4f}"
+                    )
+            elif verbose_debug:
+                print(f"  - TV row {r_int}: t_s = {t_s}, θ({r_int}, {t_s}) not in mask.")
+
+    total_price = float(base + float(w_max) * float(theta_sum))
+    if verbose_debug:
+        print(f"Theta sum component: w_max * theta_sum = {w_max} * {theta_sum} = {float(w_max) * float(theta_sum)}")
+        print(f"Total v_G = base + theta_component = {base} + {float(w_max) * float(theta_sum)} = {total_price}")
+        print("--- End price_kernel_vG ---")
+
+    return total_price
 
 
 def price_to_hotspot_vGH(
