@@ -115,12 +115,34 @@ def main() -> None:
         )
 
     capacities_by_tv = build_bin_capacities(geojson_path, indexer)
+    # Print some capacities
+    table = Table(title=f"Capacities at bin {hotspot_bin}")
+    table.add_column("Traffic Volume")
+    table.add_column("Capacity")
+
+    # Show a few sample TVs and their capacity at the hotspot time
+    # Then show the hotspot TV itself
+    tvs_to_show = list(capacities_by_tv.keys())[:5]
+    if hotspot_tv in tvs_to_show:
+        tvs_to_show.remove(hotspot_tv)
+    else:
+        tvs_to_show = tvs_to_show[:4]
+
+    for tv in tvs_to_show:
+        capacity = capacities_by_tv[tv][hotspot_bin]
+        table.add_row(tv, f"{capacity:.2f}")
+
+    hotspot_capacity = capacities_by_tv[hotspot_tv][hotspot_bin]
+    table.add_row(hotspot_tv, f"{hotspot_capacity:.2f}", style="bold magenta")
+    console.print(table)
+    
 
     caches = build_base_caches(flight_list, capacities_by_tv, indexer)
     H_bool = caches["hourly_excess_bool"]
     S_mat = caches["slack_per_bin_matrix"]
     T = indexer.num_time_bins
     row_map = flight_list.tv_id_to_idx
+    idx_to_tv_id = {idx: tv for tv, idx in row_map.items()}
 
     # 6) Convert travel minutes to bin offsets
     bin_offsets = minutes_to_bin_offsets(
@@ -135,6 +157,9 @@ def main() -> None:
     tau_map: Dict[int, Dict[int, int]] = {}
     tG_map: Dict[int, int] = {}
     ctrl_by_flow: Dict[int, str] = {}
+
+    print("\n--- Detailed t_G Calculation ---")
+    hotspot_tv_row = row_map.get(hot.tv_id)
 
     for fobj in flows:
         fid = int(fobj["flow_id"])  # flow id
@@ -160,6 +185,37 @@ def main() -> None:
             ctrl_row = int(row_map[ctrl])
         tG_map[fid] = phase_time(ctrl_row, hot, tau, T)
 
+        # Sanity check: print detailed breakdown of t_G
+        tG = tG_map[fid]
+        tau_G_s_star = tau.get(hotspot_tv_row) if hotspot_tv_row is not None else None
+
+        print("-" * 60)
+        print(f"Calculating phase alignment time t_G for flow {fid}:")
+        print("Formula: t_G = t* - τ_{G,s*}")
+        print("\n  Components:")
+        print("  - Hotspot H = (s*, t*):")
+        print(
+            f"    - s* (hotspot_tv): '{hot.tv_id}'"
+            + (f" (row: {hotspot_tv_row})" if hotspot_tv_row is not None else " (TV not found in row_map)")
+        )
+        print(f"    - t* (hotspot_bin): {hot.bin}")
+
+        print(f"\n  - Flow G = {fid}:")
+        print(
+            f"    - Control volume s_ctrl: '{ctrl}'"
+            + (f" (row: {ctrl_row})" if ctrl_row is not None else " (Control TV not found or not specified)")
+        )
+
+        print("\n  - Travel time τ_{G,s*}:")
+        if tau_G_s_star is not None:
+            print(f"    - Offset from s_ctrl to s* in time bins: {tau_G_s_star}")
+            print("\n  Calculation:")
+            print(f"  t_G = {hot.bin} - {tau_G_s_star} = {tG}")
+        else:
+            print("    - Could not determine travel time offset.")
+            print(f"\n  Final t_G value: {tG}")
+        print("-" * 60)
+
     # 8) Per-flow features wrt hotspot
     params = HyperParams(S0=5.0)  # tune as needed
     h_row = int(row_map[hotspot_tv])
@@ -177,6 +233,8 @@ def main() -> None:
             theta_mask=None,
             w_sum=params.w_sum,
             w_max=params.w_max,
+            verbose_debug=True,
+            idx_to_tv_id=idx_to_tv_id,
         )
         vGH = price_to_hotspot_vGH(
             h_row,
