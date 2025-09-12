@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union, Any
 from datetime import datetime
 
 from .flow_extractor import (
@@ -201,6 +201,7 @@ def build_global_flows(
     hotspots: Optional[Sequence[Union[str, int]]] = None,
     trim_policy: str = "earliest_hotspot",
     leiden_params: Optional[Dict[str, Union[float, int]]] = None,
+    direction_opts: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, int]:
     """
     Partition union flights into flows using Jaccard + Leiden on TV footprints.
@@ -265,6 +266,52 @@ def build_global_flows(
         seed = int(seed_val) if seed_val is not None else None
     except Exception:
         seed = None
+
+    # Helpers for direction-aware reweighting
+    # Map hotspots to TV indices for trimming when computing direction vectors
+    hotspot_tv_indices_for_dir: Optional[set[int]] = None
+    if hotspots is not None:
+        hotspot_tv_indices_for_dir = set()
+        tv_map = getattr(flight_list, "tv_id_to_idx", {}) or {}
+        for h in hotspots:
+            if isinstance(h, str):
+                idx_h = tv_map.get(h)
+                if idx_h is not None:
+                    hotspot_tv_indices_for_dir.add(int(idx_h))
+            else:
+                try:
+                    hotspot_tv_indices_for_dir.add(int(h))
+                except Exception:
+                    pass
+        if not hotspot_tv_indices_for_dir:
+            hotspot_tv_indices_for_dir = None
+
+    def _seq_indices_for_dir(fid: str) -> List[int]:
+        """Chronological TV index sequence for a flight, deduping consecutive repeats."""
+        if hasattr(flight_list, "get_flight_tv_sequence_indices"):
+            try:
+                arr = flight_list.get_flight_tv_sequence_indices(fid)  # type: ignore[misc]
+                return list(map(int, getattr(arr, "tolist", lambda: list(arr))()))
+            except Exception:
+                pass
+        meta = getattr(flight_list, "flight_metadata", {}).get(fid)
+        if not meta:
+            return []
+        intervals = meta.get("occupancy_intervals", []) or []
+        if not intervals:
+            return []
+        try:
+            order = sorted(range(len(intervals)), key=lambda i: float(intervals[i].get("entry_time_s", 0.0)))
+        except Exception:
+            order = list(range(len(intervals)))
+        bins_per_tv = int(getattr(flight_list, "num_time_bins_per_tv"))
+        tv_indices = [(int(intervals[i].get("tvtw_index", 0)) // bins_per_tv) for i in order]
+        out: List[int] = []
+        for v in tv_indices:
+            vv = int(v)
+            if not out or out[-1] != vv:
+                out.append(vv)
+        return out
 
     # Build footprints according to trimming policy
     try:
@@ -334,6 +381,99 @@ def build_global_flows(
             fps.append(_np.unique(_np.asarray(seq, dtype=int)))
 
     S = compute_jaccard_similarity(fps)
+
+    # Direction-aware reweighting (defaults to enabled via coord_cosine)
+    if direction_opts is None:
+        direction_opts = {"mode": "coord_cosine"}
+    mode = str(direction_opts.get("mode", "coord_cosine")).strip().lower() if isinstance(direction_opts, dict) else "coord_cosine"
+    if mode == "coord_cosine":
+        # Expect tv_centroids mapping tv_id -> (lat, lon) in EPSG:4326; if not supplied, skip
+        tv_centroids: Optional[Dict[str, Tuple[float, float]]] = None
+        if isinstance(direction_opts, dict):
+            tv_centroids = direction_opts.get("tv_centroids")  # type: ignore[assignment]
+        if isinstance(tv_centroids, dict) and tv_centroids:
+            import math
+            idx_to_tv_id = getattr(flight_list, "idx_to_tv_id", {}) or {}
+
+            def _unit_vec_from_seq(seq_tv_idx: List[int]) -> Optional[Tuple[float, float]]:
+                if not seq_tv_idx:
+                    return None
+                tv_start = idx_to_tv_id.get(int(seq_tv_idx[0]))
+                tv_end = idx_to_tv_id.get(int(seq_tv_idx[-1]))
+                if tv_start is None or tv_end is None:
+                    return None
+                a = tv_centroids.get(str(tv_start))
+                b = tv_centroids.get(str(tv_end))
+                if not a or not b:
+                    return None
+                lat1, lon1 = float(a[0]), float(a[1])
+                lat2, lon2 = float(b[0]), float(b[1])
+                latm = math.radians(0.5 * (lat1 + lat2))
+                dx = (lon2 - lon1) * math.cos(latm)
+                dy = (lat2 - lat1)
+                norm = math.hypot(dx, dy)
+                if not (norm > 0.0):
+                    return None
+                return (dx / norm, dy / norm)
+
+            use_trimmed = bool(direction_opts.get("use_trimmed", True)) if isinstance(direction_opts, dict) else True
+            angle_gate_deg = float(direction_opts.get("angle_gate_deg", 90.0)) if isinstance(direction_opts, dict) else 90.0
+            cosine_exponent = float(direction_opts.get("cosine_exponent", 1.0)) if isinstance(direction_opts, dict) else 1.0
+            min_weight = float(direction_opts.get("min_weight", 0.0)) if isinstance(direction_opts, dict) else 0.0
+
+            # Precompute per-flight unit vectors using first/last centroids; apply same trimming as footprints
+            unit_vecs: List[Optional[Tuple[float, float]]] = []
+            for fid in ids:
+                seq = _seq_indices_for_dir(str(fid))
+                if use_trimmed and hotspot_tv_indices_for_dir and isinstance(trim_policy, str) and trim_policy == "earliest_hotspot":
+                    hit = None
+                    for i, v in enumerate(seq):
+                        if int(v) in hotspot_tv_indices_for_dir:
+                            hit = i
+                            break
+                    if hit is not None:
+                        seq = seq[: hit + 1]
+                unit_vecs.append(_unit_vec_from_seq(seq))
+
+            def _pair_weight(i: int, j: int) -> float:
+                vi = unit_vecs[i]
+                vj = unit_vecs[j]
+                if vi is None or vj is None:
+                    return 1.0
+                cosv = vi[0] * vj[0] + vi[1] * vj[1]
+                if cosv > 1.0:
+                    cosv = 1.0
+                elif cosv < -1.0:
+                    cosv = -1.0
+                try:
+                    theta = math.degrees(math.acos(cosv))
+                except Exception:
+                    theta = 0.0 if cosv >= 1.0 else 180.0
+                if theta > angle_gate_deg:
+                    return float(min_weight)
+                w = max(cosv, 0.0) ** float(cosine_exponent)
+                return float(max(w, min_weight))
+
+            # Apply to S (dense ndarray or sparse via COO)
+            if hasattr(S, "tocoo"):
+                coo = S.tocoo()
+                vals = coo.data
+                rows = coo.row
+                cols = coo.col
+                for k in range(vals.size):
+                    i = int(rows[k]); j = int(cols[k])
+                    if i >= j:
+                        continue
+                    vals[k] *= _pair_weight(i, j)
+                S = coo
+            else:
+                n = S.shape[0]
+                for i in range(n):
+                    for j in range(i + 1, n):
+                        wij = _pair_weight(i, j)
+                        S[i, j] *= wij
+                        S[j, i] = S[i, j]
+
     membership = run_leiden_from_similarity(S, threshold=threshold, resolution=resolution, seed=seed)
 
     # Remap to consecutive labels 0..k-1 in order of first appearance
