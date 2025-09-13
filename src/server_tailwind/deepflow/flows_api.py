@@ -4,6 +4,7 @@ from fastapi import FastAPI, HTTPException, Query
 # Import compute_flows directly from the parrhesia package
 from parrhesia.api.flows import compute_flows
 from parrhesia.api.base_evaluation import compute_base_evaluation
+from server_tailwind.core.resources import get_resources
 
 
 @app.get("/flows")
@@ -42,11 +43,14 @@ def get_flows(
         resolution = rval
 
     try:
+        # Inject direction-aware options using shared TV centroids
+        dir_opts = {"mode": "coord_cosine", "tv_centroids": get_resources().tv_centroids}
         result = compute_flows(
             tvs=tv_list,
             timebins=bins_list,
             threshold=threshold,
             resolution=resolution,
+            direction_opts=dir_opts,
         )
     except Exception as e:
         import traceback
