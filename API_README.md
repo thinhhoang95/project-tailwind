@@ -37,7 +37,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 - **`/tv_count_with_capacity`** - Get occupancy counts along with hourly capacity for a traffic volume
 - **`/hotspots`** - Get list of hotspots detected via sliding rolling-hour counts (contiguous overloaded segments per TV) with detailed statistics
 - **`/slack_distribution`** - For a source TV and reference time, returns per-TV slack at the query bin shifted by nominal travel time (475 kts), with an optional additional shift `delta_min` (minutes)
-- **`/regulation_plan_simulation`** - Simulate a regulation plan to get per-flight delays, objective metrics, and top-K busiest TVs (rolling-hour occupancy) ranked over the union of the plan's active time windows (pre/post)
+- **`/regulation_plan_simulation`** - Simulate a regulation plan to get per-flight delays, objective metrics, and rolling-hour occupancy for all TVs that changed (pre/post); no server-side ranking
 - **Authentication** - OAuth2 password flow with JWT access tokens
 - **`/token`** - Issue access token and user info (`display_name`, `organization`) (demo users: `nm@intuelle.com` / `nm123`, `thinh.hoangdinh@enac.fr` / `Vy011195`)
 - **`/protected`** - Example protected endpoint requiring `Authorization: Bearer <token>`
@@ -455,7 +455,7 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
     }
   ],
   "weights": {"alpha": 1.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0},
-  "top_k": 25,
+  
   "include_excess_vector": false
 }
 ```
@@ -463,7 +463,7 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
 **Notes:**
 - `regulations`: List of either raw strings like `TV_<LOC> <FILTER> <RATE> <TW>` or objects with `location`, `rate`, `time_windows`, and optional `filter_type`, `filter_value`, `target_flight_ids`.
 - `weights`: Optional objective weights for combining overload and delay components.
-- `top_k`: Number of busiest TVs to include (default: 25). Ranking is across all TVs, evaluated only on the union of the plan's active time windows.
+- Deprecated: `top_k` is accepted but ignored for one release (for backward compatibility). The response includes all changed TVs in stable row order (no ranking). If `top_k` is present, a deprecation note is added under `metadata.deprecated`.
 - `include_excess_vector`: If true, returns the full post-regulation excess vector; otherwise returns compact stats.
 - Hours/bins with no capacity are skipped when computing busy-ness.
 - Ranking metric: `max(pre_rolling_count - hourly_capacity)` over the union mask of active regulation windows.
@@ -494,7 +494,7 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
     "gamma": 0.1,
     "delta": 25.0
   },
-  "rolling_top_tvs": [
+  "rolling_changed_tvs": [
     {
       "traffic_volume_id": "TVA",
       "pre_rolling_counts": [3.0, 4.0, 5.0],
@@ -503,20 +503,30 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
       "active_time_windows": [32]
     }
   ],
+  "rolling_top_tvs": [ ... same as rolling_changed_tvs ... ],
   "excess_vector_stats": {"sum": 10.0, "max": 3.0, "mean": 0.1, "count": 9600},
   "metadata": {
-    "top_k": 25,
     "time_bin_minutes": 15,
     "bins_per_tv": 384,
     "bins_per_hour": 4,
     "num_traffic_volumes": 1,
-    "ranking_metric": "max(pre_rolling_count - hourly_capacity) over the union of active regulation windows"
+    "num_changed_tvs": 1,
+    "deprecated": {
+      "top_k": "accepted but ignored; will be removed in next release",
+      "rolling_top_tvs": "alias of rolling_changed_tvs for one release"
+    }
   }
 }
 ```
 
 Fields:
 - `pre_flight_context`: Map of flight ID → `{takeoff_time, tv_arrival_time}` strings (HH:MM:SS). `tv_arrival_time` can be `null` if the flight does not enter any regulated traffic volume.
+
+Fields:
+- `pre_flight_context`: Map of flight ID → `{takeoff_time, tv_arrival_time}` strings (HH:MM:SS). `tv_arrival_time` can be `null` if the flight does not enter any regulated traffic volume.
+- `rolling_changed_tvs`: All TVs where any raw occupancy bin changed due to the plan; arrays are full-length per TV. Results are returned in stable TV row order (no ranking or top-k selection).
+- `rolling_top_tvs`: Deprecated alias, equal to `rolling_changed_tvs` for one release.
+- `metadata.num_changed_tvs`: Count of changed TVs.
 
 **cURL Example:**
 ```bash
@@ -525,7 +535,6 @@ curl -X POST "http://localhost:8000/regulation_plan_simulation" \
   -d '{
     "regulations": ["TV_TVA IC__ 3 32"],
     "weights": {"alpha": 1.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0},
-    "top_k": 25,
     "include_excess_vector": false
   }'
 ```

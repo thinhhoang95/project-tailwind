@@ -355,20 +355,25 @@ async def regulation_plan_simulation(request: Dict[str, Any], current_user: dict
     Simulate a regulation plan and return:
     - per-flight delays and delay stats
     - objective and component breakdown
-    - rolling-hour occupancy arrays (pre and post) for all bins of the top-K busiest TVs
-      (busiest defined as TVs with highest max(pre_rolling_count - hourly_capacity)
-      over the active regulation time windows)
+    - for every traffic volume that changed due to the plan, the full-length rolling-hour arrays
+      (pre and post) and capacity-per-bin, plus active regulation time windows for that TV.
+
+    Server returns all changed TVs in stable row order (no server-side ranking/sorting).
 
     Request JSON keys:
     - regulations: List[str|object]
     - weights: Optional[dict]
-    - top_k: Optional[int] (number of TVs to include; default 25)
     - include_excess_vector: Optional[bool]
+
+    Backward compatibility (one release):
+    - top_k: accepted but ignored; if present, a deprecation note is included in metadata.
+    - rolling_top_tvs: returned as a deprecated alias of rolling_changed_tvs.
     """
     try:
         regs = request.get("regulations", [])
         weights = request.get("weights")
-        top_k = int(request.get("top_k", 25))
+        # Accept but ignore top_k for one release (deprecation path)
+        top_k = request.get("top_k")
         include_excess_vector = bool(request.get("include_excess_vector", False))
 
         result = await airspace_wrapper.run_regulation_plan_simulation(
