@@ -396,6 +396,8 @@ def build_global_flows(
         tv_centroids: Optional[Dict[str, Tuple[float, float]]] = None
         if isinstance(direction_opts, dict):
             tv_centroids = direction_opts.get("tv_centroids")  # type: ignore[assignment]
+        if tv_centroids is None:
+            raise Exception("tv_centroids is None")
         if isinstance(tv_centroids, dict) and tv_centroids:
             import math
             idx_to_tv_id = getattr(flight_list, "idx_to_tv_id", {}) or {}

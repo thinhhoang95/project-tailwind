@@ -34,9 +34,14 @@ hotspot_bin = (start_h * 60 + start_m) // bin_size
 
 # 4) Compute flows via the API wrapper
 from parrhesia.api.flows import compute_flows
+# Pass direction-aware options with TV centroids, like server wrappers do
 flows_payload: Dict[str, Any] = compute_flows(
     tvs=[hotspot_tv],
     timebins=[hotspot_bin],
+    direction_opts={
+        "mode": "coord_cosine",
+        "tv_centroids": res.tv_centroids,
+    },
 )
 print(f"Found {len(flows_payload['flows'])} flows for {hotspot_tv} @ bin {hotspot_bin}")
 

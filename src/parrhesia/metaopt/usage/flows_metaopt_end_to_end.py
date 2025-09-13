@@ -46,6 +46,10 @@ def main() -> None:
     flows_payload: Dict[str, Any] = compute_flows(
         tvs=[hotspot_tv],
         timebins=[hotspot_bin],
+        direction_opts={
+            "mode": "coord_cosine",
+            "tv_centroids": res.tv_centroids,
+        },
     )
     print(
         f"Found {len(flows_payload['flows'])} flows for {hotspot_tv} @ bin {hotspot_bin}"
