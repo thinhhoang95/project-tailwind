@@ -881,18 +881,20 @@ class AirspaceAPIWrapper:
         regulations: List[Any],
         *,
         weights: Optional[Dict[str, float]] = None,
-        top_k: int = 50,
+        top_k: Optional[int] = None,
         include_excess_vector: bool = False,
     ) -> Dict[str, Any]:
         """
         Evaluate a regulation plan on the baseline flight list and return post-regulation
-        delays, metrics, and rolling-hour occupancy for the top-K busiest TVs.
+        delays, metrics, and rolling-hour occupancy arrays for all TVs that changed.
 
         - regulations: list of raw strings (Regulation DSL) or dicts with keys
             {location, rate, time_windows[], filter_type?, filter_value?, target_flight_ids?}
         - weights: optional objective weights
-        - top_k: number of TVs to include (ranked by max(count - capacity) over the union of active regulation windows)
         - include_excess_vector: if True, include the full post-regulation excess vector
+
+        Backward compatibility (one release):
+        - top_k is accepted but ignored; a deprecation note is included in metadata when present.
         """
         self._ensure_evaluator_ready()
 
@@ -1033,55 +1035,21 @@ class AirspaceAPIWrapper:
                         mask[wi] = True
                         union_active_mask[wi] = True
 
-            # 8) Rank TVs by max busy over the UNION of active regulation windows using PRE state; skip bins without capacity
-            ranking: List[Tuple[str, float]] = []
+            # 8) Determine changed TVs by comparing raw pre/post occupancy per TV (integer semantics)
+            # If arrays are float, use tolerance to be safe.
+            if np.issubdtype(pre_by_tv.dtype, np.floating) or np.issubdtype(post_by_tv.dtype, np.floating):
+                diff_mask = np.abs(pre_by_tv - post_by_tv) > 0.5
+            else:
+                diff_mask = (pre_by_tv != post_by_tv)
+            changed_rows = np.where(np.any(diff_mask, axis=1))[0].tolist()
+
+            # 9) Package rolling arrays for changed TVs in stable row order
+            rolling_changed_tvs: List[Dict[str, Any]] = []
             for tv_id, row in tv_items:
-                # Use the union of regulation windows so all TVs are considered over the same bins
-                mask = union_active_mask
-                if not mask.any():
-                    continue  # no active windows in the plan overall
-                cap_vec = cap_by_tv.get(tv_id)
-                if cap_vec is None:
+                if row not in changed_rows:
                     continue
-                # capacity missing bins are marked -1 -> exclude
-                valid = (cap_vec >= 0.0) & mask
-                if not np.any(valid):
-                    continue
-                busy_pre = pre_roll[row, valid] - cap_vec[valid]
-                if busy_pre.size == 0:
-                    continue
-                ranking.append((tv_id, float(np.max(busy_pre))))
-            ranking.sort(key=lambda t: t[1], reverse=True)
-            # Ensure reference TVs from the regulations appear first (deduplicated), then fill with ranked TVs
-            regulated_tv_ids: List[str] = []
-            for reg in network_plan.regulations:
-                loc = getattr(reg, "location", None)
-                if loc and loc in self._flight_list.tv_id_to_idx:
-                    regulated_tv_ids.append(loc)
-
-            # Deduplicate while preserving order
-            seen: set = set()
-            dedup_reg_tvs: List[str] = []
-            for tv in regulated_tv_ids:
-                if tv not in seen:
-                    seen.add(tv)
-                    dedup_reg_tvs.append(tv)
-
-            # Append ranked TVs excluding ones already included
-            ordered_tv_ids: List[str] = list(dedup_reg_tvs)
-            for tv, _ in ranking:
-                if tv not in seen:
-                    seen.add(tv)
-                    ordered_tv_ids.append(tv)
-
-            selected_tv_ids = ordered_tv_ids[: max(0, int(top_k))]
-
-            # 9) Package rolling arrays for selected TVs
-            rolling_top_tvs: List[Dict[str, Any]] = []
-            for tv_id in selected_tv_ids:
-                row = self._flight_list.tv_id_to_idx[tv_id]
                 active_wins = np.where(tv_to_active_mask[tv_id])[0].tolist()
-                rolling_top_tvs.append(
+                rolling_changed_tvs.append(
                     {
                         "traffic_volume_id": tv_id,
                         "pre_rolling_counts": pre_roll[row, :].astype(float).tolist(),
@@ -1178,23 +1146,39 @@ class AirspaceAPIWrapper:
                         "tv_arrival_time": tv_arrival_time_str,
                     }
 
-            return {
+            result_payload = {
                 "delays_by_flight": plan_result.get("delays_by_flight", {}),
                 "delay_stats": plan_result.get("delay_stats", {}),
                 "objective": plan_result.get("objective", 0.0),
                 "objective_components": plan_result.get("objective_components", {}),
                 "pre_flight_context": pre_flight_context,
-                "rolling_top_tvs": rolling_top_tvs,
+                # New key with changed TVs only
+                "rolling_changed_tvs": rolling_changed_tvs,
+                # Backward-compatibility alias for one release
+                "rolling_top_tvs": rolling_changed_tvs,
                 "metadata": {
-                    "top_k": int(top_k),
                     "time_bin_minutes": int(self._flight_list.time_bin_minutes),
                     "bins_per_tv": int(bins_per_tv),
                     "bins_per_hour": int(bins_per_hour),
                     "num_traffic_volumes": int(num_tvs),
-                    "ranking_metric": "max(pre_rolling_count - hourly_capacity) over the union of active regulation windows",
+                    "num_changed_tvs": int(len(rolling_changed_tvs)),
                 },
                 **excess_payload,
             }
+
+            # Add deprecation note if top_k was provided in the request
+            if top_k is not None:
+                try:
+                    meta = result_payload.get("metadata", {})
+                    meta["deprecated"] = {
+                        "top_k": "accepted but ignored; will be removed in next release",
+                        "rolling_top_tvs": "alias of rolling_changed_tvs for one release",
+                    }
+                    result_payload["metadata"] = meta
+                except Exception:
+                    pass
+
+            return result_payload
 
         try:
             return await loop.run_in_executor(self._executor, _compute)
