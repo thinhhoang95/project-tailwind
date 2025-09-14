@@ -165,6 +165,9 @@ def main() -> None:
     print("\n--- Detailed t_G Calculation ---")
     hotspot_tv_row = row_map.get(hot.tv_id)
 
+    # Feature flag to enable signed τ by relative direction vs control
+    enable_signed_tau = True
+
     for fobj in flows:
         fid = int(fobj["flow_id"])  # flow id
         ctrl = fobj.get("controlled_volume")
@@ -172,6 +175,7 @@ def main() -> None:
             ctrl_by_flow[fid] = str(ctrl)
         # Rebuild x_G from flights' requested_bin
         flights_specs = fobj.get("flights", [])
+        flow_flight_ids = [str(sp.get("flight_id")) for sp in flights_specs if sp.get("flight_id")]
         x = np.zeros(T, dtype=float)
         for sp in flights_specs:
             rb = int(sp.get("requested_bin", 0))
@@ -179,15 +183,25 @@ def main() -> None:
                 x[rb] += 1.0
         xG_map[fid] = x
 
-        # τ map: control TV to all TVs (row -> Δbins)
-        tau = flow_offsets_from_ctrl(ctrl, row_map, bin_offsets) or {}
+        # τ map: control TV to all TVs (row -> Δbins), optionally signed per-flow
+        if enable_signed_tau:
+            tau = flow_offsets_from_ctrl(
+                ctrl,
+                row_map,
+                bin_offsets,
+                flow_flight_ids=flow_flight_ids,
+                flight_list=flight_list,
+                hotspots=[hotspot_tv],
+                trim_policy="earliest_hotspot",
+                direction_sign_mode="order_vs_ctrl",
+                tv_centroids=res.tv_centroids,
+            ) or {}
+        else:
+            tau = flow_offsets_from_ctrl(ctrl, row_map, bin_offsets) or {}
         tau_map[fid] = tau
 
         # Phase alignment t_G
-        ctrl_row = None
-        if ctrl is not None and ctrl in row_map:
-            ctrl_row = int(row_map[ctrl])
-        tG_map[fid] = phase_time(ctrl_row, hot, tau, T)
+        tG_map[fid] = phase_time(hotspot_tv_row, hot, tau, T)
 
         # Sanity check: print detailed breakdown of t_G
         tG = tG_map[fid]
@@ -205,6 +219,10 @@ def main() -> None:
         print(f"    - t* (hotspot_bin): {hot.bin}")
 
         print(f"\n  - Flow G = {fid}:")
+        # Resolve control row for display (not used for phase calculation)
+        ctrl_row = None
+        if ctrl is not None and ctrl in row_map:
+            ctrl_row = int(row_map[ctrl])
         print(
             f"    - Control volume s_ctrl: '{ctrl}'"
             + (f" (row: {ctrl_row})" if ctrl_row is not None else " (Control TV not found or not specified)")
@@ -317,4 +335,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

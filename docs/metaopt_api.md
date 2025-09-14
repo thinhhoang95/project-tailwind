@@ -51,7 +51,7 @@ This reference documents public functions and classes under `parrhesia.metaopt`.
 
 ## Per‑flow Features
 
-- `phase_time(control_tv_row: Optional[int], hotspot: Hotspot, tau_row_to_bins: Mapping[int, int]|None, T: int) -> int`
+- `phase_time(hotspot_row: Optional[int], hotspot: Hotspot, tau_row_to_bins: Mapping[int, int]|None, T: int) -> int`
 - `price_kernel_vG(t_G: int, tau_row_to_bins, hourly_excess_bool, theta_mask=None, w_sum=1.0, w_max=1.0) -> float`
 - `price_to_hotspot_vGH(hotspot_row: int, hotspot_bin: int, tau_row_to_bins, hourly_excess_bool, theta_mask=None, w_sum=1.0, w_max=1.0, kappa=0.25) -> float`
 - `slack_G_at(t: int, tau_row_to_bins, slack_per_bin_matrix) -> float`
@@ -79,4 +79,3 @@ This reference documents public functions and classes under `parrhesia.metaopt`.
 
 - `runner.rank_flows_and_plan(flight_list, indexer, travel_minutes_map, flights_by_flow, ctrl_by_flow, hotspot: Hotspot, params: HyperParams|None, capacities_by_tv) -> (proposals, diagnostics)`
   - Diagnostics include `scores_by_flow`, `pairwise_features`, and `labels`.
-

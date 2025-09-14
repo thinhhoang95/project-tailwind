@@ -82,6 +82,7 @@ tau_map: Dict[int, Dict[int, int]] = {}
 tG_map: Dict[int, int] = {}
 ctrl_by_flow: Dict[int, str] = {}
 
+enable_signed_tau = True  # feature flag to compare behaviors
 for fobj in flows:
     fid = int(fobj["flow_id"])  # flow id
     ctrl = fobj.get("controlled_volume")
@@ -90,6 +91,7 @@ for fobj in flows:
     # Rebuild x_G from flights' requested_bin
     # compute_flows returns flights: [{ flight_id, requested_bin, ... }]
     flights_specs = fobj.get("flights", [])
+    flow_flight_ids = [sp["flight_id"] for sp in flights_specs if sp.get("flight_id")]
     x = np.zeros(T, dtype=float)
     for sp in flights_specs:
         rb = int(sp.get("requested_bin", 0))
@@ -97,15 +99,24 @@ for fobj in flows:
             x[rb] += 1.0
     xG_map[fid] = x
 
-    # τ map: control TV to all TVs (row -> Δbins)
-    tau = flow_offsets_from_ctrl(ctrl, row_map, bin_offsets) or {}
+    # τ map: control TV to all TVs (row -> Δbins), optionally signed
+    if enable_signed_tau:
+        tau = flow_offsets_from_ctrl(
+            ctrl, row_map, bin_offsets,
+            flow_flight_ids=flow_flight_ids,
+            flight_list=flight_list,
+            hotspots=[hotspot_tv],
+            trim_policy="earliest_hotspot",
+            direction_sign_mode="order_vs_ctrl",
+            tv_centroids=res.tv_centroids,
+        ) or {}
+    else:
+        tau = flow_offsets_from_ctrl(ctrl, row_map, bin_offsets) or {}
     tau_map[fid] = tau
 
     # Phase alignment t_G
-    ctrl_row = None
-    if ctrl is not None and ctrl in row_map:
-        ctrl_row = int(row_map[ctrl])
-    tG_map[fid] = phase_time(ctrl_row, hot, tau, T)
+    h_row = int(row_map[hotspot_tv])
+    tG_map[fid] = phase_time(h_row, hot, tau, T)
 
 # 8) Per-flow features wrt hotspot
 params = HyperParams(S0=5.0)  # tune as needed
@@ -184,4 +195,3 @@ for k, d in pairwise.items():
 - Travel minutes use centroid great‑circle distances from the server resources; adjust if you maintain your own travel‑time matrix.
 - Slack uses hourly capacities distributed uniformly within the hour; change `S0` to scale slack penalties for your environment.
 - For additional planning/grouping and proposals, see `docs/metaopt_overview.md` and `docs/metaopt_examples.md`.
-

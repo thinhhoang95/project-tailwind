@@ -8,7 +8,7 @@ from .types import Hotspot, HyperParams
 
 
 def phase_time(
-    control_tv_row: Optional[int],
+    hotspot_row: Optional[int],
     hotspot: Hotspot,
     tau_row_to_bins: Optional[Mapping[int, int]],
     T: int,
@@ -17,16 +17,16 @@ def phase_time(
     Compute t_G = t* − τ_{G,s*} for a flow controlled at `control_tv_row`.
 
     Parameters
-    - control_tv_row: row index of the flow's control volume (None => 0 shift)
+    - hotspot_row: row index of the hotspot TV s* (None => 0 shift)
     - hotspot: (s*, t*) in ids/bins; we use only t*
     - tau_row_to_bins: mapping row -> offset bins from control row to that row
     - T: number of bins per TV
     """
     t_star = int(hotspot.bin)
-    if control_tv_row is None or tau_row_to_bins is None:
+    if hotspot_row is None or tau_row_to_bins is None:
         return max(0, min(int(T - 1), t_star))
-    # Offset from control to hotspot row
-    tau_ctrl_to_hstar = int(tau_row_to_bins.get(int(control_tv_row), 0))
+    # Offset from control to hotspot row: τ_{G,s*}
+    tau_ctrl_to_hstar = int(tau_row_to_bins.get(int(hotspot_row), 0))
     tG = int(t_star) - int(tau_ctrl_to_hstar)
     return max(0, min(int(T - 1), tG))
 
@@ -84,16 +84,30 @@ def price_kernel_vG(
     t_idx = np.clip(int(t_G) + tau, 0, T - 1)
 
     if verbose_debug:
-        print(f"Found {len(overloaded_rows_indices)} overloaded TVs at their phase-shifted times:")
-        if idx_to_tv_id:
-            details = [
-                f"  - {idx_to_tv_id.get(int(r_idx), f'Row {r_idx}')} @ bin {t_idx[int(r_idx)]}"
-                for r_idx in overloaded_rows_indices
-            ]
-            print("\n".join(details))
-        else:
-            # Fallback to original if no map is provided
-            print(f"  Indices: {overloaded_rows_indices.tolist()}")
+        from rich.console import Console
+        from rich.table import Table
+        
+        console = Console()
+        console.print(f"Found {len(overloaded_rows_indices)} overloaded TVs at their phase-shifted times:")
+        
+        if len(overloaded_rows_indices) > 0:
+            table = Table(title="Overloaded TVs")
+            table.add_column("TV ID", style="cyan")
+            table.add_column("Bin", style="magenta")
+            
+            if idx_to_tv_id:
+                for r_idx in overloaded_rows_indices:
+                    tv_id = idx_to_tv_id.get(int(r_idx), f'Row {r_idx}')
+                    bin_val = str(t_idx[int(r_idx)])
+                    table.add_row(tv_id, bin_val)
+            else:
+                # Fallback to original if no map is provided
+                for r_idx in overloaded_rows_indices:
+                    tv_id = f'Row {r_idx}'
+                    bin_val = str(t_idx[int(r_idx)])
+                    table.add_row(tv_id, bin_val)
+            
+            console.print(table)
 
     # Sum base weights over overloaded rows
     base = float(w_sum) * float(np.sum(overloaded))
@@ -264,4 +278,3 @@ def score(
         a = eligibility_a(xG, int(t_G), q0=params.q0, gamma=params.gamma, soft=use_soft_eligibility)
     rho = slack_penalty(int(t_G), tau_row_to_bins, slack_per_bin_matrix, S0=params.S0)
     return float(params.alpha) * float(a) * float(v) - float(params.beta) * float(rho)
-
