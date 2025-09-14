@@ -60,9 +60,8 @@ def rank_flows_and_plan(
         ctrl_tv = ctrl_by_flow.get(f)
         tmap = flow_offsets_from_ctrl(ctrl_tv, row_map, bin_offsets) or {}
         tau_map[int(f)] = tmap
-        ctrl_row = None if ctrl_tv is None else int(row_map.get(str(ctrl_tv), -1))
-        ctrl_row = None if (ctrl_row is not None and ctrl_row < 0) else ctrl_row
-        tG = phase_time(ctrl_row, hotspot, tmap, T)
+        # Phase time uses hotspot row when looking up τ_{G,s*}
+        tG = phase_time(h_row, hotspot, tmap, T)
         tG_map[int(f)] = tG
 
     # Compute per-flow score for rough ranking
@@ -144,4 +143,3 @@ def rank_flows_and_plan(
         "labels": labels,
     }
     return proposals, diagnostics
-

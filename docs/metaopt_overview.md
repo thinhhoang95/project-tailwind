@@ -41,9 +41,11 @@ Attention mask θ is built via `attention_mask_from_cells((tv_id, bin), ripple_c
 Nominal travel minutes between TVs (e.g., from centroid distances at 475 kts) are converted to bin offsets:
 - `minutes_to_bin_offsets(minutes_map, time_bin_minutes) → {src: {dst: bins}}`
 - For a flow controlled at TV `s_ctrl`, `flow_offsets_from_ctrl` yields `τ_{G,s}` for all TVs `s` as a mapping `row_index → offset_bins`.
+  - Signed option: pass flow context (`flow_flight_ids`, `flight_list`) and `direction_sign_mode="order_vs_ctrl"` to infer signs per TV (+ downstream, − upstream) with geometric fallback (`"vector_centroid"`).
+  - Back‑compat: if flow context is omitted, τ magnitudes remain non‑negative (old behavior).
 
 Given a hotspot H = (s*, t*), the flow’s phase time is:
-- `t_G = t* − τ_{G,s*}` (aligned index at the flow’s control row). Use `phase_time(control_row, hotspot, tau, T)`.
+- `t_G = t* − τ_{G,s*}` (aligned index at the flow’s control row). Use `phase_time(hotspot_row, hotspot, tau, T)` where `hotspot_row` is the row index of s*.
 
 ## Per‑Flow Features
 
@@ -113,7 +115,19 @@ from parrhesia.metaopt import minutes_to_bin_offsets, flow_offsets_from_ctrl
 
 bin_offsets = minutes_to_bin_offsets(travel_minutes_map, indexer.time_bin_minutes)
 row_map = flight_list.tv_id_to_idx  # tv_id -> row
-tau = flow_offsets_from_ctrl(control_tv_id, row_map, bin_offsets)  # row -> Δbins
+# Signed τ (optional):
+tau = flow_offsets_from_ctrl(
+    control_tv_id,
+    row_map,
+    bin_offsets,
+    flow_flight_ids=[sp['flight_id'] for sp in flights_by_flow[flow_id]],
+    flight_list=flight_list,
+    hotspots=[hotspot_tv_id],
+    trim_policy="earliest_hotspot",
+    direction_sign_mode="order_vs_ctrl",
+    tv_centroids=tv_centroids,  # optional, for geometric fallback
+)
+# Back‑compat (unsigned): tau = flow_offsets_from_ctrl(control_tv_id, row_map, bin_offsets)
 ```
 
 ### Per-flow series and score
@@ -124,7 +138,8 @@ from parrhesia.metaopt import (
 from parrhesia.metaopt import HyperParams
 
 xG = build_xG_series(flights_by_flow, ctrl_by_flow, flow_id, indexer.num_time_bins)
-tG = phase_time(control_row, Hotspot(h_tv, h_bin), tau, indexer.num_time_bins)
+h_row = flight_list.tv_id_to_idx[h_tv]
+tG = phase_time(h_row, Hotspot(h_tv, h_bin), tau, indexer.num_time_bins)
 theta = attention_mask_from_cells((h_tv, h_bin), tv_id_to_idx=flight_list.tv_id_to_idx, T=indexer.num_time_bins)
 params = HyperParams(w_sum=1.0, w_max=1.0, kappa=0.25, alpha=1.0, beta=1.0, S0=5.0)
 
@@ -180,4 +195,3 @@ proposals = make_proposals(Hotspot(h_tv, h_bin), flows, labels, xG_map, tG_map, 
 - The vectorized design allows swapping in richer attention masks or alternative travel‑time models (e.g., wind‑adjusted) by replacing τ and θ providers.
 - The SA optimizer integration is intentionally left out of this doc; proposals can be translated to the optimizer’s expected inputs by filtering flows and windows accordingly.
 - Hyperparameters in `HyperParams` expose the key trade‑offs; tune based on validation scenarios.
-

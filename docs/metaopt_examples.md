@@ -40,8 +40,8 @@ tau = flow_offsets_from_ctrl(ctrl_by_flow[0], row_map, bin_offsets)
 xG = build_xG_series(flights_by_flow, ctrl_by_flow, flow_id=0, num_time_bins_per_tv=T)
 
 # Phase alignment
-ctrl_row = row_map.get(ctrl_by_flow[0], None)
-tG = phase_time(ctrl_row, hot, tau, T)
+h_row = row_map.get(hot.tv_id, None)
+tG = phase_time(h_row, hot, tau, T)
 
 # Attention mask and weights
 theta = attention_mask_from_cells((hot.tv_id, hot.bin), tv_id_to_idx=row_map, T=T)
@@ -77,8 +77,8 @@ xG_map, tG_map, tau_map, scores_map = {}, {}, {}, {}
 for f in flow_ids:
     xG_map[f] = build_xG_series(flights_by_flow, ctrl_by_flow, f, T)
     tau_map[f] = flow_offsets_from_ctrl(ctrl_by_flow[f], flight_list.tv_id_to_idx, bin_offsets)
-    ctrl_row = flight_list.tv_id_to_idx.get(ctrl_by_flow[f], None)
-    tG_map[f] = phase_time(ctrl_row, hot, tau_map[f], T)
+    h_row = flight_list.tv_id_to_idx.get(hot.tv_id, None)
+    tG_map[f] = phase_time(h_row, hot, tau_map[f], T)
     scores_map[f] = score_flow(
         t_G=tG_map[f],
         hotspot_row=flight_list.tv_id_to_idx[hot.tv_id],
