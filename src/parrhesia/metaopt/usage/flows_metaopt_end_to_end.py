@@ -6,6 +6,9 @@ This mirrors docs/flows_metaopt_end_to_end.md as a runnable script. It:
 - Calls the compute_flows API wrapper for a chosen hotspot cell
 - Computes per-flow and pairwise features against the hotspot using parrhesia.metaopt
 
+Slack_G+k features (k ∈ {0, 15, 30, 45} minutes) are summed over the selected
+time bins for each flow, matching Slack_G aggregation semantics.
+
 Adjust the hotspot TV and time as needed, and ensure your TV GeoJSON path
 resolves (see the geojson_path block below).
 """
@@ -274,6 +277,12 @@ def main() -> None:
     params = HyperParams(S0=5.0, S0_mode="x_at_argmin")  # default mode can be omitted
     h_row = int(row_map[hotspot_tv])
 
+    minutes_per_bin = int(indexer.time_bin_minutes)
+    slack_shift_bins = [1, 2, 3]
+    slack_shift_labels = {
+        shift: f"slackG+{shift * minutes_per_bin}" for shift in slack_shift_bins
+    }
+
     per_flow_sums: Dict[int, Dict[str, float]] = {}
     # Pre-initialize sums for all flows
     for fid in xG_map.keys():
@@ -287,6 +296,8 @@ def main() -> None:
             "rho": 0.0,
             "score_rev1": 0.0,
         }
+        for label in slack_shift_labels.values():
+            per_flow_sums[int(fid)][label] = 0.0
 
     # Bin loop: compute per-flow contributions and accumulate
     for b in timebins:
@@ -334,7 +345,114 @@ def main() -> None:
             vtilde_b[int(fid)] = float(v_tilde)
 
             # Slack + eligibility
-            sG = slack_G_at(tG, tau, S_mat)
+            sG = slack_G_at(
+                tG,
+                tau,
+                S_mat,
+                rolling_occ_by_bin=rolling_occ_by_bin,
+                hourly_capacity_matrix=hourly_capacity_matrix,
+                bins_per_hour=bins_per_hour,
+            )
+            slack_shifts: Dict[int, float] = {}
+            for shift in slack_shift_bins:
+                tG_shift = tG + shift
+                if not (0 <= tG_shift < T):
+                    continue
+                slack_shifts[shift] = float(
+                    slack_G_at(
+                        tG_shift,
+                        tau,
+                        S_mat,
+                        rolling_occ_by_bin=rolling_occ_by_bin,
+                        hourly_capacity_matrix=hourly_capacity_matrix,
+                        bins_per_hour=bins_per_hour,
+                    )
+                )
+
+            # Optional: per-bin debug tables for Slack_G+15/30/45, similar to Slack Penalty Debug
+            if bool(args.per_bin_debug) and len(slack_shifts) > 0:
+                try:
+                    # Reproduce argmin details at each shifted time like slack_penalty() debug
+                    V, _T = S_mat.shape
+                    tau_vec = np.zeros(int(V), dtype=np.int32)
+                    touched = np.zeros(int(V), dtype=np.bool_)
+                    for r_row, off in tau.items():
+                        r_int = int(r_row)
+                        if 0 <= r_int < int(V):
+                            tau_vec[r_int] = int(off)
+                            touched[r_int] = True
+                    if np.any(touched):
+                        rows_all = np.arange(int(V), dtype=np.int32)
+                        rows = rows_all[touched]
+                        for shift, _val in slack_shifts.items():
+                            tG_shift = int(tG + shift)
+                            if not (0 <= tG_shift < T):
+                                continue
+                            t_idx_vec_all = np.clip(int(tG_shift) + tau_vec, 0, int(T) - 1)
+                            t_idx_vec = t_idx_vec_all[touched]
+                            try:
+                                if (
+                                    rolling_occ_by_bin is not None
+                                    and hourly_capacity_matrix is not None
+                                    and bins_per_hour is not None
+                                ):
+                                    hour_idx = np.clip(t_idx_vec // int(bins_per_hour), 0, 23)
+                                    roll_vals = rolling_occ_by_bin[rows, t_idx_vec]
+                                    cap_vals = hourly_capacity_matrix[rows, hour_idx]
+                                    vals = cap_vals - roll_vals
+                                else:
+                                    vals = S_mat[rows, t_idx_vec]
+                            except Exception:
+                                vals = S_mat[rows, t_idx_vec]
+                            if vals.size == 0:
+                                continue
+                            local_idx = int(np.argmin(vals))
+                            r_hat = int(rows[int(local_idx)])
+                            t_hat = int(t_idx_vec[int(local_idx)])
+                            s_shift = float(vals[int(local_idx)])
+
+                            # Pull friendly TV name and occupancy/capacity at t_hat for the row
+                            tv_name = (
+                                idx_to_tv_id.get(int(r_hat), str(int(r_hat)))
+                                if idx_to_tv_id is not None
+                                else str(int(r_hat))
+                            )
+                            occ_val = None
+                            if rolling_occ_by_bin is not None:
+                                try:
+                                    occ_val = float(rolling_occ_by_bin[int(r_hat), int(t_hat)])
+                                except Exception:
+                                    occ_val = None
+                            cap_val = None
+                            if (
+                                hourly_capacity_matrix is not None
+                                and bins_per_hour is not None
+                                and int(bins_per_hour) > 0
+                            ):
+                                try:
+                                    hidx = int(int(t_hat) // int(bins_per_hour))
+                                    hidx = 0 if hidx < 0 else (23 if hidx > 23 else hidx)
+                                    cap_val = float(hourly_capacity_matrix[int(r_hat), int(hidx)])
+                                except Exception:
+                                    cap_val = None
+
+                            # Print a Slack_G+Δ debug table mirroring the style of Slack Penalty Debug
+                            shift_min = int(shift * minutes_per_bin)
+                            from rich.table import Table as _Table
+                            dbg = _Table(title=f"Slack_G+{shift_min} Debug")
+                            dbg.add_column("Parameter", style="cyan")
+                            dbg.add_column("Value", style="yellow")
+                            dbg.add_row("t_G", str(int(tG)))
+                            dbg.add_row("Δ", f"+{shift_min}")
+                            dbg.add_row("t_G+Δ", str(int(tG_shift)))
+                            dbg.add_row("argmin TV", f"{tv_name} (row {int(r_hat)})")
+                            dbg.add_row("t̂", str(int(t_hat)))
+                            dbg.add_row("Slack_G+Δ", f"{float(s_shift):.4f}")
+                            dbg.add_row("roll_occ", ("N/A" if occ_val is None else f"{occ_val:.4f}"))
+                            dbg.add_row("hour_cap", ("N/A" if cap_val is None else f"{cap_val:.4f}"))
+                            console.print(dbg)
+                except Exception:
+                    pass
             aG = eligibility_a(xG, tG, q0=params.q0, gamma=params.gamma, soft=True)
             rho = slack_penalty(
                 tG,
@@ -373,6 +491,8 @@ def main() -> None:
             acc["g_H"] += float(gH)
             acc["v_tilde"] += float(v_tilde)
             acc["slackG"] += float(sG)
+            for shift, val in slack_shifts.items():
+                acc[slack_shift_labels[shift]] += float(val)
             acc["eligibility"] += float(aG)
             acc["rho"] += float(rho)
             acc["score_rev1"] += float(scr_rev1)
