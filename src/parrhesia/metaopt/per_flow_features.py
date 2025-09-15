@@ -555,18 +555,51 @@ def slack_G_at(
     t: int,
     tau_row_to_bins: Mapping[int, int],
     slack_per_bin_matrix: np.ndarray,
+    *,
+    rolling_occ_by_bin: Optional[np.ndarray] = None,
+    hourly_capacity_matrix: Optional[np.ndarray] = None,
+    bins_per_hour: Optional[int] = None,
 ) -> float:
     """
-    Slack_G(t) = min_s s_s(t + τ_{G,s}), where s_s(·) drawn from per-bin slack matrix [V, T].
+    Slack_G(t) = min_{s ∈ touched} s_s(t + τ_{G,s}).
+
+    When rolling-hour occupancy and hourly capacity matrices are provided, the per-TV
+    slack slice is derived from ``capacity − occupancy`` so negative slacks are
+    preserved. Otherwise the cached ``slack_per_bin_matrix`` is used (which is
+    non-negative by construction).
     """
     V, T = slack_per_bin_matrix.shape
-    tau = np.zeros(V, dtype=np.int32)
+    tau = np.zeros(int(V), dtype=np.int32)
+    touched = np.zeros(int(V), dtype=np.bool_)
     for r, off in tau_row_to_bins.items():
-        if 0 <= int(r) < V:
-            tau[int(r)] = int(off)
-    t_idx = np.clip(int(t) + tau, 0, T - 1)
-    vals = slack_per_bin_matrix[np.arange(V, dtype=np.int32), t_idx]
-    # If no rows, return 0; else min slack across affected rows
+        r_int = int(r)
+        if 0 <= r_int < int(V):
+            tau[r_int] = int(off)
+            touched[r_int] = True
+
+    if not np.any(touched):
+        return 0.0
+
+    t_idx_all = np.clip(int(t) + tau, 0, int(T) - 1)
+    rows_all = np.arange(int(V), dtype=np.int32)
+    rows = rows_all[touched]
+    t_idx = t_idx_all[touched]
+
+    try:
+        if (
+            rolling_occ_by_bin is not None
+            and hourly_capacity_matrix is not None
+            and bins_per_hour is not None
+        ):
+            hour_idx = np.clip(t_idx // int(bins_per_hour), 0, 23)
+            roll_vals = rolling_occ_by_bin[rows, t_idx]
+            cap_vals = hourly_capacity_matrix[rows, hour_idx]
+            vals = cap_vals - roll_vals
+        else:
+            vals = slack_per_bin_matrix[rows, t_idx]
+    except Exception:
+        vals = slack_per_bin_matrix[rows, t_idx]
+
     if vals.size == 0:
         return 0.0
     return float(np.min(vals))
