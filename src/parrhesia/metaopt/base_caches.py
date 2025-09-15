@@ -38,7 +38,7 @@ def build_base_caches(
       - 'cap_per_bin': 1D np.ndarray length V*T with per-bin capacity (hourly/ bins_per_hour)
       - 'hourly_capacity_matrix': np.ndarray shape [V, 24]
       - 'hourly_occ_base': np.ndarray shape [V, 24]
-      - 'slack_per_bin': 1D np.ndarray length V*T with max(hourly_slack/ bins_per_hour, 0)
+      - 'slack_per_bin': 1D np.ndarray length V*T with max(hourly_capacity − rolling_occ, 0)
       - 'slack_per_bin_matrix': np.ndarray shape [V, T]
       - 'rolling_occ_by_bin': np.ndarray shape [V, T] with forward-looking rolling-hour occupancy
       - 'excess_per_bin_matrix': np.ndarray shape [V, T] with max(rolling_occ - hourly_cap, 0)
@@ -76,7 +76,7 @@ def build_base_caches(
     hour_of_tvtw = np.tile(hour_bins, reps=num_tvs)
     tv_row_of_tvtw = np.repeat(np.arange(num_tvs, dtype=np.int32), repeats=T)
 
-    # Base hourly occupancy and slack
+    # Base hourly occupancy and per-bin capacity aligned by hour
     occ_mat = _reshape_by_tv(occ_base, num_tvs, T)
     hourly_occ_base = np.zeros((num_tvs, 24), dtype=np.float64)
     for h in range(24):
@@ -86,11 +86,7 @@ def build_base_caches(
             continue
         hourly_occ_base[:, h] = occ_mat[:, start:end].sum(axis=1)
 
-    hourly_slack = np.maximum(hourly_capacity_matrix - hourly_occ_base, 0.0)
-    # Per-bin slack matrix [V, T]: distribute each hour's slack uniformly across its bins
-    slack_per_bin_matrix = np.maximum(hourly_slack[:, hour_bins] / float(bins_per_hour), 0.0)
-    # Flatten to [V*T]
-    slack_per_bin = slack_per_bin_matrix.reshape(-1)
+    cap_by_bin_hour = hourly_capacity_matrix[:, hour_bins]
 
     # Rolling-hour occupancy and hourly excess indicator per bin
     # Compute forward-looking rolling sum of width K=bins_per_hour
@@ -102,11 +98,14 @@ def build_base_caches(
     idx = np.arange(T, dtype=np.int32)
     end_idx = np.minimum(idx + K, T)
     roll = csum[:, end_idx] - csum[:, :T]
-    # map hourly capacity by bin
-    cap_by_bin_hour = hourly_capacity_matrix[:, hour_bins]
     hourly_excess_bool = (roll - cap_by_bin_hour) > 0.0
     # Exceedance magnitude per bin (rolling occupancy minus hourly capacity, clamped at 0)
     excess_per_bin_matrix = np.maximum(roll - cap_by_bin_hour, 0.0)
+
+    # Slack per bin matrix [V, T]: rolling-hour slack relative to hourly capacity
+    slack_per_bin_matrix = np.maximum(cap_by_bin_hour - roll, 0.0)
+    # Flatten to [V*T]
+    slack_per_bin = slack_per_bin_matrix.reshape(-1)
 
     # Slack per bin matrix [V, T] already computed above
 
