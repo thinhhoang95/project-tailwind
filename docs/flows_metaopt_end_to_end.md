@@ -193,5 +193,5 @@ for k, d in pairwise.items():
 ## Notes
 - `compute_flows` clusters flights into flows and selects a control TV per flow using the earliest‑median policy. The example reconstructs `x_G(t)` from the per‑flow flights’ `requested_bin`.
 - Travel minutes use centroid great‑circle distances from the server resources; adjust if you maintain your own travel‑time matrix.
-- Slack uses hourly capacities distributed uniformly within the hour; change `S0` to scale slack penalties for your environment.
+- Slack compares hourly capacities against rolling-hour occupancy; change `S0` to scale slack penalties for your environment.
 - For additional planning/grouping and proposals, see `docs/metaopt_overview.md` and `docs/metaopt_examples.md`.

@@ -20,4 +20,6 @@ I would like that we can enter the *begin and end time*, for example: `09:00` to
 2. The features are accumulated **by sum over each time bin**, that is the current procedure computes each feature for one time bin, now for many time bins, we just sum them together.
 
 # Requirements
-The current code heavily uses caching and vectorization. Please ensure that the revised 
+- The current code heavily uses caching and vectorization. Please ensure that the revised code would reach the same level of optimization.
+
+- You must ensure the correctness of the approach.

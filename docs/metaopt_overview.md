@@ -24,7 +24,7 @@ Base inputs and caches are built once per scenario using `build_base_caches`:
 - `hourly_capacity_matrix` (V×24): hourly capacity per TV.
 - `cap_per_bin` (V·T): capacity per bin (hourly capacity divided by bins per hour).
 - `hourly_occ_base` (V×24): baseline hourly occupancy per TV.
-- `slack_per_bin_matrix` (V×T): per‑bin slack from hourly slack distributed uniformly within the hour.
+- `slack_per_bin_matrix` (V×T): per-bin slack computed as `max(hourly_capacity − rolling_hour_occ, 0)`.
 - `hourly_excess_bool` (V×T): indicator of rolling‑hour overload (forward‑looking window of 60 minutes equivalent in bins).
 
 Here V is the number of TVs, T is time bins per day.

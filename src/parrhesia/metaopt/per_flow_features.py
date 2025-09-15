@@ -272,19 +272,24 @@ def price_contrib_v_tilde(
                         cap_val = float(hourly_capacity_matrix[int(r), hour_idx])
                     except Exception:
                         cap_val = None
-                if (Pval > 0.0 and oval > 0.0) or (int(r) == int(hotspot_row) and (Pval > 0 or xval > 0)):
-                    name = idx_to_tv_id.get(int(r), str(r)) if idx_to_tv_id else str(int(r))
-                    table.add_row(
-                        name,
-                        str(th),
-                        str(tc),
-                        (f"{occ_val:.4f}" if occ_val is not None else "N/A"),
-                        (f"{cap_val:.4f}" if cap_val is not None else "N/A"),
-                        f"{Pval:.4f}",
-                        f"{xval:.4f}",
-                        f"{Dval:.4f}",
-                        f"{oval:.4f}",
-                    )
+                # Highlight rows that satisfy the original inclusion condition in yellow
+                # Original condition: (P>0 and ω>0) or (row==hotspot_row and (P>0 or x>0))
+                highlight = (Pval > 0.0 and oval > 0.0) or (
+                    int(r) == int(hotspot_row) and (Pval > 0.0 or xval > 0.0)
+                )
+                name = idx_to_tv_id.get(int(r), str(r)) if idx_to_tv_id else str(int(r))
+                table.add_row(
+                    name,
+                    str(th),
+                    str(tc),
+                    (f"{occ_val:.4f}" if occ_val is not None else "N/A"),
+                    (f"{cap_val:.4f}" if cap_val is not None else "N/A"),
+                    f"{Pval:.4f}",
+                    f"{xval:.4f}",
+                    f"{Dval:.4f}",
+                    f"{oval:.4f}",
+                    style=("yellow" if highlight else None),
+                )
             console.print(table)
             console.print(f"Primary: {primary:.4f}; Secondary: {secondary:.4f}; Total ṽ: {total:.4f}")
         except Exception:
@@ -613,22 +618,57 @@ def slack_penalty(
       - "constant": use provided S0 as-is.
 
     If the chosen mode requires xG but xG is None or empty, falls back to the constant S0.
+
+    Notes
+    - Rows considered in Slack_G(t_G) are restricted to those "touched" by the flow
+      (rows present in τ) to align with the domain used by ṽ components.
+    - When rolling-hour occupancy and hourly capacity matrices are provided, per-row
+      slack is derived as (capacity − occupancy) at the aligned time; otherwise the
+      cached slack_per_bin_matrix is used.
     """
     # Compute aligned indices and per-row slack at t_G + τ, then Slack_G(t_G)
+    # Restrict to rows touched by the flow (present in τ), to align with ṽ components
     V, T = slack_per_bin_matrix.shape
     tau = np.zeros(int(V), dtype=np.int32)
+    touched = np.zeros(int(V), dtype=np.bool_)
     for r, off in tau_row_to_bins.items():
         r_int = int(r)
         if 0 <= r_int < int(V):
             tau[r_int] = int(off)
-    t_idx_vec = np.clip(int(t_G) + tau, 0, int(T) - 1)
-    rows = np.arange(int(V), dtype=np.int32)
-    slack_slice = slack_per_bin_matrix[rows, t_idx_vec]
+            touched[r_int] = True
+
+    if not np.any(touched):
+        return 0.0
+
+    t_idx_vec_all = np.clip(int(t_G) + tau, 0, int(T) - 1)
+    rows_all = np.arange(int(V), dtype=np.int32)
+    rows = rows_all[touched]
+    t_idx_vec = t_idx_vec_all[touched]
+
+    # Prefer deriving slack from rolling occupancy and hourly capacity if provided
+    # so that Slack_G(t) basis matches the exceedance basis used in ṽ.
+    try:
+        if (
+            rolling_occ_by_bin is not None
+            and hourly_capacity_matrix is not None
+            and bins_per_hour is not None
+        ):
+            hour_idx = np.clip(t_idx_vec // int(bins_per_hour), 0, 23)
+            roll_vals = rolling_occ_by_bin[rows, t_idx_vec]
+            cap_vals = hourly_capacity_matrix[rows, hour_idx]
+            slack_slice = cap_vals - roll_vals
+        else:
+            slack_slice = slack_per_bin_matrix[rows, t_idx_vec]
+    except Exception:
+        # Fallback to cached slack if any indexing fails
+        slack_slice = slack_per_bin_matrix[rows, t_idx_vec]
+
     if slack_slice.size == 0:
         return 0.0
-    r_hat = int(np.argmin(slack_slice))
-    t_hat = int(t_idx_vec[int(r_hat)])
-    s = float(slack_slice[int(r_hat)])
+    local_idx = int(np.argmin(slack_slice))
+    r_hat = int(rows[int(local_idx)])
+    t_hat = int(t_idx_vec[int(local_idx)])
+    s = float(slack_slice[int(local_idx)])
 
     # Decide normalization S0 according to mode
     S0_eff = float(S0)
@@ -654,10 +694,18 @@ def slack_penalty(
                     if idx_to_tv_id is not None
                     else str(int(r_hat))
                 )
-                print(
-                    f"[slack_penalty] t_G={int(t_G)} | argmin TV={tv_name} (row {int(r_hat)}), t̂={int(t_hat)}, "
-                    f"Slack_G={float(s):.4f} | S0_eff<=0 → rho=0.0"
-                )
+                from rich.console import Console
+                console = Console()
+                from rich.table import Table
+                table = Table(title="Slack Penalty (S0_eff <= 0)")
+                table.add_column("Parameter", style="cyan")
+                table.add_column("Value", style="yellow")
+                table.add_row("t_G", str(int(t_G)))
+                table.add_row("argmin TV", f"{tv_name} (row {int(r_hat)})")
+                table.add_row("t̂", str(int(t_hat)))
+                table.add_row("Slack_G", f"{float(s):.4f}")
+                table.add_row("Result", "S0_eff<=0 → rho=0.0")
+                console.print(table)
             except Exception:
                 pass
         return 0.0
@@ -685,12 +733,22 @@ def slack_penalty(
                     cap_val = float(hourly_capacity_matrix[int(r_hat), int(hidx)])
                 except Exception:
                     cap_val = None
-            print(
-                f"[slack_penalty] t_G={int(t_G)} | argmin TV={tv_name} (row {int(r_hat)}), t̂={int(t_hat)} | "
-                f"Slack_G={float(s):.4f} | S0_mode={mode} S0_eff={float(S0_eff):.4f} | "
-                f"roll_occ={('N/A' if occ_val is None else f'{occ_val:.4f}')} | "
-                f"hour_cap={('N/A' if cap_val is None else f'{cap_val:.4f}')} | rho={rho:.4f}"
-            )
+            from rich.console import Console
+            from rich.table import Table
+            console = Console()
+            table = Table(title="Slack Penalty Debug")
+            table.add_column("Parameter", style="cyan")
+            table.add_column("Value", style="yellow")
+            table.add_row("t_G", str(int(t_G)))
+            table.add_row("argmin TV", f"{tv_name} (row {int(r_hat)})")
+            table.add_row("t̂", str(int(t_hat)))
+            table.add_row("Slack_G", f"{float(s):.4f}")
+            table.add_row("S0_mode", str(mode))
+            table.add_row("S0_eff", f"{float(S0_eff):.4f}")
+            table.add_row("roll_occ", ('N/A' if occ_val is None else f'{occ_val:.4f}'))
+            table.add_row("hour_cap", ('N/A' if cap_val is None else f'{cap_val:.4f}'))
+            table.add_row("rho", f"{rho:.4f}")
+            console.print(table)
         except Exception:
             pass
 

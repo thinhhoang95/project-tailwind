@@ -24,7 +24,7 @@ This reference documents public functions and classes under `parrhesia.metaopt`.
     - `hourly_capacity_matrix: np.ndarray (V×24)`
     - `cap_per_bin: np.ndarray (V·T)`
     - `hourly_occ_base: np.ndarray (V×24)`
-    - `slack_per_bin: np.ndarray (V·T)`
+    - `slack_per_bin: np.ndarray (V·T)` (flattened `max(hourly_capacity − rolling_hour_occ, 0)`)
     - `slack_per_bin_matrix: np.ndarray (V×T)`
     - `hourly_excess_bool: np.ndarray (V×T)`
     - `tv_row_of_tvtw: np.ndarray (V·T, int32)`

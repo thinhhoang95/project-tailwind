@@ -6,7 +6,7 @@ Implement a script in `src/project_tailwind/flow_x/cache_flow_extract.py` that:
 ### Assumptions and grounding
 - Hotspot items and flight lists come from `NetworkEvaluator` and `FlightList`.
 - Flow extraction uses `FlowXExtractor.find_groups_from_evaluator_item(...)` returning multiple groups per hotspot.
-- Excess logic is hourly-capacity-based; per-bin excess is distributed uniformly within that hour.
+- Excess logic compares hourly capacity against rolling-hour occupancy per bin.
 
 Key APIs to rely on:
 ```310:388:src/project_tailwind/optimize/eval/network_evaluator.py

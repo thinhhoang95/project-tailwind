@@ -12,11 +12,12 @@ resolves (see the geojson_path block below).
 
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, List
 
 import numpy as np
 from rich.console import Console
 from rich.table import Table
+import argparse
 
 
 def main() -> None:
@@ -33,26 +34,58 @@ def main() -> None:
 
     set_global_resources(indexer, flight_list)
 
-    # 3) Choose hotspot and convert time to bin index
-    hotspot_tv = "LSGL13W"
-    # For 15-minute bins, 09:00–09:15 starts at bin = 9*60/15 = 36
-    start_h, start_m = 9, 0
-    bin_size = indexer.time_bin_minutes
-    hotspot_bin = (start_h * 60 + start_m) // bin_size
+    # 3) Parse CLI: hotspot and time range [start, end) at 15-min granularity
+    parser = argparse.ArgumentParser(description="Flows + MetaOpt end-to-end over a time range")
+    parser.add_argument("--hotspot", default="LSGL13W", help="Hotspot TV ID (e.g., LSGL13W)")
+    parser.add_argument("--start", default="11:15", help="Range start time HH:MM (inclusive)")
+    parser.add_argument("--end", default="11:45", help="Range end time HH:MM (exclusive); defaults to start+1 bin")
+    parser.add_argument("--per-bin-debug", action="store_true", help="Print per-bin debug for pricing/slack")
+    args = parser.parse_args()
+
+    def _parse_hhmm(s: str) -> Tuple[int, int]:
+        try:
+            h, m = s.strip().split(":", 1)
+            return int(h), int(m)
+        except Exception:
+            raise ValueError(f"Invalid time format '{s}'. Expected HH:MM")
+
+    hotspot_tv = str(args.hotspot)
+    bin_size = int(indexer.time_bin_minutes)
+    start_h, start_m = _parse_hhmm(args.start)
+    if start_m % bin_size != 0:
+        raise ValueError(f"Start minutes must be a multiple of bin size ({bin_size})")
+    start_total = start_h * 60 + start_m
+    start_bin = start_total // bin_size
+
+    if args.end is None:
+        end_total = start_total + bin_size
+    else:
+        end_h, end_m = _parse_hhmm(args.end)
+        if end_m % bin_size != 0:
+            raise ValueError(f"End minutes must be a multiple of bin size ({bin_size})")
+        end_total = end_h * 60 + end_m
+    if not (0 <= start_total < end_total <= 24 * 60):
+        raise ValueError("Time range must be within a single day and end > start.")
+    end_bin = end_total // bin_size
+    if end_bin > int(indexer.num_time_bins):
+        raise ValueError("End time exceeds indexer's configured time bins.")
+    timebins: List[int] = list(range(int(start_bin), int(end_bin)))
+    if len(timebins) == 0:
+        raise ValueError("Empty time bin range; check start/end values.")
 
     # 4) Compute flows via the API wrapper
     from parrhesia.api.flows import compute_flows
 
     flows_payload: Dict[str, Any] = compute_flows(
         tvs=[hotspot_tv],
-        timebins=[hotspot_bin],
+        timebins=timebins,
         direction_opts={
             "mode": "coord_cosine",
             "tv_centroids": res.tv_centroids,
         },
     )
     print(
-        f"Found {len(flows_payload['flows'])} flows for {hotspot_tv} @ bin {hotspot_bin}"
+        f"Found {len(flows_payload['flows'])} flows for {hotspot_tv} @ bins {timebins[0]}–{timebins[-1]}"
     )
 
     console = Console()
@@ -124,7 +157,7 @@ def main() -> None:
 
     capacities_by_tv = build_bin_capacities(geojson_path, indexer)
     # Print some capacities
-    table = Table(title=f"Capacities at bin {hotspot_bin}")
+    table = Table(title=f"Capacities at bin {timebins[0]}")
     table.add_column("Traffic Volume")
     table.add_column("Capacity")
 
@@ -137,10 +170,10 @@ def main() -> None:
         tvs_to_show = tvs_to_show[:4]
 
     for tv in tvs_to_show:
-        capacity = capacities_by_tv[tv][hotspot_bin]
+        capacity = capacities_by_tv[tv][timebins[0]]
         table.add_row(tv, f"{capacity:.2f}")
 
-    hotspot_capacity = capacities_by_tv[hotspot_tv][hotspot_bin]
+    hotspot_capacity = capacities_by_tv[hotspot_tv][timebins[0]]
     table.add_row(hotspot_tv, f"{hotspot_capacity:.2f}", style="bold magenta")
     console.print(table)
     
@@ -165,16 +198,14 @@ def main() -> None:
     )
 
     # 7) Rebuild x_G and τ maps from compute_flows payload
-    hot = Hotspot(tv_id=hotspot_tv, bin=hotspot_bin)
     flows = flows_payload["flows"]
 
     xG_map: Dict[int, np.ndarray] = {}
     tau_map: Dict[int, Dict[int, int]] = {}
-    tG_map: Dict[int, int] = {}
     ctrl_by_flow: Dict[int, str] = {}
 
-    print("\n--- Detailed t_G Calculation ---")
-    hotspot_tv_row = row_map.get(hot.tv_id)
+    print("\n--- Preparing τ maps and demand series (x_G) ---")
+    hotspot_tv_row = row_map.get(hotspot_tv)
 
     # Feature flag to enable signed τ by relative direction vs control
     enable_signed_tau = True
@@ -210,44 +241,6 @@ def main() -> None:
         else:
             tau = flow_offsets_from_ctrl(ctrl, row_map, bin_offsets) or {}
 
-        # Phase alignment t_G uses the full τ map
-        tG_map[fid] = phase_time(hotspot_tv_row, hot, tau, T)
-
-        # Sanity check: print detailed breakdown of t_G
-        tG = tG_map[fid]
-        tau_G_s_star = tau.get(hotspot_tv_row) if hotspot_tv_row is not None else None
-
-        print("-" * 60)
-        print(f"Calculating phase alignment time t_G for flow {fid}:")
-        print("Formula: t_G = t* - τ_{G,s*}")
-        print("\n  Components:")
-        print("  - Hotspot H = (s*, t*):")
-        print(
-            f"    - s* (hotspot_tv): '{hot.tv_id}'"
-            + (f" (row: {hotspot_tv_row})" if hotspot_tv_row is not None else " (TV not found in row_map)")
-        )
-        print(f"    - t* (hotspot_bin): {hot.bin}")
-
-        print(f"\n  - Flow G = {fid}:")
-        # Resolve control row for display (not used for phase calculation)
-        ctrl_row = None
-        if ctrl is not None and ctrl in row_map:
-            ctrl_row = int(row_map[ctrl])
-        print(
-            f"    - Control volume s_ctrl: '{ctrl}'"
-            + (f" (row: {ctrl_row})" if ctrl_row is not None else " (Control TV not found or not specified)")
-        )
-
-        print("\n  - Travel time τ_{G,s*}:")
-        if tau_G_s_star is not None:
-            print(f"    - Offset from s_ctrl to s* in time bins: {tau_G_s_star}")
-            print("\n  Calculation:")
-            print(f"  t_G = {hot.bin} - {tau_G_s_star} = {tG}")
-        else:
-            print("    - Could not determine travel time offset.")
-            print(f"\n  Final t_G value: {tG}")
-        print("-" * 60)
-
         # Restrict τ to TVs actually visited by the flow (plus hotspot row for alignment safety)
         visited_rows = set()
         for fid_str in flow_flight_ids:
@@ -277,128 +270,177 @@ def main() -> None:
         tau_filtered = {int(r): int(off) for r, off in (tau or {}).items() if int(r) in visited_rows}
         tau_map[fid] = tau_filtered
 
-    # 8) Per-flow features wrt hotspot
+    # 8) Aggregate per-flow features over bins in [start_bin, end_bin)
     params = HyperParams(S0=5.0, S0_mode="x_at_argmin")  # default mode can be omitted
     h_row = int(row_map[hotspot_tv])
 
-    per_flow_feats: Dict[int, Dict[str, float]] = {}
+    per_flow_sums: Dict[int, Dict[str, float]] = {}
+    # Pre-initialize sums for all flows
     for fid in xG_map.keys():
-        tG = int(tG_map[fid])
-        tau = tau_map[fid]
-        xG = xG_map[fid]
-        # Rev1 mass weight and contribution-weighted price
-        xhat, DH, gH = mass_weight_gH(
-            xG,
-            tG,
-            h_row,
-            hot.bin,
-            S_mat,
-            eps=params.eps,
-            rolling_occ_by_bin=rolling_occ_by_bin,
-            hourly_capacity_matrix=hourly_capacity_matrix,
-            bins_per_hour=bins_per_hour,
-        )
-        v_tilde = price_contrib_v_tilde(
-            tG,
-            h_row,
-            hot.bin,
-            tau,
-            H_bool,
-            S_mat,
-            xG,
-            theta_mask=None,
-            w_sum=params.w_sum,
-            w_max=params.w_max,
-            kappa=params.kappa,
-            eps=params.eps,
-            verbose_debug=True,
-            idx_to_tv_id=idx_to_tv_id,
-            rolling_occ_by_bin=rolling_occ_by_bin,
-            hourly_capacity_matrix=hourly_capacity_matrix,
-            bins_per_hour=bins_per_hour,
-        )
-        # Slack + eligibility
-        sG = slack_G_at(tG, tau, S_mat)
-        aG = eligibility_a(xG, tG, q0=params.q0, gamma=params.gamma, soft=True)
-        rho = slack_penalty(
-            tG,
-            tau,
-            S_mat,
-            S0=params.S0,
-            xG=xG,
-            S0_mode=params.S0_mode,
-            verbose_debug=True,
-            idx_to_tv_id=idx_to_tv_id,
-            rolling_occ_by_bin=rolling_occ_by_bin,
-            hourly_capacity_matrix=hourly_capacity_matrix,
-            bins_per_hour=bins_per_hour,
-        )
-        # Rev1 score (α g_H ṽ − β ρ)
-        scr_rev1 = score_rev1(
-            t_G=tG,
-            hotspot_row=h_row,
-            hotspot_bin=hot.bin,
-            tau_row_to_bins=tau,
-            hourly_excess_bool=H_bool,
-            slack_per_bin_matrix=S_mat,
-            params=params,
-            xG=xG,
-            theta_mask=None,
-            verbose_debug=False,
-            idx_to_tv_id=idx_to_tv_id,
-            rolling_occ_by_bin=rolling_occ_by_bin,
-            hourly_capacity_matrix=hourly_capacity_matrix,
-            bins_per_hour=bins_per_hour,
-        )
-        per_flow_feats[fid] = {
-            "tG": float(tG),
-            # Rev1 fields
-            "xhat_GH": float(xhat),
-            "D_H": float(DH),
-            "g_H": float(gH),
-            "v_tilde": float(v_tilde),
-            "slackG": float(sG),
-            "eligibility": float(aG),
-            "rho": float(rho),
-            "score_rev1": float(scr_rev1),
+        per_flow_sums[int(fid)] = {
+            "xhat_GH": 0.0,
+            "D_H": 0.0,
+            "g_H": 0.0,
+            "v_tilde": 0.0,
+            "slackG": 0.0,
+            "eligibility": 0.0,
+            "rho": 0.0,
+            "score_rev1": 0.0,
         }
 
-    print("Per-flow features:")
-    for fid, d in per_flow_feats.items():
-        print(fid, d)
+    # Bin loop: compute per-flow contributions and accumulate
+    for b in timebins:
+        hot = Hotspot(tv_id=hotspot_tv, bin=int(b))
+        # Build phase times for this bin
+        tG_b: Dict[int, int] = {}
+        vtilde_b: Dict[int, float] = {}
+        for fid in xG_map.keys():
+            tau = tau_map[int(fid)]
+            xG = xG_map[int(fid)]
+            tG = int(phase_time(hotspot_tv_row, hot, tau, T))
+            tG_b[int(fid)] = tG
 
-    # 9) Pairwise features across flows
-    pairwise: Dict[Tuple[int, int], Dict[str, float]] = {}
-    flow_ids = list(xG_map.keys())
-    window = list(range(-params.window_left, params.window_right + 1))
-    for i in range(len(flow_ids)):
-        for j in range(i + 1, len(flow_ids)):
-            fi, fj = flow_ids[i], flow_ids[j]
-            # Build window around tGi in absolute bins
-            W = [int(tG_map[fi]) + int(k) for k in window]
-            # Align xGj to fi’s phase by shifting
-            d = int(tG_map[fi] - tG_map[fj])
-            xj_shift = np.zeros_like(xG_map[fj])
-            if d >= 0:
-                xj_shift[d:] = xG_map[fj][: T - d]
-            else:
-                xj_shift[: T + d] = xG_map[fj][-d:]
-            ov = temporal_overlap(xG_map[fi], xj_shift, window_bins=W)
-            orth = offset_orthogonality(h_row, hot.bin, tau_map[fi], tau_map[fj], H_bool)
-            Si = slack_profile(tG_map[fi], tau_map[fi], S_mat, window)
-            Sj = slack_profile(tG_map[fj], tau_map[fj], S_mat, window)
-            sc = slack_corr(Si, Sj)
-            pg = price_gap(per_flow_feats[fi]["vG"], per_flow_feats[fj]["vG"], eps=params.eps)
-            pairwise[(fi, fj)] = {
-                "overlap": float(ov),
-                "orth": float(orth),
-                "slack_corr": float(sc),
-                "price_gap": float(pg),
-            }
+            # Rev1 mass weight and contribution-weighted price
+            xhat, DH, gH = mass_weight_gH(
+                xG,
+                tG,
+                h_row,
+                hot.bin,
+                S_mat,
+                eps=params.eps,
+                rolling_occ_by_bin=rolling_occ_by_bin,
+                hourly_capacity_matrix=hourly_capacity_matrix,
+                bins_per_hour=bins_per_hour,
+            )
+            v_tilde = price_contrib_v_tilde(
+                tG,
+                h_row,
+                hot.bin,
+                tau,
+                H_bool,
+                S_mat,
+                xG,
+                theta_mask=None,
+                w_sum=params.w_sum,
+                w_max=params.w_max,
+                kappa=params.kappa,
+                eps=params.eps,
+                verbose_debug=bool(args.per_bin_debug),
+                idx_to_tv_id=idx_to_tv_id,
+                rolling_occ_by_bin=rolling_occ_by_bin,
+                hourly_capacity_matrix=hourly_capacity_matrix,
+                bins_per_hour=bins_per_hour,
+            )
+            vtilde_b[int(fid)] = float(v_tilde)
 
-    print("Pairwise features:")
-    for k, d in pairwise.items():
-        print(k, d)
+            # Slack + eligibility
+            sG = slack_G_at(tG, tau, S_mat)
+            aG = eligibility_a(xG, tG, q0=params.q0, gamma=params.gamma, soft=True)
+            rho = slack_penalty(
+                tG,
+                tau,
+                S_mat,
+                S0=params.S0,
+                xG=xG,
+                S0_mode=params.S0_mode,
+                verbose_debug=bool(args.per_bin_debug),
+                idx_to_tv_id=idx_to_tv_id,
+                rolling_occ_by_bin=rolling_occ_by_bin,
+                hourly_capacity_matrix=hourly_capacity_matrix,
+                bins_per_hour=bins_per_hour,
+            )
+            # Rev1 score (α g_H ṽ − β ρ)
+            scr_rev1 = score_rev1(
+                t_G=tG,
+                hotspot_row=h_row,
+                hotspot_bin=hot.bin,
+                tau_row_to_bins=tau,
+                hourly_excess_bool=H_bool,
+                slack_per_bin_matrix=S_mat,
+                params=params,
+                xG=xG,
+                theta_mask=None,
+                verbose_debug=True,
+                idx_to_tv_id=idx_to_tv_id,
+                rolling_occ_by_bin=rolling_occ_by_bin,
+                hourly_capacity_matrix=hourly_capacity_matrix,
+                bins_per_hour=bins_per_hour,
+            )
+
+            acc = per_flow_sums[int(fid)]
+            acc["xhat_GH"] += float(xhat)
+            acc["D_H"] += float(DH)
+            acc["g_H"] += float(gH)
+            acc["v_tilde"] += float(v_tilde)
+            acc["slackG"] += float(sG)
+            acc["eligibility"] += float(aG)
+            acc["rho"] += float(rho)
+            acc["score_rev1"] += float(scr_rev1)
+
+        # 9) Pairwise features for this bin; accumulate across bins
+        if "pairwise" not in locals():
+            pairwise: Dict[Tuple[int, int], Dict[str, float]] = {}
+        flow_ids = list(xG_map.keys())
+        window = list(range(-params.window_left, params.window_right + 1))
+        for i in range(len(flow_ids)):
+            for j in range(i + 1, len(flow_ids)):
+                fi, fj = int(flow_ids[i]), int(flow_ids[j])
+                # Build window around tGi in absolute bins
+                W = [int(tG_b[fi]) + int(k) for k in window]
+                # Align xGj to fi’s phase by shifting
+                d = int(tG_b[fi] - tG_b[fj])
+                xj_shift = np.zeros_like(xG_map[fj])
+                if d >= 0:
+                    xj_shift[d:] = xG_map[fj][: T - d]
+                else:
+                    xj_shift[: T + d] = xG_map[fj][-d:]
+                ov = temporal_overlap(xG_map[fi], xj_shift, window_bins=W)
+                orth = offset_orthogonality(h_row, hot.bin, tau_map[fi], tau_map[fj], H_bool)
+                Si = slack_profile(tG_b[fi], tau_map[fi], S_mat, window)
+                Sj = slack_profile(tG_b[fj], tau_map[fj], S_mat, window)
+                sc = slack_corr(Si, Sj)
+                pg = price_gap(vtilde_b[fi], vtilde_b[fj], eps=params.eps)
+                key = (fi, fj)
+                if key not in pairwise:
+                    pairwise[key] = {"overlap": 0.0, "orth": 0.0, "slack_corr": 0.0, "price_gap": 0.0}
+                pairwise[key]["overlap"] += float(ov)
+                pairwise[key]["orth"] += float(orth)
+                pairwise[key]["slack_corr"] += float(sc)
+                pairwise[key]["price_gap"] += float(pg)
+
+    if per_flow_sums:
+        feature_columns = list(next(iter(per_flow_sums.values())).keys())
+        per_flow_table = Table(
+            title=f"Per-flow features (summed across bins {timebins[0]}–{timebins[-1]})"
+        )
+        per_flow_table.add_column("Flow ID", justify="left", style="bold")
+        for col in feature_columns:
+            per_flow_table.add_column(col, justify="right")
+
+        for fid, metrics in per_flow_sums.items():
+            per_flow_table.add_row(
+                str(fid),
+                *[f"{metrics[col]:.3f}" for col in feature_columns],
+            )
+        console.print(per_flow_table)
+    else:
+        console.print("No per-flow features computed.")
+
+    if "pairwise" in locals() and pairwise:
+        pairwise_table = Table(title="Pairwise features (summed across bins)")
+        pairwise_table.add_column("Flow Pair", style="bold")
+        pairwise_columns = list(next(iter(pairwise.values())).keys())
+        for col in pairwise_columns:
+            pairwise_table.add_column(col, justify="right")
+
+        for (fi, fj), metrics in pairwise.items():
+            pairwise_table.add_row(
+                f"{fi} ↔ {fj}",
+                *[f"{metrics[col]:.3f}" for col in pairwise_columns],
+            )
+        console.print(pairwise_table)
+    else:
+        console.print("No pairwise features computed.")
 
 
 if __name__ == "__main__":
