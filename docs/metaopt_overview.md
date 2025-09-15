@@ -66,7 +66,11 @@ Given a hotspot H = (s*, t*), the flow’s phase time is:
 
 - Net score: matched‑filter objective
   - `score(t_G, h_row, h_bin, tau, hourly_excess_bool, slack_per_bin_matrix, params, xG, theta)` computes:
-    - `α · a_{G→H} · v_{G→H} − β · ρ_{G→H}` with `ρ = [1 − Slack_G(t_G)/S0]_+`
+    - `α · a_{G→H} · v_{G→H} − β · ρ_{G→H}` with `ρ = [1 − Slack_G(t_G)/S0_eff]_+`.
+    - `S0_eff` can be dynamic via `params.S0_mode`:
+      - `"x_at_argmin"` (default): `x_G` at the aligned time achieving the min in `Slack_G(t_G)`.
+      - `"x_at_control"`: `x_G(t_G)`.
+      - `"constant"`: the provided `params.S0`.
   - `lambda_delay` is included in params but not consumed yet (reserved for future delay penalty).
 
 ## Pairwise Features

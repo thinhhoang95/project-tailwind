@@ -6,10 +6,17 @@ from .per_flow_features import (
     phase_time,
     price_kernel_vG,
     price_to_hotspot_vGH,
+    price_kernel_vG_legacy,
+    price_to_hotspot_vGH_legacy,
     slack_G_at,
     eligibility_a,
     slack_penalty,
     score,
+    score_legacy,
+    # Rev1
+    mass_weight_gH,
+    price_contrib_v_tilde,
+    score_rev1,
 )
 from .pairwise_features import (
     temporal_overlap,
@@ -36,10 +43,17 @@ __all__ = [
     "phase_time",
     "price_kernel_vG",
     "price_to_hotspot_vGH",
+    "price_kernel_vG_legacy",
+    "price_to_hotspot_vGH_legacy",
     "slack_G_at",
     "eligibility_a",
     "slack_penalty",
     "score",
+    "score_legacy",
+    # Rev1
+    "mass_weight_gH",
+    "price_contrib_v_tilde",
+    "score_rev1",
     # Pairwise features
     "temporal_overlap",
     "offset_orthogonality",
@@ -47,4 +61,3 @@ __all__ = [
     "slack_corr",
     "price_gap",
 ]
-

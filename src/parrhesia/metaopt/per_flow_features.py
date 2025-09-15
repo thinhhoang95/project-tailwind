@@ -6,6 +6,364 @@ import numpy as np
 
 from .types import Hotspot, HyperParams
 
+# --- Rev1 helpers and pricing (feat_eng_rev1.md) ---
+def _aligned_indices(
+    hotspot_row: int,
+    hotspot_bin: int,
+    t_G: int,
+    tau_row_to_bins: Mapping[int, int],
+    V: int,
+    T: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Build alignment helpers restricted to rows touched by G (present in tau_row_to_bins):
+      - tau: int32 [V] with provided offsets on touched rows, 0 elsewhere
+      - touched_rows: bool [V] mask where row is in tau_row_to_bins
+      - t_idx_hotspot: int32 [V] with indices hotspot_bin + (tau - tau_ref) clamped
+      - t_idx_control: int32 [V] with indices t_G + tau clamped
+
+    This aligns each row's relevant time for hotspot-based effects (ripple) and
+    control-based presence checks.
+    """
+    tau = np.zeros(int(V), dtype=np.int32)
+    touched_rows = np.zeros(int(V), dtype=np.bool_)
+    for r, off in tau_row_to_bins.items():
+        r_int = int(r)
+        if 0 <= r_int < int(V):
+            tau[r_int] = int(off)
+            touched_rows[r_int] = True
+
+    tau_ref = int(tau[int(hotspot_row)]) if 0 <= int(hotspot_row) < int(V) else 0
+    rel_tau = tau - int(tau_ref)
+    t_idx_hotspot = np.clip(int(hotspot_bin) + rel_tau, 0, int(T) - 1)
+    t_idx_control = np.clip(int(t_G) + tau, 0, int(T) - 1)
+    return tau, touched_rows, t_idx_hotspot, t_idx_control
+
+
+def _exceedance_from_slack(slack_vals: np.ndarray) -> np.ndarray:
+    """
+    Derive exceedance magnitudes D = max(0, -slack). If provided slack is already
+    non-negative (typical with current caches), this yields zeros, which
+    gracefully reduces ω to 0/eps or 1 depending on presence.
+    """
+    return np.maximum(0.0, -np.asarray(slack_vals, dtype=np.float64))
+
+
+def mass_weight_gH(
+    xG: np.ndarray,
+    t_G: int,
+    hotspot_row: int,
+    hotspot_bin: int,
+    slack_per_bin_matrix: np.ndarray,
+    *,
+    eps: float = 1e-6,
+    rolling_occ_by_bin: Optional[np.ndarray] = None,
+    hourly_capacity_matrix: Optional[np.ndarray] = None,
+    bins_per_hour: Optional[int] = None,
+) -> Tuple[float, float, float]:
+    """
+    Compute mass weight at the hotspot per feat_eng_rev1.md:
+      - x̂_GH = xG(t_G)
+      - D_H = max(0, -slack[hotspot_row, hotspot_bin])
+      - g_H = x̂_GH / (x̂_GH + D_H) with guard for small denominator
+
+    Returns (x_hat_GH, D_H, g_H).
+    """
+    V, T = slack_per_bin_matrix.shape
+    tG = int(max(0, min(int(T) - 1, int(t_G))))
+    x_hat = float(xG[int(tG)]) if xG.size > 0 else 0.0
+    D_H = 0.0
+    if 0 <= int(hotspot_row) < int(V) and 0 <= int(hotspot_bin) < int(T):
+        if (
+            rolling_occ_by_bin is not None
+            and hourly_capacity_matrix is not None
+            and bins_per_hour is not None
+        ):
+            hidx = int(int(hotspot_bin) // int(bins_per_hour))
+            if hidx < 0:
+                hidx = 0
+            elif hidx > 23:
+                hidx = 23
+            try:
+                roll_val = float(rolling_occ_by_bin[int(hotspot_row), int(hotspot_bin)])
+                cap_val = float(hourly_capacity_matrix[int(hotspot_row), int(hidx)])
+                D_H = float(max(0.0, roll_val - cap_val))
+            except Exception:
+                sl = float(slack_per_bin_matrix[int(hotspot_row), int(hotspot_bin)])
+                D_H = float(max(0.0, -sl))
+        else:
+            sl = float(slack_per_bin_matrix[int(hotspot_row), int(hotspot_bin)])
+            D_H = float(max(0.0, -sl))
+    denom = float(x_hat + D_H)
+    if denom <= float(eps):
+        g = 0.0
+    else:
+        g = float(x_hat / denom)
+    return x_hat, D_H, g
+
+
+def _unit_price_matrix(
+    hourly_excess_bool: np.ndarray,
+    theta_mask: Optional[Mapping[Tuple[int, int], float]],
+    *,
+    w_sum: float,
+    w_max: float,
+) -> np.ndarray:
+    """
+    P_s(t) = (w_sum + w_max * θ_{s,t}) · 1{hourly_excess_bool[s,t]}
+    Returns a dense [V, T] matrix of unit prices.
+    """
+    V, T = hourly_excess_bool.shape
+    P = np.zeros((int(V), int(T)), dtype=np.float64)
+    # Start with base for overloaded cells
+    mask = hourly_excess_bool.astype(np.bool_, copy=False)
+    P[mask] = float(w_sum)
+    if theta_mask:
+        for (r, t), w in theta_mask.items():
+            r_int, t_int = int(r), int(t)
+            if 0 <= r_int < int(V) and 0 <= t_int < int(T) and mask[r_int, t_int]:
+                P[r_int, t_int] += float(w_max) * float(w)
+    return P
+
+
+def price_contrib_v_tilde(
+    t_G: int,
+    hotspot_row: int,
+    hotspot_bin: int,
+    tau_row_to_bins: Mapping[int, int],
+    hourly_excess_bool: np.ndarray,
+    slack_per_bin_matrix: np.ndarray,
+    xG: np.ndarray,
+    theta_mask: Optional[Mapping[Tuple[int, int], float]] = None,
+    *,
+    w_sum: float = 1.0,
+    w_max: float = 1.0,
+    kappa: float = 0.25,
+    eps: float = 1e-6,
+    verbose_debug: bool = False,
+    idx_to_tv_id: Optional[Mapping[int, str]] = None,
+    rolling_occ_by_bin: Optional[np.ndarray] = None,
+    hourly_capacity_matrix: Optional[np.ndarray] = None,
+    bins_per_hour: Optional[int] = None,
+) -> float:
+    """
+    Contribution-weighted price ṽ_{G→H} using overload-addressable shares ω:
+      - Primary: P_{s*}(t*) · ω_{s*,G|H}
+      - Secondary ripple: κ · Σ_{s≠s*, touched} P_s(t* + τ_{G,s} − τ_{G,s*}) · ω_{s,G|H}
+
+    Where ω_{s,G|H} = min(1, x_{s,G} / (D_s + eps)), with
+      - x_{s,G} = xG(t_G + τ_{G,s})
+      - D_s = max(0, -slack[s, t]) at the aligned hotspot time for row s
+
+    Vectorized over rows, restricted to rows present in τ map.
+    """
+    V, T = hourly_excess_bool.shape
+    tau, touched, t_idx_hot, t_idx_ctl = _aligned_indices(
+        hotspot_row, hotspot_bin, t_G, tau_row_to_bins, V, T
+    )
+
+    # Unit prices at all cells
+    P = _unit_price_matrix(hourly_excess_bool, theta_mask, w_sum=w_sum, w_max=w_max)
+
+    rows = np.arange(int(V), dtype=np.int32)
+    touched_rows = rows[touched]
+
+    # x_{s,G} at hotspot-aligned times (use same indices as P/D to avoid clamp mismatches)
+    x_sG = np.zeros(int(V), dtype=np.float64)
+    if xG.size > 0:
+        x_sG = xG[np.asarray(t_idx_hot, dtype=np.int32)]
+
+    # Exceedance magnitudes at hotspot-aligned times for all rows
+    t_hot_idx = np.asarray(t_idx_hot, dtype=np.int32)
+    if (
+        rolling_occ_by_bin is not None
+        and hourly_capacity_matrix is not None
+        and bins_per_hour is not None
+    ):
+        hour_idx = np.clip(t_hot_idx // int(bins_per_hour), 0, 23)
+        try:
+            roll_vals = rolling_occ_by_bin[rows, t_hot_idx]
+            cap_vals = hourly_capacity_matrix[rows, hour_idx]
+            D_s_vec = np.maximum(0.0, roll_vals - cap_vals)
+        except Exception:
+            slack_slice = slack_per_bin_matrix[rows, t_hot_idx]
+            D_s_vec = _exceedance_from_slack(slack_slice)
+    else:
+        slack_slice = slack_per_bin_matrix[rows, t_hot_idx]
+        D_s_vec = _exceedance_from_slack(slack_slice)
+
+    # Addressable shares ω
+    denom = D_s_vec + float(eps)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        omega = np.minimum(1.0, np.where(denom > 0.0, x_sG / denom, 0.0))
+    omega = omega.astype(np.float64, copy=False)
+    # Restrict to sectors touched by G
+    omega[~touched] = 0.0
+
+    # Primary term at hotspot cell
+    primary = 0.0
+    if 0 <= int(hotspot_row) < int(V):
+        P_h = float(P[int(hotspot_row), int(hotspot_bin)])
+        omega_h = float(omega[int(hotspot_row)])
+        primary = P_h * omega_h
+
+    # Secondary ripple on touched rows excluding s*
+    mask_sec = touched.copy()
+    if 0 <= int(hotspot_row) < int(V):
+        mask_sec[int(hotspot_row)] = False
+    if np.any(mask_sec):
+        P_sec = P[rows[mask_sec], np.asarray(t_idx_hot[mask_sec], dtype=np.int32)]
+        omega_sec = omega[mask_sec]
+        secondary = float(kappa) * float(np.sum(P_sec * omega_sec))
+    else:
+        secondary = 0.0
+
+    total = float(primary + secondary)
+
+    if verbose_debug:
+        try:
+            # Debug info about time alignment
+            print(f"\nTime alignment for flow G:")
+            print(f"  t_G (phase time): {t_G}")
+            print(f"  t* (hotspot bin): {hotspot_bin}")
+            print(f"  τ_{{G,s*}} (travel time to hotspot): {tau_row_to_bins.get(hotspot_row, 'N/A')}")
+            print(f"  Relationship: t_G = t* - τ_{{G,s*}} = {hotspot_bin} - {tau_row_to_bins.get(hotspot_row, 'N/A')} = {t_G}")
+            print(f"\nTime calculations per sector:")
+            print(f"  - t_hot(s) = clamp(t* + τ_{{G,s}} - τ_{{G,s*}}, 0, T-1): hotspot-aligned time used to read price/slack at row s. In other words: if there is a hotspot at time t*, then what is the relevant time bin we should read for s when traffic goes from s to the hotspot or vice versa?")
+            print(f"  - t_ctl(s) = clamp(t_G + τ_{{G,s}}, 0, T-1): control-aligned time where flow's presence x_{{s,G}} is sampled")
+            print(f"  - Algebraically (ignoring clamping), t_hot(s) = t* + τ_{{G,s}} - τ_{{G,s*}} = t_G + τ_{{G,s}} = t_ctl(s)")
+            print(f"  - t_G itself is constant per flow and defined as t_G = t* - τ_{{G,s*}}")
+            if not np.array_equal(t_idx_hot, t_idx_ctl):
+                print("  - Warning: t_hot(s) != t_ctl(s) for some rows due to boundary clamping; indexing x_{s,G} with t_hot(s) to match P and D indices.")
+            print()
+            from rich.console import Console
+            from rich.table import Table
+            console = Console()
+            table = Table(title="ṽ components (nonzero P or x)")
+            table.add_column("TV")
+            table.add_column("t_hot")
+            table.add_column("t_ctl")
+            table.add_column("roll_occ")
+            table.add_column("cap_hour")
+            table.add_column("P")
+            table.add_column("x_{s,G}")
+            table.add_column("D_s")
+            table.add_column("ω")
+            for r in rows[touched]:
+                th = int(t_idx_hot[int(r)])
+                tc = int(t_idx_ctl[int(r)])
+                Pval = float(P[int(r), th])
+                xval = float(x_sG[int(r)])
+                Dval = float(D_s_vec[int(r)])
+                oval = float(omega[int(r)])
+                # Rolling-hour occupancy at (row r, bin th) if provided
+                occ_val: Optional[float] = None
+                if rolling_occ_by_bin is not None:
+                    try:
+                        occ_val = float(rolling_occ_by_bin[int(r), th])
+                    except Exception:
+                        occ_val = None
+                # Hourly capacity for bin th if provided
+                cap_val: Optional[float] = None
+                if hourly_capacity_matrix is not None and bins_per_hour is not None:
+                    try:
+                        hour_idx = int(th // int(bins_per_hour))
+                        hour_idx = 0 if hour_idx < 0 else (23 if hour_idx > 23 else hour_idx)
+                        cap_val = float(hourly_capacity_matrix[int(r), hour_idx])
+                    except Exception:
+                        cap_val = None
+                if (Pval > 0.0 and oval > 0.0) or (int(r) == int(hotspot_row) and (Pval > 0 or xval > 0)):
+                    name = idx_to_tv_id.get(int(r), str(r)) if idx_to_tv_id else str(int(r))
+                    table.add_row(
+                        name,
+                        str(th),
+                        str(tc),
+                        (f"{occ_val:.4f}" if occ_val is not None else "N/A"),
+                        (f"{cap_val:.4f}" if cap_val is not None else "N/A"),
+                        f"{Pval:.4f}",
+                        f"{xval:.4f}",
+                        f"{Dval:.4f}",
+                        f"{oval:.4f}",
+                    )
+            console.print(table)
+            console.print(f"Primary: {primary:.4f}; Secondary: {secondary:.4f}; Total ṽ: {total:.4f}")
+        except Exception:
+            pass
+
+    return total
+
+
+def score_rev1(
+    t_G: int,
+    hotspot_row: int,
+    hotspot_bin: int,
+    tau_row_to_bins: Mapping[int, int],
+    hourly_excess_bool: np.ndarray,
+    slack_per_bin_matrix: np.ndarray,
+    params: HyperParams,
+    xG: np.ndarray,
+    theta_mask: Optional[Mapping[Tuple[int, int], float]] = None,
+    *,
+    verbose_debug: bool = False,
+    idx_to_tv_id: Optional[Mapping[int, str]] = None,
+    rolling_occ_by_bin: Optional[np.ndarray] = None,
+    hourly_capacity_matrix: Optional[np.ndarray] = None,
+    bins_per_hour: Optional[int] = None,
+) -> float:
+    """
+    Rev1 matched-filter score:
+      Score_rev1 = α · g_H(x̂_GH) · ṽ_{G→H} − β · ρ_{G→H}
+
+    with:
+      - g_H derived from xG and hotspot deficit D_H
+      - ṽ from contribution-weighted price using ω shares
+      - ρ unchanged from legacy
+    """
+    x_hat, D_H, gH = mass_weight_gH(
+        xG,
+        int(t_G),
+        int(hotspot_row),
+        int(hotspot_bin),
+        slack_per_bin_matrix,
+        eps=params.eps,
+        rolling_occ_by_bin=rolling_occ_by_bin,
+        hourly_capacity_matrix=hourly_capacity_matrix,
+        bins_per_hour=bins_per_hour,
+    )
+    v_tilde = price_contrib_v_tilde(
+        int(t_G),
+        int(hotspot_row),
+        int(hotspot_bin),
+        tau_row_to_bins,
+        hourly_excess_bool,
+        slack_per_bin_matrix,
+        xG,
+        theta_mask=theta_mask,
+        w_sum=params.w_sum,
+        w_max=params.w_max,
+        kappa=params.kappa,
+        eps=params.eps,
+        verbose_debug=verbose_debug,
+        idx_to_tv_id=idx_to_tv_id,
+        rolling_occ_by_bin=rolling_occ_by_bin,
+        hourly_capacity_matrix=hourly_capacity_matrix,
+        bins_per_hour=bins_per_hour,
+    )
+    rho = slack_penalty(
+        int(t_G),
+        tau_row_to_bins,
+        slack_per_bin_matrix,
+        S0=params.S0,
+        xG=xG,
+        S0_mode=getattr(params, "S0_mode", "x_at_argmin"),
+        verbose_debug=verbose_debug,
+        idx_to_tv_id=idx_to_tv_id,
+        rolling_occ_by_bin=rolling_occ_by_bin,
+        hourly_capacity_matrix=hourly_capacity_matrix,
+        bins_per_hour=bins_per_hour,
+    )
+    return float(params.alpha) * float(gH) * float(v_tilde) - float(params.beta) * float(rho)
+
 
 def phase_time(
     hotspot_row: Optional[int],
@@ -237,14 +595,106 @@ def slack_penalty(
     tau_row_to_bins: Mapping[int, int],
     slack_per_bin_matrix: np.ndarray,
     S0: float,
+    *,
+    xG: Optional[np.ndarray] = None,
+    S0_mode: str = "x_at_argmin",
+    verbose_debug: bool = False,
+    idx_to_tv_id: Optional[Mapping[int, str]] = None,
+    rolling_occ_by_bin: Optional[np.ndarray] = None,
+    hourly_capacity_matrix: Optional[np.ndarray] = None,
+    bins_per_hour: Optional[int] = None,
 ) -> float:
     """
     ρ_{G→H} = [1 − Slack_G(t_G)/S0]_+
+
+    Dynamic S0 modes (default = "x_at_argmin"):
+      - "x_at_argmin": S0 = x_G(t̂) where t̂ corresponds to the row/time attaining min slack in Slack_G(t_G).
+      - "x_at_control": S0 = x_G(t_G).
+      - "constant": use provided S0 as-is.
+
+    If the chosen mode requires xG but xG is None or empty, falls back to the constant S0.
     """
-    s = slack_G_at(int(t_G), tau_row_to_bins, slack_per_bin_matrix)
-    if S0 <= 0:
+    # Compute aligned indices and per-row slack at t_G + τ, then Slack_G(t_G)
+    V, T = slack_per_bin_matrix.shape
+    tau = np.zeros(int(V), dtype=np.int32)
+    for r, off in tau_row_to_bins.items():
+        r_int = int(r)
+        if 0 <= r_int < int(V):
+            tau[r_int] = int(off)
+    t_idx_vec = np.clip(int(t_G) + tau, 0, int(T) - 1)
+    rows = np.arange(int(V), dtype=np.int32)
+    slack_slice = slack_per_bin_matrix[rows, t_idx_vec]
+    if slack_slice.size == 0:
         return 0.0
-    return float(max(0.0, 1.0 - float(s) / float(S0)))
+    r_hat = int(np.argmin(slack_slice))
+    t_hat = int(t_idx_vec[int(r_hat)])
+    s = float(slack_slice[int(r_hat)])
+
+    # Decide normalization S0 according to mode
+    S0_eff = float(S0)
+    mode = str(S0_mode or "").strip().lower()
+    if mode == "x_at_control":
+        if xG is not None and xG.size > 0:
+            t_idx = int(max(0, min(len(xG) - 1, int(t_G))))
+            S0_eff = float(xG[int(t_idx)])
+    elif mode == "x_at_argmin":
+        if xG is not None and xG.size > 0:
+            # Guard index against xG length
+            if 0 <= int(t_hat) < int(xG.size):
+                S0_eff = float(xG[int(t_hat)])
+    else:
+        # mode == "constant" or unrecognized → keep provided S0
+        pass
+
+    if S0_eff <= 0.0:
+        if verbose_debug:
+            try:
+                tv_name = (
+                    idx_to_tv_id.get(int(r_hat), str(int(r_hat)))
+                    if idx_to_tv_id is not None
+                    else str(int(r_hat))
+                )
+                print(
+                    f"[slack_penalty] t_G={int(t_G)} | argmin TV={tv_name} (row {int(r_hat)}), t̂={int(t_hat)}, "
+                    f"Slack_G={float(s):.4f} | S0_eff<=0 → rho=0.0"
+                )
+            except Exception:
+                pass
+        return 0.0
+
+    rho = float(max(0.0, 1.0 - float(s) / float(S0_eff)))
+
+    if verbose_debug:
+        try:
+            tv_name = (
+                idx_to_tv_id.get(int(r_hat), str(int(r_hat)))
+                if idx_to_tv_id is not None
+                else str(int(r_hat))
+            )
+            occ_val = None
+            if rolling_occ_by_bin is not None:
+                try:
+                    occ_val = float(rolling_occ_by_bin[int(r_hat), int(t_hat)])
+                except Exception:
+                    occ_val = None
+            cap_val = None
+            if hourly_capacity_matrix is not None and bins_per_hour is not None and int(bins_per_hour) > 0:
+                try:
+                    hidx = int(int(t_hat) // int(bins_per_hour))
+                    hidx = 0 if hidx < 0 else (23 if hidx > 23 else hidx)
+                    cap_val = float(hourly_capacity_matrix[int(r_hat), int(hidx)])
+                except Exception:
+                    cap_val = None
+            print(
+                f"[slack_penalty] t_G={int(t_G)} | argmin TV={tv_name} (row {int(r_hat)}), t̂={int(t_hat)} | "
+                f"Slack_G={float(s):.4f} | S0_mode={mode} S0_eff={float(S0_eff):.4f} | "
+                f"roll_occ={('N/A' if occ_val is None else f'{occ_val:.4f}')} | "
+                f"hour_cap={('N/A' if cap_val is None else f'{cap_val:.4f}')} | rho={rho:.4f}"
+            )
+        except Exception:
+            pass
+
+    return rho
 
 
 def score(
@@ -263,6 +713,19 @@ def score(
     Matched-filter net score:
       Score(G | H) = α · a_{G→H} · v_{G→H} − β · ρ_{G→H} − λ_delay (delay term omitted here)
     """
+    # Rev1 feature flag dispatch
+    if getattr(params, "use_rev1", False) and xG is not None:
+        return score_rev1(
+            t_G=t_G,
+            hotspot_row=hotspot_row,
+            hotspot_bin=hotspot_bin,
+            tau_row_to_bins=tau_row_to_bins,
+            hourly_excess_bool=hourly_excess_bool,
+            slack_per_bin_matrix=slack_per_bin_matrix,
+            params=params,
+            xG=xG,
+            theta_mask=theta_mask,
+        )
     v = price_to_hotspot_vGH(
         hotspot_row=hotspot_row,
         hotspot_bin=hotspot_bin,
@@ -276,5 +739,22 @@ def score(
     a = 1.0
     if xG is not None:
         a = eligibility_a(xG, int(t_G), q0=params.q0, gamma=params.gamma, soft=use_soft_eligibility)
-    rho = slack_penalty(int(t_G), tau_row_to_bins, slack_per_bin_matrix, S0=params.S0)
+    rho = slack_penalty(
+        int(t_G),
+        tau_row_to_bins,
+        slack_per_bin_matrix,
+        S0=params.S0,
+        xG=xG,
+        S0_mode=getattr(params, "S0_mode", "x_at_argmin"),
+        verbose_debug=False,
+        idx_to_tv_id=None,
+        rolling_occ_by_bin=None,
+        hourly_capacity_matrix=None,
+        bins_per_hour=None,
+    )
     return float(params.alpha) * float(a) * float(v) - float(params.beta) * float(rho)
+
+# Back-compatibility aliases for legacy implementations
+price_kernel_vG_legacy = price_kernel_vG
+price_to_hotspot_vGH_legacy = price_to_hotspot_vGH
+score_legacy = score

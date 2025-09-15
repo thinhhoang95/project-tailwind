@@ -14,7 +14,7 @@ This reference documents public functions and classes under `parrhesia.metaopt`.
   - Structured proposal for rate optimization.
 
 - `HyperParams`
-  - Fields: `w_sum, w_max, kappa, alpha, beta, lambda_delay, q0, gamma, S0, eps, window_left, window_right`.
+  - Fields: `w_sum, w_max, kappa, alpha, beta, lambda_delay, q0, gamma, S0, S0_mode, eps, window_left, window_right`.
 
 ## Base Caches and Attention
 
@@ -56,7 +56,14 @@ This reference documents public functions and classes under `parrhesia.metaopt`.
 - `price_to_hotspot_vGH(hotspot_row: int, hotspot_bin: int, tau_row_to_bins, hourly_excess_bool, theta_mask=None, w_sum=1.0, w_max=1.0, kappa=0.25) -> float`
 - `slack_G_at(t: int, tau_row_to_bins, slack_per_bin_matrix) -> float`
 - `eligibility_a(xG: np.ndarray, t_G: int, q0: float, gamma: float, soft=False) -> float`
-- `slack_penalty(t_G: int, tau_row_to_bins, slack_per_bin_matrix, S0: float) -> float`
+- `slack_penalty(t_G: int, tau_row_to_bins, slack_per_bin_matrix, S0: float, *, xG: np.ndarray|None = None, S0_mode: str = "x_at_argmin", verbose_debug: bool = False, idx_to_tv_id: Mapping[int, str]|None = None, rolling_occ_by_bin: np.ndarray|None = None, hourly_capacity_matrix: np.ndarray|None = None, bins_per_hour: int|None = None) -> float`
+  - Computes `ρ_{G→H} = max(0, 1 − Slack_G(t_G)/S0_eff)`.
+  - `S0_mode` controls how `S0_eff` is chosen:
+    - `"x_at_argmin"` (default): `S0_eff = x_G(t̂)` where `t̂` is the aligned time at the row/time yielding the minimum slack in `Slack_G(t_G)`.
+    - `"x_at_control"`: `S0_eff = x_G(t_G)`.
+    - `"constant"`: use the provided `S0` unchanged.
+  - If the selected mode needs `xG` but it is `None` or empty, falls back to the constant `S0`.
+  - When `verbose_debug=True`, prints: argmin TV row/id, aligned time `t̂`, `Slack_G`, chosen `S0_eff` and `S0_mode`, rolling-hour occupancy at `(row, t̂)` if provided, hourly capacity for the hour of `t̂` if provided, and the resulting `rho`.
 - `score(t_G: int, hotspot_row: int, hotspot_bin: int, tau_row_to_bins, hourly_excess_bool, slack_per_bin_matrix, params: HyperParams, xG=None, theta_mask=None, use_soft_eligibility=False) -> float`
 
 ## Pairwise Features
