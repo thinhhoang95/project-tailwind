@@ -39,6 +39,9 @@ def build_base_caches(
       - 'hourly_capacity_matrix': np.ndarray shape [V, 24]
       - 'hourly_occ_base': np.ndarray shape [V, 24]
       - 'slack_per_bin': 1D np.ndarray length V*T with max(hourly_slack/ bins_per_hour, 0)
+      - 'slack_per_bin_matrix': np.ndarray shape [V, T]
+      - 'rolling_occ_by_bin': np.ndarray shape [V, T] with forward-looking rolling-hour occupancy
+      - 'excess_per_bin_matrix': np.ndarray shape [V, T] with max(rolling_occ - hourly_cap, 0)
       - 'hourly_excess_bool': np.ndarray shape [V, T] with (rolling_hour_occ - hourly_cap > 0)
     """
     num_tvs = len(flight_list.tv_id_to_idx)
@@ -102,6 +105,8 @@ def build_base_caches(
     # map hourly capacity by bin
     cap_by_bin_hour = hourly_capacity_matrix[:, hour_bins]
     hourly_excess_bool = (roll - cap_by_bin_hour) > 0.0
+    # Exceedance magnitude per bin (rolling occupancy minus hourly capacity, clamped at 0)
+    excess_per_bin_matrix = np.maximum(roll - cap_by_bin_hour, 0.0)
 
     # Slack per bin matrix [V, T] already computed above
 
@@ -117,6 +122,8 @@ def build_base_caches(
         "hourly_occ_base": hourly_occ_base.astype(np.float64, copy=False),
         "slack_per_bin": slack_per_bin.astype(np.float64, copy=False),
         "slack_per_bin_matrix": slack_per_bin_matrix.astype(np.float64, copy=False),
+        "rolling_occ_by_bin": roll.astype(np.float64, copy=False),
+        "excess_per_bin_matrix": excess_per_bin_matrix.astype(np.float64, copy=False),
         "hourly_excess_bool": hourly_excess_bool.astype(np.bool_, copy=False),
     }
 

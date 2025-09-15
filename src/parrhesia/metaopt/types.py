@@ -40,9 +40,12 @@ class HyperParams:
     gamma: float = 5.0
     # Slack normalization
     S0: float = 1.0
+    # Slack normalization mode: "x_at_argmin" (default), "x_at_control", or "constant"
+    S0_mode: str = "x_at_argmin"
     # Price gap epsilon
     eps: float = 1e-6
     # Window sizes
     window_left: int = 2
     window_right: int = 2
-
+    # Feature flag: use Rev1 pricing and score (α g_H ṽ − β ρ)
+    use_rev1: bool = False

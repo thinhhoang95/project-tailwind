@@ -152,13 +152,6 @@ def main() -> None:
     row_map = flight_list.tv_id_to_idx
     idx_to_tv_id = {idx: tv for tv, idx in row_map.items()}
 
-    # Prepare rolling-hour occupancy and hourly capacity for debug verification
-    num_tvs = int(caches.get("num_tvs", len(row_map)))
-    bins_per_hour = int(caches.get("bins_per_hour", max(1, 60 // int(indexer.time_bin_minutes))))
-    hourly_capacity_matrix = caches.get("hourly_capacity_matrix")
-    # Prefer cached rolling occupancy if present
-    rolling_occ_by_bin = caches.get("rolling_occ_by_bin")
-
     # 6) Convert travel minutes to bin offsets
     bin_offsets = minutes_to_bin_offsets(
         travel_minutes_map, time_bin_minutes=indexer.time_bin_minutes
@@ -209,8 +202,9 @@ def main() -> None:
             ) or {}
         else:
             tau = flow_offsets_from_ctrl(ctrl, row_map, bin_offsets) or {}
+        tau_map[fid] = tau
 
-        # Phase alignment t_G uses the full τ map
+        # Phase alignment t_G
         tG_map[fid] = phase_time(hotspot_tv_row, hot, tau, T)
 
         # Sanity check: print detailed breakdown of t_G
@@ -248,37 +242,8 @@ def main() -> None:
             print(f"\n  Final t_G value: {tG}")
         print("-" * 60)
 
-        # Restrict τ to TVs actually visited by the flow (plus hotspot row for alignment safety)
-        visited_rows = set()
-        for fid_str in flow_flight_ids:
-            try:
-                seq = flight_list.get_flight_tv_sequence_indices(str(fid_str))
-                if not isinstance(seq, np.ndarray):
-                    seq = np.asarray(seq, dtype=np.int64)
-            except Exception:
-                continue
-            if seq.size == 0:
-                continue
-            # Optional trim to earliest hotspot, mirroring offsets' trim
-            if hotspot_tv_row is not None:
-                cut = None
-                for i, v in enumerate(seq.tolist()):
-                    if int(v) == int(hotspot_tv_row):
-                        cut = i
-                        break
-                if cut is not None:
-                    seq = seq[: cut + 1]
-            visited_rows.update(int(v) for v in seq.tolist())
-
-        # Keep hotspot row to preserve primary term and consistent indexing
-        if hotspot_tv_row is not None:
-            visited_rows.add(int(hotspot_tv_row))
-
-        tau_filtered = {int(r): int(off) for r, off in (tau or {}).items() if int(r) in visited_rows}
-        tau_map[fid] = tau_filtered
-
     # 8) Per-flow features wrt hotspot
-    params = HyperParams(S0=5.0, S0_mode="x_at_argmin")  # default mode can be omitted
+    params = HyperParams(S0=5.0)  # tune as needed
     h_row = int(row_map[hotspot_tv])
 
     per_flow_feats: Dict[int, Dict[str, float]] = {}
@@ -286,6 +251,27 @@ def main() -> None:
         tG = int(tG_map[fid])
         tau = tau_map[fid]
         xG = xG_map[fid]
+        # Price kernels
+        vG = price_kernel_vG(
+            tG,
+            tau,
+            H_bool,
+            theta_mask=None,
+            w_sum=params.w_sum,
+            w_max=params.w_max,
+            verbose_debug=True,
+            idx_to_tv_id=idx_to_tv_id,
+        )
+        vGH = price_to_hotspot_vGH(
+            h_row,
+            hot.bin,
+            tau,
+            H_bool,
+            theta_mask=None,
+            w_sum=params.w_sum,
+            w_max=params.w_max,
+            kappa=params.kappa,
+        )
         # Rev1 mass weight and contribution-weighted price
         xhat, DH, gH = mass_weight_gH(
             xG,
@@ -294,9 +280,6 @@ def main() -> None:
             hot.bin,
             S_mat,
             eps=params.eps,
-            rolling_occ_by_bin=rolling_occ_by_bin,
-            hourly_capacity_matrix=hourly_capacity_matrix,
-            bins_per_hour=bins_per_hour,
         )
         v_tilde = price_contrib_v_tilde(
             tG,
@@ -313,25 +296,23 @@ def main() -> None:
             eps=params.eps,
             verbose_debug=True,
             idx_to_tv_id=idx_to_tv_id,
-            rolling_occ_by_bin=rolling_occ_by_bin,
-            hourly_capacity_matrix=hourly_capacity_matrix,
-            bins_per_hour=bins_per_hour,
         )
         # Slack + eligibility
         sG = slack_G_at(tG, tau, S_mat)
         aG = eligibility_a(xG, tG, q0=params.q0, gamma=params.gamma, soft=True)
-        rho = slack_penalty(
-            tG,
-            tau,
-            S_mat,
-            S0=params.S0,
+        rho = slack_penalty(tG, tau, S_mat, S0=params.S0)
+        # Net score (α a v_{G→H} − β ρ)
+        scr = score_flow(
+            t_G=tG,
+            hotspot_row=h_row,
+            hotspot_bin=hot.bin,
+            tau_row_to_bins=tau,
+            hourly_excess_bool=H_bool,
+            slack_per_bin_matrix=S_mat,
+            params=params,
             xG=xG,
-            S0_mode=params.S0_mode,
-            verbose_debug=True,
-            idx_to_tv_id=idx_to_tv_id,
-            rolling_occ_by_bin=rolling_occ_by_bin,
-            hourly_capacity_matrix=hourly_capacity_matrix,
-            bins_per_hour=bins_per_hour,
+            theta_mask=None,
+            use_soft_eligibility=True,
         )
         # Rev1 score (α g_H ṽ − β ρ)
         scr_rev1 = score_rev1(
@@ -346,12 +327,11 @@ def main() -> None:
             theta_mask=None,
             verbose_debug=False,
             idx_to_tv_id=idx_to_tv_id,
-            rolling_occ_by_bin=rolling_occ_by_bin,
-            hourly_capacity_matrix=hourly_capacity_matrix,
-            bins_per_hour=bins_per_hour,
         )
         per_flow_feats[fid] = {
             "tG": float(tG),
+            "vG": float(vG),
+            "vGH": float(vGH),
             # Rev1 fields
             "xhat_GH": float(xhat),
             "D_H": float(DH),
@@ -360,6 +340,7 @@ def main() -> None:
             "slackG": float(sG),
             "eligibility": float(aG),
             "rho": float(rho),
+            "score": float(scr),
             "score_rev1": float(scr_rev1),
         }
 

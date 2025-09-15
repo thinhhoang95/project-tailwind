@@ -119,7 +119,7 @@ for fobj in flows:
     tG_map[fid] = phase_time(h_row, hot, tau, T)
 
 # 8) Per-flow features wrt hotspot
-params = HyperParams(S0=5.0)  # tune as needed
+params = HyperParams(S0=5.0, S0_mode="x_at_argmin")  # default mode can be omitted
 h_row = int(row_map[hotspot_tv])
 
 per_flow_feats: Dict[int, Dict[str, float]] = {}
@@ -133,7 +133,7 @@ for fid in xG_map.keys():
     # Slack + eligibility
     sG = slack_G_at(tG, tau, S_mat)
     aG = eligibility_a(xG, tG, q0=params.q0, gamma=params.gamma, soft=True)
-    rho = slack_penalty(tG, tau, S_mat, S0=params.S0)
+    rho = slack_penalty(tG, tau, S_mat, S0=params.S0, xG=xG, S0_mode=params.S0_mode)
     # Net score (α a v_{G→H} − β ρ)
     scr = score_flow(
         t_G=tG,

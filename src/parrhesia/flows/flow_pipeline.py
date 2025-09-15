@@ -254,7 +254,7 @@ def build_global_flows(
     (True, True, True)
     """
 
-    print(f"build_global_flows: {flight_list}, {union_flight_ids}, {hotspots}, {trim_policy}, {leiden_params}, {direction_opts}")
+    # print(f"build_global_flows: {flight_list}, {union_flight_ids}, {hotspots}, {trim_policy}, {leiden_params}, {direction_opts}")
 
     ids = list(union_flight_ids)
     if len(ids) == 0:
