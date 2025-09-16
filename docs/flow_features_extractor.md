@@ -28,6 +28,10 @@ Inputs
 - travel_minutes_map: Nested mapping of minutes[src][dst] used to build bin offsets.
 - params: Optional `HyperParams` (defaults keep `S0_mode="x_at_argmin"`).
 - flows_payload: Optional pre‑computed payload from `parrhesia.api.flows.compute_flows` to reuse flows.
+- autotrim_from_ctrl_to_hotspot (bool, default False):
+  - When False (default), the domain of TVs considered for a flow is the union of all TVs that any flight in the flow reaches ("can touch").
+  - When True, per‑flight TV sequences and τ rows are trimmed to the prefix up to and including the first visit to the hotspot.
+  - Note: With `S0_mode="x_at_argmin"`, if a TV is "touched" but at a different aligned time bin such that `xG[t̂]=0`, then `rho` remains 0 by design (since `S0_eff<=0`).
 
 API
 - Class: `parrhesia.metaopt.feats.FlowFeaturesExtractor`
@@ -54,7 +58,14 @@ Quick Usage
 from parrhesia.metaopt.feats import FlowFeaturesExtractor
 from parrhesia.metaopt.types import HyperParams
 
-extractor = FlowFeaturesExtractor(indexer, flight_list, capacities_by_tv, travel_minutes_map, params=HyperParams(S0_mode="x_at_argmin"))
+extractor = FlowFeaturesExtractor(
+    indexer,
+    flight_list,
+    capacities_by_tv,
+    travel_minutes_map,
+    params=HyperParams(S0_mode="x_at_argmin"),
+    autotrim_from_ctrl_to_hotspot=False,  # default
+)
 features_by_flow = extractor.compute_for_hotspot(hotspot_tv="LSGL13W", timebins=[45,46,47,48], flows_payload=flows_payload)
 
 for fid, feats in features_by_flow.items():
@@ -63,4 +74,3 @@ for fid, feats in features_by_flow.items():
 
 Cross‑checking
 - See the runnable example at `src/parrhesia/metaopt/usage/flows_features_extractor_example.py`. It computes features using the extractor and, optionally, recomputes the same aggregates manually (mirroring the original example logic) to show side‑by‑side comparisons.
-

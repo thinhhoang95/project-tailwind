@@ -90,37 +90,37 @@ def main() -> None:
     })
 
     console = Console()
-    table = Table(title=f"FlowFeaturesExtractor results for {hotspot_tv} @ bins {timebins[0]}–{timebins[-1]}")
-    cols = [
-        "flow_id", "ctrl", "tGl", "tGu", "xGH", "DH", "gH(derived)", "gH_sum", "gH_avg", "v_tilde", "gH*v_tilde",
-        "Slack_G0", "G0_row", "Slack_G15", "G15_row", "Slack_G30", "G30_row", "Slack_G45", "G45_row", "rho"
-    ]
-    for c in cols:
-        table.add_column(c)
+    
+    # Display each flow in its own two-column table
     for fid, feat in feats_by_flow.items():
-        table.add_row(
-            str(fid),
-            str(feat.control_tv_id or ""),
-            str(feat.tGl),
-            str(feat.tGu),
-            f"{feat.xGH:.3f}",
-            f"{feat.DH:.3f}",
-            f"{feat.gH:.3f}",
-            f"{feat.gH_sum:.3f}",
-            f"{feat.gH_avg:.3f}",
-            f"{feat.v_tilde:.3f}",
-            f"{feat.gH_v_tilde:.3f}",
-            f"{feat.Slack_G0:.3f}",
-            ("None" if feat.Slack_G0_row is None else str(int(feat.Slack_G0_row))),
-            f"{feat.Slack_G15:.3f}",
-            ("None" if feat.Slack_G15_row is None else str(int(feat.Slack_G15_row))),
-            f"{feat.Slack_G30:.3f}",
-            ("None" if feat.Slack_G30_row is None else str(int(feat.Slack_G30_row))),
-            f"{feat.Slack_G45:.3f}",
-            ("None" if feat.Slack_G45_row is None else str(int(feat.Slack_G45_row))),
-            f"{feat.rho:.3f}",
-        )
-    console.print(table)
+        table = Table(title=f"Flow {fid} - {hotspot_tv} @ bins {timebins[0]}–{timebins[-1]}")
+        table.add_column("Field", style="bold")
+        table.add_column("Value")
+        
+        # Add rows for each field
+        table.add_row("flow_id", str(fid))
+        table.add_row("ctrl", str(feat.control_tv_id or ""))
+        table.add_row("tGl", str(feat.tGl))
+        table.add_row("tGu", str(feat.tGu))
+        table.add_row("xGH", f"{feat.xGH:.3f}")
+        table.add_row("DH", f"{feat.DH:.3f}")
+        table.add_row("gH(derived)", f"{feat.gH:.3f}")
+        table.add_row("gH_sum", f"{feat.gH_sum:.3f}")
+        table.add_row("gH_avg", f"{feat.gH_avg:.3f}")
+        table.add_row("v_tilde", f"{feat.v_tilde:.3f}")
+        table.add_row("gH*v_tilde", f"{feat.gH_v_tilde:.3f}")
+        table.add_row("Slack_G0", f"{feat.Slack_G0:.3f}")
+        table.add_row("G0_row", ("None" if feat.Slack_G0_row is None else str(int(feat.Slack_G0_row))))
+        table.add_row("Slack_G15", f"{feat.Slack_G15:.3f}")
+        table.add_row("G15_row", ("None" if feat.Slack_G15_row is None else str(int(feat.Slack_G15_row))))
+        table.add_row("Slack_G30", f"{feat.Slack_G30:.3f}")
+        table.add_row("G30_row", ("None" if feat.Slack_G30_row is None else str(int(feat.Slack_G30_row))))
+        table.add_row("Slack_G45", f"{feat.Slack_G45:.3f}")
+        table.add_row("G45_row", ("None" if feat.Slack_G45_row is None else str(int(feat.Slack_G45_row))))
+        table.add_row("rho", f"{feat.rho:.3f}")
+        
+        console.print(table)
+        console.print()  # Add spacing between flow tables
 
     if args.compare_manual:
         # Manual reproduction of per-bin sums to cross-check extractor
@@ -148,7 +148,7 @@ def main() -> None:
         bins_per_hour = int(caches.get("bins_per_hour", max(1, 60 // int(indexer.time_bin_minutes))))
         bin_offsets = minutes_to_bin_offsets(travel_minutes_map, time_bin_minutes=indexer.time_bin_minutes)
 
-        # Rebuild xG and τ maps
+        # Rebuild xG and τ maps (use full set of TVs that flights can reach; no autotrim)
         flows = flows_payload["flows"]
         xG_map: Dict[int, np.ndarray] = {}
         tau_map: Dict[int, Dict[int, int]] = {}
@@ -169,12 +169,12 @@ def main() -> None:
                 bin_offsets,
                 flow_flight_ids=flow_flight_ids,
                 flight_list=flight_list,
-                hotspots=[hotspot_tv],
-                trim_policy="earliest_hotspot",
+                hotspots=None,
+                trim_policy=None,
                 direction_sign_mode="order_vs_ctrl",
                 tv_centroids=res.tv_centroids,
             ) or {}
-            # Keep hotspot row and restrict to visited
+            # Keep hotspot row and restrict to visited TVs anywhere the flow can touch
             visited_rows = set()
             for fid_str in flow_flight_ids:
                 try:
@@ -185,14 +185,6 @@ def main() -> None:
                     continue
                 if seq.size == 0:
                     continue
-                # optional trim as above
-                cut = None
-                for i, v in enumerate(seq.tolist()):
-                    if int(v) == int(h_row):
-                        cut = i
-                        break
-                if cut is not None:
-                    seq = seq[: cut + 1]
                 visited_rows.update(int(v) for v in seq.tolist())
             if h_row not in visited_rows:
                 visited_rows.add(int(h_row))
@@ -286,22 +278,23 @@ def main() -> None:
                         slack_sum[int(fid)][int(mins)] += s_val
 
         # Compare side-by-side with extractor
-        cmp = Table(title="Manual vs Extractor (selected fields)")
-        for c in ["flow", "xGH(man)", "xGH(ext)", "DH(man)", "DH(ext)", "gH_sum(man)", "gH_sum(ext)", "v(man)", "v(ext)", "rho(man)", "rho(ext)", "G0(man)", "G0(ext)"]:
-            cmp.add_column(c)
         for fid, feat in feats_by_flow.items():
-            cmp.add_row(
-                str(fid),
-                f"{sums[fid]['xGH']:.3f}", f"{feat.xGH:.3f}",
-                f"{sums[fid]['DH']:.3f}", f"{feat.DH:.3f}",
-                f"{sums[fid]['gH_sum']:.3f}", f"{feat.gH_sum:.3f}",
-                f"{sums[fid]['v_tilde']:.3f}", f"{feat.v_tilde:.3f}",
-                f"{sums[fid]['rho']:.3f}", f"{feat.rho:.3f}",
-                f"{slack_sum[fid][0]:.3f}", f"{feat.Slack_G0:.3f}",
-            )
-        console.print(cmp)
+            cmp = Table(title=f"Manual vs Extractor Comparison - Flow {fid}")
+            cmp.add_column("Field", style="bold")
+            cmp.add_column("Manual", style="cyan")
+            cmp.add_column("Extractor", style="green")
+            
+            # Add comparison rows for each field
+            cmp.add_row("xGH", f"{sums[fid]['xGH']:.3f}", f"{feat.xGH:.3f}")
+            cmp.add_row("DH", f"{sums[fid]['DH']:.3f}", f"{feat.DH:.3f}")
+            cmp.add_row("gH_sum", f"{sums[fid]['gH_sum']:.3f}", f"{feat.gH_sum:.3f}")
+            cmp.add_row("v_tilde", f"{sums[fid]['v_tilde']:.3f}", f"{feat.v_tilde:.3f}")
+            cmp.add_row("rho", f"{sums[fid]['rho']:.3f}", f"{feat.rho:.3f}")
+            cmp.add_row("Slack_G0", f"{slack_sum[fid][0]:.3f}", f"{feat.Slack_G0:.3f}")
+            
+            console.print(cmp)
+            console.print()  # Add spacing between comparison tables
 
 
 if __name__ == "__main__":
     main()
-
