@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+import warnings
 
 import numpy as np
 
@@ -315,7 +316,7 @@ class FlowFeaturesExtractor:
         tGl_by_flow: Dict[int, int] = {int(fid): T - 1 for fid in xG_map.keys()}
         tGu_by_flow: Dict[int, int] = {int(fid): 0 for fid in xG_map.keys()}
 
-        # Slack sums and global argmin row trackers per Δ
+        # Slack sums and global argmin row trackers per Δ ∈ {0, 15, 30, 45} minutes (for example).
         slack_sums: Dict[int, Dict[int, float]] = {int(fid): {m: 0.0 for m in delta_min_list} for fid in xG_map.keys()}
         slack_min_rows: Dict[int, Dict[int, Optional[int]]] = {int(fid): {m: None for m in delta_min_list} for fid in xG_map.keys()}
         slack_min_vals: Dict[int, Dict[int, float]] = {int(fid): {m: float("inf") for m in delta_min_list} for fid in xG_map.keys()}
@@ -345,6 +346,27 @@ class FlowFeaturesExtractor:
                         flow_flight_ids = None
                         if hasattr(self, "_flights_by_flow"):
                             flow_flight_ids = getattr(self, "_flights_by_flow").get(int(fid))
+                        # Prefer geometric signs when flight ids are unavailable but tv_centroids exist
+                        tvc = getattr(self.indexer, "tv_centroids", None) or getattr(self, "tv_centroids", None)
+                        if not flow_flight_ids:
+                            if tvc:
+                                warnings.warn(
+                                    "[FlowFeaturesExtractor] Missing flow_flight_ids for τ recompute; "
+                                    "using vector_centroid sign inference (geometric fallback). Results may differ from order-based signs.",
+                                    RuntimeWarning,
+                                )
+                                dir_mode = "vector_centroid"
+                            else:
+                                warnings.warn(
+                                    "[FlowFeaturesExtractor] Missing flow_flight_ids and tv_centroids for τ recompute; "
+                                    "falling back to non-signed τ magnitudes. Derived times may be biased.",
+                                    RuntimeWarning,
+                                )
+                                # Explicitly disable sign mode to force magnitude fallback
+                                dir_mode = "disabled"
+                        else:
+                            # Normal case: order_vs_ctrl is the intended sign mode
+                            dir_mode = "order_vs_ctrl"
                         tau_full = flow_offsets_from_ctrl(
                             ctrl_tv,
                             self.row_map,
@@ -353,14 +375,22 @@ class FlowFeaturesExtractor:
                             flight_list=self.flight_list if flow_flight_ids else None,
                             hotspots=([str(hotspot_tv)] if (self.autotrim_from_ctrl_to_hotspot and hotspot_tv is not None) else None),
                             trim_policy=("earliest_hotspot" if self.autotrim_from_ctrl_to_hotspot else None),
-                            direction_sign_mode="order_vs_ctrl",
-                            tv_centroids=getattr(self.indexer, "tv_centroids", None) or getattr(self, "tv_centroids", None),
+                            direction_sign_mode=dir_mode,
+                            tv_centroids=tvc,
                         ) or {}
                         if int(h_row) in tau_full:
                             tau[int(h_row)] = int(tau_full[int(h_row)])
                         else:
+                            warnings.warn(
+                                "[FlowFeaturesExtractor] τ for hotspot row missing after recompute; defaulting to 0.",
+                                RuntimeWarning,
+                            )
                             tau[int(h_row)] = 0
                     except Exception:
+                        warnings.warn(
+                            "[FlowFeaturesExtractor] Exception during τ recompute for hotspot; defaulting τ(hotspot)=0.",
+                            RuntimeWarning,
+                        )
                         tau[int(h_row)] = 0
 
                 xG = xG_map[int(fid)]

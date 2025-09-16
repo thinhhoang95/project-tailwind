@@ -8,7 +8,7 @@ against a manual per-bin computation for verification.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import argparse
 import numpy as np
@@ -148,6 +148,55 @@ def main() -> None:
         bins_per_hour = int(caches.get("bins_per_hour", max(1, 60 // int(indexer.time_bin_minutes))))
         bin_offsets = minutes_to_bin_offsets(travel_minutes_map, time_bin_minutes=indexer.time_bin_minutes)
 
+        def _slack_argmin_details(
+            t_val: int, tau_row_to_bins: Dict[int, int]
+        ) -> Tuple[Optional[int], Optional[float], Optional[int], Optional[float], Optional[float]]:
+            V, T = S_mat.shape
+            tau_vec = np.zeros(int(V), dtype=np.int32)
+            touched = np.zeros(int(V), dtype=np.bool_)
+            for r, off in tau_row_to_bins.items():
+                r_int = int(r)
+                if 0 <= r_int < int(V):
+                    tau_vec[r_int] = int(off)
+                    touched[r_int] = True
+            if not np.any(touched):
+                return None, None, None, None, None
+
+            t_idx_all = np.clip(int(t_val) + tau_vec, 0, int(T) - 1)
+            rows_all = np.arange(int(V), dtype=np.int32)
+            rows = rows_all[touched]
+            t_idx = t_idx_all[touched]
+
+            roll_vals = cap_vals = None
+            try:
+                if (
+                    rolling_occ_by_bin is not None
+                    and hourly_capacity_matrix is not None
+                    and bins_per_hour is not None
+                ):
+                    hour_idx = np.clip(
+                        t_idx // int(bins_per_hour), 0, hourly_capacity_matrix.shape[1] - 1
+                    )
+                    roll_vals = rolling_occ_by_bin[rows, t_idx]
+                    cap_vals = hourly_capacity_matrix[rows, hour_idx]
+                    vals = cap_vals - roll_vals
+                else:
+                    vals = S_mat[rows, t_idx]
+            except Exception:
+                vals = S_mat[rows, t_idx]
+                roll_vals = cap_vals = None
+
+            if vals.size == 0:
+                return None, None, None, None, None
+
+            local_idx = int(np.argmin(vals))
+            row_idx = int(rows[local_idx])
+            bin_idx = int(t_idx[local_idx])
+            slack_val = float(vals[local_idx])
+            occ_val = float(roll_vals[local_idx]) if roll_vals is not None else None
+            cap_val = float(cap_vals[local_idx]) if cap_vals is not None else None
+            return row_idx, slack_val, bin_idx, occ_val, cap_val
+
         # Rebuild xG and τ maps (use full set of TVs that flights can reach; no autotrim)
         flows = flows_payload["flows"]
         xG_map: Dict[int, np.ndarray] = {}
@@ -202,7 +251,16 @@ def main() -> None:
         sums: Dict[int, Dict[str, float]] = {}
         tGl: Dict[int, int] = {}
         tGu: Dict[int, int] = {}
-        slack_sum: Dict[int, Dict[int, float]] = {int(fid): {m: 0.0 for m in delta_min_list} for fid in xG_map.keys()}
+        slack_sum: Dict[int, Dict[int, float]] = {
+            int(fid): {m: 0.0 for m in delta_min_list} for fid in xG_map.keys()
+        }
+        slack_details: Dict[int, Dict[int, Dict[str, Optional[float]]]] = {
+            int(fid): {
+                int(m): {"value": None, "row": None, "bin": None, "occ": None, "cap": None}
+                for m in delta_min_list
+            }
+            for fid in xG_map.keys()
+        }
         for fid in xG_map.keys():
             sums[int(fid)] = {"xGH": 0.0, "DH": 0.0, "gH_sum": 0.0, "v_tilde": 0.0, "rho": 0.0}
             tGl[int(fid)] = T - 1
@@ -267,15 +325,26 @@ def main() -> None:
                 for mins in delta_min_list:
                     t_eval = tG + delta_to_shift[mins]
                     if 0 <= t_eval < T:
-                        s_val = float(slack_G_at(
-                            t_eval,
-                            tau,
-                            S_mat,
-                            rolling_occ_by_bin=rolling_occ_by_bin,
-                            hourly_capacity_matrix=hourly_capacity_matrix,
-                            bins_per_hour=bins_per_hour,
-                        ))
+                        s_val = float(
+                            slack_G_at(
+                                t_eval,
+                                tau,
+                                S_mat,
+                                rolling_occ_by_bin=rolling_occ_by_bin,
+                                hourly_capacity_matrix=hourly_capacity_matrix,
+                                bins_per_hour=bins_per_hour,
+                            )
+                        )
                         slack_sum[int(fid)][int(mins)] += s_val
+                        row_idx, _, bin_idx, occ_val, cap_val = _slack_argmin_details(t_eval, tau)
+                        if row_idx is not None:
+                            details = slack_details[int(fid)][int(mins)]
+                            if details["value"] is None or s_val < float(details["value"]):
+                                details["value"] = float(s_val)
+                                details["row"] = int(row_idx)
+                                details["bin"] = int(bin_idx) if bin_idx is not None else None
+                                details["occ"] = float(occ_val) if occ_val is not None else None
+                                details["cap"] = float(cap_val) if cap_val is not None else None
 
         # Compare side-by-side with extractor
         for fid, feat in feats_by_flow.items():
@@ -291,8 +360,51 @@ def main() -> None:
             cmp.add_row("v_tilde", f"{sums[fid]['v_tilde']:.3f}", f"{feat.v_tilde:.3f}")
             cmp.add_row("rho", f"{sums[fid]['rho']:.3f}", f"{feat.rho:.3f}")
             cmp.add_row("Slack_G0", f"{slack_sum[fid][0]:.3f}", f"{feat.Slack_G0:.3f}")
-            
+            cmp.add_row("Slack_G15", f"{slack_sum[fid][15]:.3f}", f"{feat.Slack_G15:.3f}")
+            cmp.add_row("Slack_G30", f"{slack_sum[fid][30]:.3f}", f"{feat.Slack_G30:.3f}")
+            cmp.add_row("Slack_G45", f"{slack_sum[fid][45]:.3f}", f"{feat.Slack_G45:.3f}")
+
             console.print(cmp)
+            detail = Table(title=f"Slack Minima Details - Flow {fid}")
+            detail.add_column("Shift", style="bold")
+            detail.add_column("Manual TV")
+            detail.add_column("Manual Row")
+            detail.add_column("Bin")
+            detail.add_column("Rolling Occ")
+            detail.add_column("Capacity")
+            detail.add_column("Extractor TV")
+            detail.add_column("Extractor Row")
+            for mins in (15, 30, 45):
+                info = slack_details[int(fid)][int(mins)]
+                manual_row = info["row"]
+                manual_tv = (
+                    idx_to_tv_id.get(int(manual_row), str(manual_row))
+                    if manual_row is not None
+                    else "None"
+                )
+                manual_bin = int(info["bin"]) if info["bin"] is not None else None
+                manual_occ = f"{info['occ']:.3f}" if info["occ"] is not None else "-"
+                manual_cap = f"{info['cap']:.3f}" if info["cap"] is not None else "-"
+
+                extractor_row = getattr(feat, f"Slack_G{mins}_row")
+                extractor_tv = (
+                    idx_to_tv_id.get(int(extractor_row), str(extractor_row))
+                    if extractor_row is not None
+                    else "None"
+                )
+
+                detail.add_row(
+                    f"G+{mins}",
+                    manual_tv,
+                    str(manual_row) if manual_row is not None else "None",
+                    str(manual_bin) if manual_bin is not None else "-",
+                    manual_occ,
+                    manual_cap,
+                    extractor_tv,
+                    str(extractor_row) if extractor_row is not None else "None",
+                )
+
+            console.print(detail)
             console.print()  # Add spacing between comparison tables
 
 
