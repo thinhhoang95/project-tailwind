@@ -269,7 +269,7 @@ Use `ref_time_str` in numeric `HHMMSS` format (e.g., `084510` for 08:45:10). `HH
 
 ### GET `/flow_extraction?traffic_volume_id={id}&ref_time_str={time}&threshold={t}&resolution={r}&seed={n}&limit={k}`
 
-Computes community assignments for flights that pass through the specified traffic volume near a reference time. It reuses the ordered flights list and then applies a subflows flow extractor that builds Jaccard similarities over per-flight TV footprints and runs Leiden clustering. Internally, the extractor uses only the source `traffic_volume_id` and the candidate `flight_ids` (no "bin" or "hour" mode).
+Computes community assignments for flights that pass through the specified traffic volume near a reference time. It reuses the ordered flights list and then applies the same Jaccard + Leiden pipeline used by `/flows` via `parrhesia.flows.flow_pipeline.build_global_flows`. Internally, the pipeline trims footprints up to the earliest crossing of the requested TV and clusters using the provided `threshold` and `resolution`. Direction-aware reweighting uses TV centroids when available.
 
 Accepts flexible time formats for `ref_time_str`: `HHMMSS`, `HHMM`, `HH:MM`, `HH:MM:SS`.
 
@@ -299,9 +299,15 @@ Accepts flexible time formats for `ref_time_str`: `HHMMSS`, `HHMM`, `HH:MM`, `HH
 ```
 
 **Notes:**
-- The underlying flow extraction trims each candidate flight's footprint up to its first occurrence of the specified traffic volume and computes Jaccard similarity across these footprints.
+- The underlying flow extraction trims each candidate flight's footprint up to its first occurrence of the specified traffic volume and computes Jaccard similarity across these footprints, unified with `/flows`.
 - There is no bin/hour "mode" parameter. Grouping is determined solely by the provided `traffic_volume_id` and candidate `flight_ids`.
 - If the Leiden libraries are unavailable, a graph connected-components fallback is used.
+
+### GET `/flow_extraction_legacy`
+
+Provides the legacy flow extraction behavior using the previous subflows implementation (`project_tailwind.subflows.flow_extractor.assign_communities_for_hotspot`).
+
+Query parameters and response format are identical to `/flow_extraction`; only the underlying clustering code path differs. This endpoint is retained for regression comparison and backward compatibility.
 
 ### GET `/traffic_volumes`
 
