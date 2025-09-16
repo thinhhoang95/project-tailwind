@@ -239,15 +239,15 @@ def main() -> None:
                 bin_offsets,
                 flow_flight_ids=flow_flight_ids,
                 flight_list=flight_list,
-                hotspots=[hotspot_tv],
-                trim_policy="earliest_hotspot",
+                hotspots=None,
+                trim_policy=None,
                 direction_sign_mode="order_vs_ctrl",
                 tv_centroids=res.tv_centroids,
             ) or {}
         else:
             tau = flow_offsets_from_ctrl(ctrl, row_map, bin_offsets) or {}
 
-        # Restrict τ to TVs actually visited by the flow (plus hotspot row for alignment safety)
+        # Restrict τ to TVs actually visited by the flow anywhere it can touch (plus hotspot row for alignment safety)
         visited_rows = set()
         for fid_str in flow_flight_ids:
             try:
@@ -258,15 +258,7 @@ def main() -> None:
                 continue
             if seq.size == 0:
                 continue
-            # Optional trim to earliest hotspot, mirroring offsets' trim
-            if hotspot_tv_row is not None:
-                cut = None
-                for i, v in enumerate(seq.tolist()):
-                    if int(v) == int(hotspot_tv_row):
-                        cut = i
-                        break
-                if cut is not None:
-                    seq = seq[: cut + 1]
+            # Do not trim; include full sequence of visited TVs
             visited_rows.update(int(v) for v in seq.tolist())
 
         # Keep hotspot row to preserve primary term and consistent indexing
@@ -319,7 +311,8 @@ def main() -> None:
         for fid in xG_map.keys():
             tau = tau_map[int(fid)]
             xG = xG_map[int(fid)]
-            tG = int(phase_time(hotspot_tv_row, hot, tau, T))
+            # Use the resolved integer hotspot row for consistency
+            tG = int(phase_time(int(h_row), hot, tau, T))
             tG_b[int(fid)] = tG
 
             # Rev1 mass weight and contribution-weighted price

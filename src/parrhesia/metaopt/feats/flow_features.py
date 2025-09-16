@@ -75,12 +75,18 @@ class FlowFeaturesExtractor:
         capacities_by_tv: Mapping[str, np.ndarray],
         travel_minutes_map: Mapping[str, Mapping[str, float]],
         params: Optional[HyperParams] = None,
+        *,
+        autotrim_from_ctrl_to_hotspot: bool = False,
     ) -> None:
         self.indexer = indexer
         self.flight_list = flight_list
         self.capacities_by_tv = capacities_by_tv
         self.travel_minutes_map = travel_minutes_map
         self.params = params or HyperParams()
+        # Behavior flag: if True, trim flight sequences and τ rows to the
+        # earliest hotspot visit; otherwise use the full set of TVs that any
+        # flight in the flow reaches (default = False as requested).
+        self.autotrim_from_ctrl_to_hotspot: bool = bool(autotrim_from_ctrl_to_hotspot)
 
         # Build caches once
         self.caches: Dict[str, Any] = build_base_caches(
@@ -107,12 +113,27 @@ class FlowFeaturesExtractor:
 
         self.T: int = int(self.indexer.num_time_bins)
 
-    def _build_xG_series_from_flows(self, flows_payload: Mapping[str, Any]) -> Tuple[Dict[int, np.ndarray], Dict[int, Dict[int, int]], Dict[int, Optional[str]]]:
-        """Rebuild xG and τ maps from compute_flows payload; return (xG_map, tau_map, ctrl_by_flow)."""
+    def _build_xG_series_from_flows(
+        self,
+        flows_payload: Mapping[str, Any],
+        *,
+        hotspot_tv: Optional[str] = None,
+    ) -> Tuple[Dict[int, np.ndarray], Dict[int, Dict[int, int]], Dict[int, Optional[str]]]:
+        """
+        Rebuild xG and τ maps from compute_flows payload; return (xG_map, tau_map, ctrl_by_flow).
+
+        Behavior differences vs. earlier revision:
+        - If a hotspot is provided, infer τ with trim_policy="earliest_hotspot" and pass
+          that hotspot to the offsets helper so sign inference is restricted to the
+          prefix up to the first hotspot visit per flight.
+        - Restrict τ rows to TVs actually visited by the flow in that same prefix and
+          always include the hotspot row to preserve the primary term alignment.
+        """
         T = self.T
         xG_map: Dict[int, np.ndarray] = {}
         tau_map: Dict[int, Dict[int, int]] = {}
         ctrl_by_flow: Dict[int, Optional[str]] = {}
+        flights_by_flow: Dict[int, List[str]] = {}
 
         # Assume hotspot tv exists in row_map if called correctly
         for fobj in flows_payload.get("flows", []):
@@ -124,6 +145,7 @@ class FlowFeaturesExtractor:
             flow_flight_ids: List[str] = [
                 str(sp.get("flight_id")) for sp in flights_specs if sp.get("flight_id")
             ]
+            flights_by_flow[int(fid)] = list(flow_flight_ids)
             # Demand series by requested bins
             x = np.zeros(T, dtype=float)
             for sp in flights_specs:
@@ -132,19 +154,28 @@ class FlowFeaturesExtractor:
                     x[rb] += 1.0
             xG_map[fid] = x
 
-            # Signed τ map from control to all TVs; restrict to visited rows (+ hotspot row handled later in caller)
+            # Signed τ map from control to all TVs; restrict to visited rows in the
+            # prefix up to the earliest hotspot visit, and always include the hotspot row.
+            h_row: Optional[int] = None
+            if hotspot_tv is not None and hotspot_tv in self.row_map:
+                h_row = int(self.row_map[str(hotspot_tv)])
+
             tau = flow_offsets_from_ctrl(
                 ctrl,
                 self.row_map,
                 self.bin_offsets,
                 flow_flight_ids=flow_flight_ids,
                 flight_list=self.flight_list,
-                hotspots=None,  # hotspot known at compute time
-                trim_policy="earliest_hotspot",
+                hotspots=([str(hotspot_tv)] if (self.autotrim_from_ctrl_to_hotspot and hotspot_tv is not None) else None),
+                trim_policy=("earliest_hotspot" if self.autotrim_from_ctrl_to_hotspot else None),
                 direction_sign_mode="order_vs_ctrl",
                 tv_centroids=getattr(self.indexer, "tv_centroids", None) or getattr(self, "tv_centroids", None),
             ) or {}
-            # Limit τ to rows visited by the flow for stability
+
+            # Limit τ to rows the flow can touch: union of all TVs visited by at least
+            # one flight in the flow. If autotrim is enabled, restrict sequences to
+            # the prefix up to the earliest hotspot visit; otherwise keep full sequences.
+            # Always include the hotspot row for stability.
             visited_rows: set[int] = set()
             for fid_str in flow_flight_ids:
                 try:
@@ -155,9 +186,27 @@ class FlowFeaturesExtractor:
                     continue
                 if seq.size == 0:
                     continue
+                # Optional trim to earliest hotspot, mirroring offsets' trim
+                if self.autotrim_from_ctrl_to_hotspot and (h_row is not None):
+                    cut: Optional[int] = None
+                    for i, v in enumerate(seq.tolist()):
+                        if int(v) == int(h_row):
+                            cut = i
+                            break
+                    if cut is not None:
+                        seq = seq[: cut + 1]
                 visited_rows.update(int(v) for v in seq.tolist())
+
+            if h_row is not None:
+                visited_rows.add(int(h_row))
+
             tau_map[fid] = {int(r): int(off) for r, off in (tau or {}).items() if int(r) in visited_rows}
 
+        # Stash for internal fallback use
+        try:
+            self._flights_by_flow = flights_by_flow
+        except Exception:
+            pass
         return xG_map, tau_map, ctrl_by_flow
 
     def _slack_min_row(
@@ -223,6 +272,16 @@ class FlowFeaturesExtractor:
         if hotspot_tv not in self.row_map:
             raise ValueError(f"Unknown hotspot tv_id: {hotspot_tv}")
 
+        # If caller provided tv_centroids in direction_opts, make them available for τ sign fallback
+        if direction_opts and isinstance(direction_opts, Mapping):
+            try:
+                tvc = direction_opts.get("tv_centroids")
+                if tvc is not None:
+                    # Stash on self so _build_xG_series_from_flows can pick it up
+                    setattr(self, "tv_centroids", tvc)
+            except Exception:
+                pass
+
         # Fetch or reuse flows
         if flows_payload is None:
             from parrhesia.api.flows import compute_flows  # lazy import to avoid hard dep at import time
@@ -232,8 +291,10 @@ class FlowFeaturesExtractor:
                 direction_opts=dict(direction_opts or {}),
             )
 
-        # Build per-flow demand and offsets
-        xG_map, tau_map, ctrl_by_flow = self._build_xG_series_from_flows(flows_payload)
+        # Build per-flow demand and offsets respecting autotrim flag and keeping hotspot row
+        xG_map, tau_map, ctrl_by_flow = self._build_xG_series_from_flows(
+            flows_payload, hotspot_tv=str(hotspot_tv)
+        )
 
         h_row = int(self.row_map[hotspot_tv])
         T = self.T
@@ -275,9 +336,32 @@ class FlowFeaturesExtractor:
             hot = Hotspot(tv_id=hotspot_tv, bin=int(b))
             for fid in xG_map.keys():
                 tau = dict(tau_map[int(fid)] or {})
-                # Keep hotspot row to preserve primary term (if absent)
+                # Keep hotspot row to preserve primary term (if absent). If τ for hotspot
+                # is somehow missing, fall back to the absolute offsets map rather than 0.
                 if h_row not in tau:
-                    tau[int(h_row)] = int(tau.get(int(h_row), 0))
+                    try:
+                        # Recompute τ with flow context to preserve signs; respect autotrim flag
+                        ctrl_tv = ctrl_by_flow.get(int(fid))
+                        flow_flight_ids = None
+                        if hasattr(self, "_flights_by_flow"):
+                            flow_flight_ids = getattr(self, "_flights_by_flow").get(int(fid))
+                        tau_full = flow_offsets_from_ctrl(
+                            ctrl_tv,
+                            self.row_map,
+                            self.bin_offsets,
+                            flow_flight_ids=flow_flight_ids,
+                            flight_list=self.flight_list if flow_flight_ids else None,
+                            hotspots=([str(hotspot_tv)] if (self.autotrim_from_ctrl_to_hotspot and hotspot_tv is not None) else None),
+                            trim_policy=("earliest_hotspot" if self.autotrim_from_ctrl_to_hotspot else None),
+                            direction_sign_mode="order_vs_ctrl",
+                            tv_centroids=getattr(self.indexer, "tv_centroids", None) or getattr(self, "tv_centroids", None),
+                        ) or {}
+                        if int(h_row) in tau_full:
+                            tau[int(h_row)] = int(tau_full[int(h_row)])
+                        else:
+                            tau[int(h_row)] = 0
+                    except Exception:
+                        tau[int(h_row)] = 0
 
                 xG = xG_map[int(fid)]
                 tG = int(phase_time(hotspot_row=h_row, hotspot=hot, tau_row_to_bins=tau, T=T))
@@ -421,4 +505,3 @@ class FlowFeaturesExtractor:
             )
 
         return out
-
