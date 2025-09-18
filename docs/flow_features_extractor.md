@@ -116,6 +116,14 @@ General setup: for each `Δ ∈ {0, 15, 30, 45}` minutes, convert the minute shi
   - On ties, NumPy’s `argmin` picks the first row in index order; there is no deterministic tie-break beyond row order.
   - Uses the same fallback path as `Slack_GΔ` when rolling occupancy data are unavailable.
 
+**Slack_GΔ_occ / Slack_GΔ_cap (Δ ∈ {0, 15, 30, 45})**
+- Computation: stored alongside `Slack_GΔ_row`. Whenever a new global minimum slack is observed for a given Δ, the extractor records the rolling-hour occupancy `rolling_occ_by_bin[row, aligned_bin]` and hourly capacity `hourly_capacity_matrix[row, hour_idx]` from the same aligned bin `t_eval = tG + shift`. These values therefore correspond exactly to the bin/time pair that produced the minimum slack across the requested hotspot bin range. If the rolling caches are unavailable, both fields remain `None` and the slack value falls back to `S_mat`.
+- Informal explanation: surfaces the context (demand vs capacity) at the tightest point the flow encounters after applying the Δ shift, making it easy to see how close to capacity the bottleneck was when slack was minimal.
+- Edge-case behavior:
+  - When the minimum slack comes from a bin outside the rolling-hour cache range (e.g., due to clamping) the occupancy/capacity values are taken from the clamped index; if the cache lookup fails, they revert to `None` while the slack value falls back to the static matrix.
+  - If no minimum is recorded (because the flow never yields an in-range `t_eval`), both fields stay `None`.
+  - The hour index used for capacity is `floor((t_eval + τ_row) / bins_per_hour)` and is clamped to the matrix width to avoid IndexError.
+
 ### Risk Penalty
 
 **rho**

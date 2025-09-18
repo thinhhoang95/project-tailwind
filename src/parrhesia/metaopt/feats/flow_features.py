@@ -39,12 +39,20 @@ class FlowFeatures:
     # Slack sums and global-argmin row indices per Δ ∈ {0, 15, 30, 45} minutes
     Slack_G0: float
     Slack_G0_row: Optional[int]
+    Slack_G0_occ: Optional[float]
+    Slack_G0_cap: Optional[float]
     Slack_G15: float
     Slack_G15_row: Optional[int]
+    Slack_G15_occ: Optional[float]
+    Slack_G15_cap: Optional[float]
     Slack_G30: float
     Slack_G30_row: Optional[int]
+    Slack_G30_occ: Optional[float]
+    Slack_G30_cap: Optional[float]
     Slack_G45: float
     Slack_G45_row: Optional[int]
+    Slack_G45_occ: Optional[float]
+    Slack_G45_cap: Optional[float]
 
     # Risk penalty (sum over period)
     rho: float
@@ -214,8 +222,8 @@ class FlowFeaturesExtractor:
         self,
         t_val: int,
         tau_row_to_bins: Mapping[int, int],
-    ) -> Tuple[Optional[int], Optional[float]]:
-        """Return (row_index, min_slack_value) at time t_val + τ for touched rows; None if undefined."""
+    ) -> Tuple[Optional[int], Optional[float], Optional[float], Optional[float]]:
+        """Return (row_index, min_slack_value, rolling_occ, capacity) at time t_val + τ; None if undefined."""
         V, T = self.S_mat.shape
         tau = np.zeros(int(V), dtype=np.int32)
         touched = np.zeros(int(V), dtype=np.bool_)
@@ -225,19 +233,22 @@ class FlowFeaturesExtractor:
                 tau[r_int] = int(off)
                 touched[r_int] = True
         if not np.any(touched):
-            return None, None
+            return None, None, None, None
         t_idx_vec_all = np.clip(int(t_val) + tau, 0, int(T) - 1)
         rows_all = np.arange(int(V), dtype=np.int32)
         rows = rows_all[touched]
         t_idx_vec = t_idx_vec_all[touched]
 
+        roll_vals: Optional[np.ndarray] = None
+        cap_vals: Optional[np.ndarray] = None
         try:
             if (
                 self.rolling_occ_by_bin is not None
                 and self.hourly_capacity_matrix is not None
                 and self.bins_per_hour is not None
             ):
-                hour_idx = np.clip(t_idx_vec // int(self.bins_per_hour), 0, 23)
+                max_hour_idx = int(self.hourly_capacity_matrix.shape[1]) - 1
+                hour_idx = np.clip(t_idx_vec // int(self.bins_per_hour), 0, max_hour_idx)
                 roll_vals = self.rolling_occ_by_bin[rows, t_idx_vec]
                 cap_vals = self.hourly_capacity_matrix[rows, hour_idx]
                 vals = cap_vals - roll_vals
@@ -245,13 +256,21 @@ class FlowFeaturesExtractor:
                 vals = self.S_mat[rows, t_idx_vec]
         except Exception:
             vals = self.S_mat[rows, t_idx_vec]
+            roll_vals = None
+            cap_vals = None
 
         if vals.size == 0:
-            return None, None
+            return None, None, None, None
         local_idx = int(np.argmin(vals))
         r_hat = int(rows[int(local_idx)])
         s_min = float(vals[int(local_idx)])
-        return r_hat, s_min
+        occ_val: Optional[float] = None
+        cap_val: Optional[float] = None
+        if roll_vals is not None:
+            occ_val = float(roll_vals[int(local_idx)])
+        if cap_vals is not None:
+            cap_val = float(cap_vals[int(local_idx)])
+        return r_hat, s_min, occ_val, cap_val
 
     def compute_for_hotspot(
         self,
@@ -320,6 +339,8 @@ class FlowFeaturesExtractor:
         slack_sums: Dict[int, Dict[int, float]] = {int(fid): {m: 0.0 for m in delta_min_list} for fid in xG_map.keys()}
         slack_min_rows: Dict[int, Dict[int, Optional[int]]] = {int(fid): {m: None for m in delta_min_list} for fid in xG_map.keys()}
         slack_min_vals: Dict[int, Dict[int, float]] = {int(fid): {m: float("inf") for m in delta_min_list} for fid in xG_map.keys()}
+        slack_min_occ: Dict[int, Dict[int, Optional[float]]] = {int(fid): {m: None for m in delta_min_list} for fid in xG_map.keys()}
+        slack_min_cap: Dict[int, Dict[int, Optional[float]]] = {int(fid): {m: None for m in delta_min_list} for fid in xG_map.keys()}
 
         # Initialize metric accumulators
         for fid in xG_map.keys():
@@ -453,11 +474,13 @@ class FlowFeaturesExtractor:
                     slack_sums[int(fid)][int(mins)] += float(s_val)
 
                     # Track global argmin row
-                    r_hat, s_min = self._slack_min_row(t_eval, tau)
+                    r_hat, s_min, occ_val, cap_val = self._slack_min_row(t_eval, tau)
                     # If this bin yields a new minimum, update row
                     if s_min is not None and float(s_min) < float(slack_min_vals[int(fid)][int(mins)]):
                         slack_min_vals[int(fid)][int(mins)] = float(s_min)
                         slack_min_rows[int(fid)][int(mins)] = int(r_hat) if r_hat is not None else None
+                        slack_min_occ[int(fid)][int(mins)] = float(occ_val) if occ_val is not None else None
+                        slack_min_cap[int(fid)][int(mins)] = float(cap_val) if cap_val is not None else None
 
                 # Eligibility (soft) and slack penalty
                 rho = slack_penalty(
@@ -510,6 +533,16 @@ class FlowFeaturesExtractor:
             r30 = slack_min_rows[int(fid)][30]
             r45 = slack_min_rows[int(fid)][45]
 
+            occ0 = slack_min_occ[int(fid)][0]
+            occ15 = slack_min_occ[int(fid)][15]
+            occ30 = slack_min_occ[int(fid)][30]
+            occ45 = slack_min_occ[int(fid)][45]
+
+            cap0 = slack_min_cap[int(fid)][0]
+            cap15 = slack_min_cap[int(fid)][15]
+            cap30 = slack_min_cap[int(fid)][30]
+            cap45 = slack_min_cap[int(fid)][45]
+
             out[int(fid)] = FlowFeatures(
                 flow_id=int(fid),
                 control_tv_id=ctrl_by_flow.get(int(fid)),
@@ -524,12 +557,20 @@ class FlowFeaturesExtractor:
                 gH_v_tilde=float(g_derived * v_sum),
                 Slack_G0=slack0,
                 Slack_G0_row=(int(r0) if r0 is not None else None),
+                Slack_G0_occ=(float(occ0) if occ0 is not None else None),
+                Slack_G0_cap=(float(cap0) if cap0 is not None else None),
                 Slack_G15=slack15,
                 Slack_G15_row=(int(r15) if r15 is not None else None),
+                Slack_G15_occ=(float(occ15) if occ15 is not None else None),
+                Slack_G15_cap=(float(cap15) if cap15 is not None else None),
                 Slack_G30=slack30,
                 Slack_G30_row=(int(r30) if r30 is not None else None),
+                Slack_G30_occ=(float(occ30) if occ30 is not None else None),
+                Slack_G30_cap=(float(cap30) if cap30 is not None else None),
                 Slack_G45=slack45,
                 Slack_G45_row=(int(r45) if r45 is not None else None),
+                Slack_G45_occ=(float(occ45) if occ45 is not None else None),
+                Slack_G45_cap=(float(cap45) if cap45 is not None else None),
                 rho=float(acc["rho"]),
                 bins_count=bins_count,
             )
