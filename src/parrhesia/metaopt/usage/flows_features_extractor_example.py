@@ -90,7 +90,10 @@ def main() -> None:
     })
 
     console = Console()
-    
+
+    def _fmt_opt(val: Optional[float]) -> str:
+        return "-" if val is None else f"{float(val):.3f}"
+
     # Display each flow in its own two-column table
     for fid, feat in feats_by_flow.items():
         table = Table(title=f"Flow {fid} - {hotspot_tv} @ bins {timebins[0]}–{timebins[-1]}")
@@ -111,12 +114,20 @@ def main() -> None:
         table.add_row("gH*v_tilde", f"{feat.gH_v_tilde:.3f}")
         table.add_row("Slack_G0", f"{feat.Slack_G0:.3f}")
         table.add_row("G0_row", ("None" if feat.Slack_G0_row is None else str(int(feat.Slack_G0_row))))
+        table.add_row("Slack_G0_occ", _fmt_opt(feat.Slack_G0_occ))
+        table.add_row("Slack_G0_cap", _fmt_opt(feat.Slack_G0_cap))
         table.add_row("Slack_G15", f"{feat.Slack_G15:.3f}")
         table.add_row("G15_row", ("None" if feat.Slack_G15_row is None else str(int(feat.Slack_G15_row))))
+        table.add_row("Slack_G15_occ", _fmt_opt(feat.Slack_G15_occ))
+        table.add_row("Slack_G15_cap", _fmt_opt(feat.Slack_G15_cap))
         table.add_row("Slack_G30", f"{feat.Slack_G30:.3f}")
         table.add_row("G30_row", ("None" if feat.Slack_G30_row is None else str(int(feat.Slack_G30_row))))
+        table.add_row("Slack_G30_occ", _fmt_opt(feat.Slack_G30_occ))
+        table.add_row("Slack_G30_cap", _fmt_opt(feat.Slack_G30_cap))
         table.add_row("Slack_G45", f"{feat.Slack_G45:.3f}")
         table.add_row("G45_row", ("None" if feat.Slack_G45_row is None else str(int(feat.Slack_G45_row))))
+        table.add_row("Slack_G45_occ", _fmt_opt(feat.Slack_G45_occ))
+        table.add_row("Slack_G45_cap", _fmt_opt(feat.Slack_G45_cap))
         table.add_row("rho", f"{feat.rho:.3f}")
         
         console.print(table)
@@ -374,7 +385,9 @@ def main() -> None:
             detail.add_column("Capacity")
             detail.add_column("Extractor TV")
             detail.add_column("Extractor Row")
-            for mins in (15, 30, 45):
+            detail.add_column("Extractor Rolling Occ")
+            detail.add_column("Extractor Capacity")
+            for mins in (0, 15, 30, 45):
                 info = slack_details[int(fid)][int(mins)]
                 manual_row = info["row"]
                 manual_tv = (
@@ -392,6 +405,8 @@ def main() -> None:
                     if extractor_row is not None
                     else "None"
                 )
+                extractor_occ = _fmt_opt(getattr(feat, f"Slack_G{mins}_occ", None))
+                extractor_cap = _fmt_opt(getattr(feat, f"Slack_G{mins}_cap", None))
 
                 detail.add_row(
                     f"G+{mins}",
@@ -402,6 +417,8 @@ def main() -> None:
                     manual_cap,
                     extractor_tv,
                     str(extractor_row) if extractor_row is not None else "None",
+                    extractor_occ,
+                    extractor_cap,
                 )
 
             console.print(detail)
