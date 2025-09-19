@@ -213,6 +213,13 @@ def build_global_flows(
     `hotspots` are forwarded to enable trimming up to and including the earliest
     crossing of any hotspot in the set.
 
+    Notes:
+
+    The primary role of the hotspots parameter is to define points for trimming flight paths when the trim_policy is set to "earliest_hotspot", which is the default.
+    This trimming affects two key calculations that determine how flights are clustered into flows:
+    - Footprint Calculation: A flight's "footprint" is essentially the set of unique airspace volumes (TVs or "time volumes") it passes through. The similarity between flights is first calculated based on the overlap of these footprints (using Jaccard similarity).
+    - Direction-Aware Reweighting: After calculating the initial similarity, the code can adjust the scores based on flight direction. It calculates a direction vector for each flight (from its first TV to its last TV) and increases the similarity score for flights traveling in similar directions.
+
     Parameters
     ----------
     flight_list : FlightList
