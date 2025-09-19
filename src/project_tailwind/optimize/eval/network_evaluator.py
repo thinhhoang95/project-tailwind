@@ -47,7 +47,7 @@ class NetworkEvaluator:
         self._baseline_takeoff_seconds: np.ndarray = np.empty(0, dtype=np.float64)
         self._baseline_takeoff_seconds_by_fid: Dict[str, float] = {}
         self.original_flight_list = None
-        self._capture_baseline_takeoffs(flight_list)
+        self._baseline_initialized = False
 
         # Extract time window information
         self.time_bin_minutes = flight_list.time_bin_minutes
@@ -93,20 +93,23 @@ class NetworkEvaluator:
         )
 
     def _capture_baseline_takeoffs(self, flight_list: FlightList) -> None:
-        """Record immutable baseline takeoff timestamps for delay statistics."""
+        """Record immutable baseline takeoff timestamps for delay statistics.
 
-        base_snapshot = getattr(flight_list, "_base", None)
-        if base_snapshot is not None:
-            self.original_flight_list = base_snapshot
-        else:
-            self.original_flight_list = self._clone_flight_list_for_baseline(flight_list)
+        Implementation note: avoid deep-copying large matrices; snapshot from
+        the provided list (or its ``_base`` if present) in-place.
+        """
 
-        baseline_ids = tuple(getattr(self.original_flight_list, "flight_ids", []) or [])
+        base = getattr(flight_list, "_base", None) or flight_list
+        self.original_flight_list = base
+
+        baseline_ids = tuple(getattr(base, "flight_ids", []) or [])
+        meta_map: Dict[str, Any] = getattr(base, "flight_metadata", {}) or {}
+
         baseline_seconds = np.empty(len(baseline_ids), dtype=np.float64)
         baseline_map: Dict[str, float] = {}
 
         for idx, fid in enumerate(baseline_ids):
-            meta = self.original_flight_list.flight_metadata.get(fid)
+            meta = meta_map.get(fid)
             if not meta or "takeoff_time" not in meta:
                 raise ValueError(
                     f"Missing takeoff_time metadata for flight {fid!r} in baseline snapshot."
@@ -183,6 +186,13 @@ class NetworkEvaluator:
         clone._flight_tv_sequence_cache = {}
 
         return clone
+
+    # ---------------- Baseline lazy-init helper ----------------
+    def _ensure_baseline_initialized(self) -> None:
+        """Ensure baseline arrays are captured once, lazily."""
+        if not getattr(self, "_baseline_initialized", False):
+            self._capture_baseline_takeoffs(self.flight_list)
+            self._baseline_initialized = True
 
     # ---------------- Rolling-hour sliding helpers ----------------
     def _apply_rolling_hour_forward(self, matrix_2d: np.ndarray, window_bins: int) -> np.ndarray:
@@ -362,45 +372,21 @@ class NetworkEvaluator:
 
         bins_per_hour = 60 // self.time_bin_minutes
 
-        # This will be an occupancy matrix indexed by tv_id and hour
-        # For simplicity, we create a dense matrix, assuming number of hours is not huge
-        max_hour = 24
-        hourly_occupancy_matrix = np.zeros((len(self.tv_id_to_idx), max_hour))
-
-        # Aggregate occupancy into hourly buckets for each traffic volume
-        num_time_bins_per_tv = num_tvtws // len(self.tv_id_to_idx)
-        expected_bins_per_tv = 24 * (60 // self.time_bin_minutes)
-        if num_time_bins_per_tv != expected_bins_per_tv:
-            raise ValueError(
-                f"num_time_bins_per_tv mismatch: expected {expected_bins_per_tv}, got {num_time_bins_per_tv}"
-            )
-
-        for tv_id, tv_row in self.tv_id_to_idx.items():
-            row_idx = self.tv_id_to_row_idx[tv_id]
-            tv_start = tv_row * num_time_bins_per_tv
-            for hour in range(max_hour):
-                start_bin = hour * bins_per_hour
-                end_bin = start_bin + bins_per_hour
-
-                hourly_occupancy_for_tv = 0
-                for bin_offset in range(start_bin, end_bin):
-                    if bin_offset < num_time_bins_per_tv:
-                        tvtw_idx = tv_start + bin_offset
-                        if tvtw_idx < num_tvtws:
-                            hourly_occupancy_for_tv += total_occupancy[tvtw_idx]
-
-                hourly_occupancy_matrix[row_idx, hour] = hourly_occupancy_for_tv
+        # Vectorized hourly occupancy: reshape to (V, 24, bins_per_hour) and sum
+        occ_2d = total_occupancy.reshape(num_tvs, bins_per_tv)
+        hourly_occupancy_matrix = occ_2d.reshape(num_tvs, 24, bins_per_hour).sum(axis=2).astype(np.float64)
 
         self.last_hourly_occupancy_matrix = hourly_occupancy_matrix
 
         # Compute excess traffic for each traffic volume and hour
+        num_time_bins_per_tv = bins_per_tv
         for tv_id, hourly_capacities in self.hourly_capacity_by_tv.items():
             row_idx = self.tv_id_to_row_idx.get(tv_id)
             if row_idx is None:
                 continue
 
             for hour, hourly_capacity in hourly_capacities.items():
-                if hour >= max_hour:
+                if hour >= 24:
                     continue
 
                 hourly_occupancy = hourly_occupancy_matrix[row_idx, hour]
@@ -751,6 +737,7 @@ class NetworkEvaluator:
             Positive values mean delays; negative values mean advances.
             Implementation is vectorized for efficiency.
         """
+        self._ensure_baseline_initialized()
         current_fids = tuple(self.flight_list.flight_ids)
 
         if len(current_fids) != len(self._baseline_flight_ids):
