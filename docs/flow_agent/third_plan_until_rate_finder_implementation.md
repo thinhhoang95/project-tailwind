@@ -42,6 +42,7 @@ The package is exported in `src/parrhesia/flow_agent/__init__.py` for convenient
 * describes the working set while authoring a regulation.
 * ensures candidate and selected flow IDs are sorted.
 * exposes `add_flow()` / `remove_flow()` convenience methods that return new frozen contexts.
+* carries a free-form `metadata` dict. If `metadata["flow_proxies"]` is provided as a mapping `{flow_id -> sequence}`, `CheapTransition` will use those proxy vectors in preference to any constructor-supplied proxies.
 
 ### `PlanState`
 
@@ -51,6 +52,8 @@ The package is exported in `src/parrhesia/flow_agent/__init__.py` for convenient
   * `canonical_key()` – stable JSON string (plan, context, stage, `z_hat`). Used heavily by `RateFinder` caches.
   * `reset_hotspot(next_stage=...)` – drops the working context and moves to the given stage while clearing the `awaiting_commit` flag.
   * `set_hotspot()` – activates a context and pre-sizes `z_hat` to the selected window length.
+* `canonical_key()` serialises `z_hat` as a list of floats. Any change to `z_hat` (even if not used by the rate finder) will change the cache key.
+* `metadata` currently uses the key `"awaiting_commit"` during the confirm stage; it is added by `Continue` and cleared by `Back`/`reset_hotspot`.
 
 Stages are encoded as literals: `idle → select_hotspot → select_flows → confirm → stopped`.
 
@@ -87,6 +90,13 @@ These guards are used both in the `CheapTransition` implementation and exposed f
 * maintains the cheap proxy `z_hat` in the `PlanState`, slicing / clipping proxies to the currently selected window.
 * supports simple decay (`decay` parameter) and clipping (`clip_value`).
 * returns a tuple `(next_state, is_commit, is_terminal)` so the caller can trigger expensive work only when necessary (e.g., run the `RateFinder` on commit).
+
+Additional notes and assumptions:
+
+- Proxy precedence: if the active `HotspotContext.metadata` contains `flow_proxies`, those are used first; otherwise proxies passed to the `CheapTransition` constructor are used; if neither is available, a ones vector is used as a fallback for the current window length.
+- Window handling: when a proxy time series is longer than the selected window, a deterministic slice `[t0:t1)` is used; if it is shorter, the proxy is padded with zeros to fit the window.
+- Decay: before applying an `AddFlow`/`RemoveFlow` proxy, `z_hat` is multiplied by `(1 - decay)` if `decay > 0`.
+- Clipping: after applying a proxy (with sign +1 for add, −1 for remove), `z_hat` is clipped elementwise to `[-clip_value, +clip_value]`. Default `clip_value` is 250.0.
 
 ### Lifecycle Walkthrough
 
@@ -143,6 +153,22 @@ Key design points:
 * **FCFS integration**: uses `parrhesia.fcfs.scheduler.assign_delays` to generate per-flight delays; aggregates per-flight maximums when multiple flows contribute.
 * **Objective**: matches the plan evaluator weights (`alpha`, `beta`, `gamma`, `delta`) with optional overrides via `RateFinderConfig`.
 
+Assumptions, simplifications, and interface expectations:
+
+- Rate grid sentinel: `math.inf` in the `rate_grid` means “no regulation” for that flow/union. Rates `<= 0` and `inf` produce an empty delay set.
+- Integerisation: candidate rates are rounded and clamped to integers via `max(1, int(round(rate)))` before FCFS. The returned best rates are floats (including `math.inf`); callers that commit rates into `RegulationSpec` should cast to integers as needed.
+- Flow ordering: in `per_flow` mode, flows are visited in descending order of the number of entrants in the active window. Entrant counts are computed via `FlightList.iter_hotspot_crossings(...)` if available; otherwise all flows tie and fall back to lexicographic ordering by flow ID. Ordering only affects search determinism and speed, not correctness.
+- Active windows: the `window_bins=(t0, t1)` half-open range is expanded to the consecutive bin list `list(range(t0, t1))` when calling FCFS.
+- Regulation penalty: the objective's `num_regs` term uses `len(plan_state.plan)` for the baseline and `len(plan_state.plan) + 1` for candidates (the prospective regulation being evaluated).
+- Diagnostics: the result includes `entrants_by_flow`, a `per_flow_history` of `ΔJ` per tried rate, and `aggregate_delays_size` (number of flights delayed in the best candidate), in addition to timing, cache, and objective fields.
+- Caching scope: the baseline cache is keyed by the full `PlanState.canonical_key()` (including `z_hat` and any active context); the candidate LRU cache is in-memory and per-`RateFinder` instance.
+- Capacity bounds: there is no hard cap tying candidate rates to declared hourly capacities; realism of the grid is left to configuration.
+- FlightList/Evaluator interfaces relied upon:
+  - Required on the flight list: `flight_ids`, `flight_metadata`, `time_bin_minutes`, `tv_id_to_idx`, `get_total_occupancy_by_tvtw()`, `get_occupancy_vector(fid)`, and `shift_flight_occupancy(fid, delay_min)`.
+  - Optional on the flight list: `iter_hotspot_crossings(hotspot_ids, active_windows=...)` to compute entrant counts for ordering.
+  - Required on the evaluator: `update_flight_list(fl)`, `compute_excess_traffic_vector()`, and `compute_delay_stats()`.
+  - The evaluator currently aggregates occupancy hourly against `hourly_capacity` and redistributes hourly excess to bins proportionally to per-bin occupancy within the hour.
+
 ### Example (synthetic data)
 
 ```python
@@ -173,7 +199,8 @@ planes = {
         "occupancy_intervals": [{"tvtw_index": indexer.get_tvtw_index("TV1", 16), "entry_time_s": 120}],
     },
 }
-flight_list = DummyFlightList(indexer=indexer, flight_metadata=planes)
+flight_list = DummyFlightList(indexer=indexer, flight_metadat
+a=planes)
 
 gdf = gpd.GeoDataFrame({
     "traffic_volume_id": ["TV1"],
