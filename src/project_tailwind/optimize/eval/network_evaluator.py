@@ -12,11 +12,13 @@ As a result, this code is more legacy. The user must be warned about this!
 """
 
 import json
-import numpy as np
+from copy import deepcopy
+from typing import Any, Dict, List, Optional, Tuple
+
 import geopandas as gpd
-from typing import Dict, List, Any, Optional, Tuple
-from datetime import datetime
+import numpy as np
 import pandas as pd
+from datetime import datetime
 from pathlib import Path
 
 from .flight_list import FlightList
@@ -40,12 +42,12 @@ class NetworkEvaluator:
         """
         self.traffic_volumes_gdf = traffic_volumes_gdf
         self.flight_list = flight_list
-        # If we are given a DeltaFlightList, snapshot the original baseline from its base
-        if hasattr(flight_list, "_base"):
-            # Use the immutable base as the baseline to avoid a heavy copy
-            self.original_flight_list = flight_list._base  # type: ignore[attr-defined]
-        else:
-            self.original_flight_list = flight_list.copy()
+        # Baseline snapshot (takeoff times) used for delay statistics.
+        self._baseline_flight_ids: Tuple[str, ...] = tuple()
+        self._baseline_takeoff_seconds: np.ndarray = np.empty(0, dtype=np.float64)
+        self._baseline_takeoff_seconds_by_fid: Dict[str, float] = {}
+        self.original_flight_list = None
+        self._capture_baseline_takeoffs(flight_list)
 
         # Extract time window information
         self.time_bin_minutes = flight_list.time_bin_minutes
@@ -58,6 +60,129 @@ class NetworkEvaluator:
         # Process capacity data and handle time window conversion
         self.hourly_capacity_by_tv: Dict[str, Dict[int, float]] = {}
         self._process_capacity_data()
+
+    def _normalize_takeoff_time(self, raw_value: object, flight_id: str) -> datetime:
+        """Return a timezone-naive ``datetime`` for ``raw_value``.
+
+        ``FlightList`` populates ``takeoff_time`` as ``datetime`` objects, but
+        guard against strings, pandas timestamps or epoch seconds to remain
+        robust to future changes.  Raises ``TypeError`` if conversion fails.
+        """
+
+        if isinstance(raw_value, datetime):
+            return raw_value
+        if hasattr(raw_value, "to_pydatetime"):
+            candidate = raw_value.to_pydatetime()  # type: ignore[attr-defined]
+            if isinstance(candidate, datetime):
+                return candidate
+        if isinstance(raw_value, (int, float)):
+            return datetime.fromtimestamp(float(raw_value))
+        if isinstance(raw_value, str):
+            text = raw_value.strip()
+            if text.endswith("Z"):
+                text = text[:-1]
+            text = text.replace("T", " ")
+            try:
+                return datetime.fromisoformat(text)
+            except Exception as exc:  # pragma: no cover - defensive
+                raise TypeError(
+                    f"Could not parse takeoff_time for flight {flight_id!r}: {raw_value!r}"
+                ) from exc
+        raise TypeError(
+            f"Unsupported takeoff_time for flight {flight_id!r}: {raw_value!r}"
+        )
+
+    def _capture_baseline_takeoffs(self, flight_list: FlightList) -> None:
+        """Record immutable baseline takeoff timestamps for delay statistics."""
+
+        base_snapshot = getattr(flight_list, "_base", None)
+        if base_snapshot is not None:
+            self.original_flight_list = base_snapshot
+        else:
+            self.original_flight_list = self._clone_flight_list_for_baseline(flight_list)
+
+        baseline_ids = tuple(getattr(self.original_flight_list, "flight_ids", []) or [])
+        baseline_seconds = np.empty(len(baseline_ids), dtype=np.float64)
+        baseline_map: Dict[str, float] = {}
+
+        for idx, fid in enumerate(baseline_ids):
+            meta = self.original_flight_list.flight_metadata.get(fid)
+            if not meta or "takeoff_time" not in meta:
+                raise ValueError(
+                    f"Missing takeoff_time metadata for flight {fid!r} in baseline snapshot."
+                )
+            takeoff_dt = self._normalize_takeoff_time(meta["takeoff_time"], fid)
+            ts = float(takeoff_dt.timestamp())
+            baseline_seconds[idx] = ts
+            baseline_map[fid] = ts
+
+        self._baseline_flight_ids = baseline_ids
+        self._baseline_takeoff_seconds = baseline_seconds
+        self._baseline_takeoff_seconds_by_fid = baseline_map
+
+    def _clone_flight_list_for_baseline(self, flight_list: FlightList) -> FlightList:
+        """Create a detached snapshot of ``flight_list`` without reloading from disk."""
+
+        cls = flight_list.__class__
+        clone = cls.__new__(cls)
+
+        clone.occupancy_file_path = getattr(flight_list, "occupancy_file_path", "")
+        clone.tvtw_indexer_path = getattr(flight_list, "tvtw_indexer_path", "")
+        clone.tvtw_indexer = deepcopy(getattr(flight_list, "tvtw_indexer", {}))
+        clone.time_bin_minutes = getattr(flight_list, "time_bin_minutes", 60)
+        clone.tv_id_to_idx = dict(getattr(flight_list, "tv_id_to_idx", {}))
+        clone.num_traffic_volumes = getattr(
+            flight_list, "num_traffic_volumes", len(clone.tv_id_to_idx)
+        )
+        clone.num_time_bins_per_tv = getattr(flight_list, "num_time_bins_per_tv", 1)
+        clone.idx_to_tv_id = dict(getattr(flight_list, "idx_to_tv_id", {}))
+
+        indexer = getattr(flight_list, "_indexer", None)
+        if indexer is not None:
+            try:
+                clone._indexer = type(indexer)(
+                    dict(getattr(indexer, "tv_id_to_idx", {})),
+                    dict(getattr(indexer, "idx_to_tv_id", {})),
+                    int(getattr(indexer, "num_time_bins")),
+                )
+            except Exception:  # pragma: no cover - defensive
+                clone._indexer = indexer
+        else:
+            clone._indexer = None
+
+        clone.flight_ids = list(getattr(flight_list, "flight_ids", ()))
+        clone.num_flights = getattr(flight_list, "num_flights", len(clone.flight_ids))
+        clone.flight_id_to_row = dict(getattr(flight_list, "flight_id_to_row", {}))
+        clone.num_tvtws = getattr(flight_list, "num_tvtws", 0)
+        clone.flight_data = deepcopy(getattr(flight_list, "flight_data", {}))
+        clone.flight_metadata = deepcopy(getattr(flight_list, "flight_metadata", {}))
+
+        occupancy = getattr(flight_list, "occupancy_matrix", None)
+        if occupancy is not None:
+            clone.occupancy_matrix = occupancy.copy()
+        else:
+            clone.occupancy_matrix = np.zeros((0, 0), dtype=np.float32)
+
+        lil_matrix = getattr(flight_list, "_occupancy_matrix_lil", None)
+        if lil_matrix is not None:
+            try:
+                clone._occupancy_matrix_lil = lil_matrix.copy()
+            except Exception:  # pragma: no cover - defensive
+                clone._occupancy_matrix_lil = lil_matrix
+        else:
+            clone._occupancy_matrix_lil = clone.occupancy_matrix.tolil()
+
+        clone._lil_matrix_dirty = False
+
+        temp_buffer = getattr(flight_list, "_temp_occupancy_buffer", None)
+        if temp_buffer is not None:
+            clone._temp_occupancy_buffer = np.array(temp_buffer, copy=True)
+        else:
+            clone._temp_occupancy_buffer = np.zeros(clone.num_tvtws, dtype=np.float32)
+
+        clone._flight_tv_sequence_cache = {}
+
+        return clone
 
     # ---------------- Rolling-hour sliding helpers ----------------
     def _apply_rolling_hour_forward(self, matrix_2d: np.ndarray, window_bins: int) -> np.ndarray:
@@ -626,36 +751,39 @@ class NetworkEvaluator:
             Positive values mean delays; negative values mean advances.
             Implementation is vectorized for efficiency.
         """
-        # Fast path: both flight lists were loaded from the same sources in the same order.
-        # We rely on identical ordering of flight_ids (copy() preserves order).
-        current_fids = self.flight_list.flight_ids
-        original_fids = self.original_flight_list.flight_ids
+        current_fids = tuple(self.flight_list.flight_ids)
 
-        # Optional light sanity check (O(1) + O(n) worst if mismatch); can be disabled for max speed.
-        if len(current_fids) != len(original_fids):
+        if len(current_fids) != len(self._baseline_flight_ids):
             raise ValueError(
                 "Flight counts differ between current and original flight lists."
             )
 
-        # Vectorize extraction of takeoff times as seconds since epoch
-        # Using a list comprehension once is O(n) and then numpy ops are vectorized.
-        # datetime.timestamp() returns float seconds; cast to float64 for safe aggregation.
+        # Vectorize extraction of takeoff times as seconds since epoch. Reuse the
+        # cached baseline order whenever possible to avoid allocations.
         curr_seconds = np.asarray(
             [
-                self.flight_list.flight_metadata[fid]["takeoff_time"].timestamp()
+                self._normalize_takeoff_time(
+                    self.flight_list.flight_metadata[fid]["takeoff_time"],
+                    fid,
+                ).timestamp()
                 for fid in current_fids
             ],
             dtype=np.float64,
         )
-        orig_seconds = np.asarray(
-            [
-                self.original_flight_list.flight_metadata[fid][
-                    "takeoff_time"
-                ].timestamp()
-                for fid in original_fids
-            ],
-            dtype=np.float64,
-        )
+
+        if current_fids == self._baseline_flight_ids:
+            orig_seconds = self._baseline_takeoff_seconds
+        else:
+            try:
+                orig_seconds = np.fromiter(
+                    (self._baseline_takeoff_seconds_by_fid[fid] for fid in current_fids),
+                    dtype=np.float64,
+                    count=len(current_fids),
+                )
+            except KeyError as exc:  # pragma: no cover - defensive
+                raise ValueError(
+                    f"Flight {exc.args[0]!r} missing from baseline snapshot."
+                ) from None
 
         # If the ordering is guaranteed identical, the above aligns by index.
         # If you want to be extra safe with minimal overhead, do a quick spot check on a few positions.
