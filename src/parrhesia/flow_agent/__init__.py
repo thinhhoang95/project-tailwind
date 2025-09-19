@@ -13,6 +13,7 @@ from .actions import (
     Stop,
 )
 from .transition import CheapTransition
+from .mcts import MCTS, MCTSConfig
 from .rate_finder import RateFinder, RateFinderConfig
 
 __all__ = [
@@ -31,4 +32,6 @@ __all__ = [
     "CheapTransition",
     "RateFinder",
     "RateFinderConfig",
+    "MCTS",
+    "MCTSConfig",
 ]

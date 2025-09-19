@@ -1,3 +1,6 @@
+# Preambles
+For missing information, consult the `second_plan.md` file.
+
 ### Assumptions to guide planning
 - Commit step costs 6–10s right now (rate finding + evaluation). We’ll throttle commit evaluations per search and rely on transpositions and caching to amortize costs.
 - Shaping uses ϕ(s) from `CheapTransition` residuals; γ=1; ϕ(terminal)=0 as in the plan.
@@ -147,3 +150,59 @@
 - Integrate real commit path with strict `commit_eval_limit` and caching; add the slow smoke test.
 
 - Verified pre-MCTS components exist in `flow_agent` and there’s no `mcts.py`. The plan above sequences the MCTS build with clear deliverables and acceptance checks, and includes performance controls to accommodate current 6–10s commit costs.
+
+# Appendix
+## phi(s)
+Here’s the idea in plain terms:
+
+* **What is $\hat z$?**
+  A fast, rough picture of **how much overload remains** in the chosen hotspot over time if we *were* to regulate the currently selected flows.
+  Think of a minute-by-minute array over the hotspot window:
+
+  $$
+  \hat z_{t} \approx \text{(projected demand into the hotspot at }t\text{)} - \text{(capacity at }t\text{)}\quad(\ge 0)
+  $$
+
+  We use $\hat z$ only to *guide the search* (potential shaping), not to score commits (those use the real evaluator).
+
+* **What do we precompute?**
+  For every candidate flow $f$ and hotspot $h$, a small histogram $H_f[t]$: “how many flights from $f$ would hit this hotspot at minute $t$ (within $[t_0,t_1)$).”
+
+* **Initialization (at a node):**
+
+  $$
+  \hat z_t \leftarrow z^{\text{base}}_t
+  $$
+
+  where $z^{\text{base}}$ comes from the current plan (no new regulation yet).
+
+* **When you add a flow to regulate (SelectFlows.AddFlow$f$):**
+  We assume (optimistically but safely clipped) that regulating $f$ can *remove* its contribution in-window, so we **subtract its histogram**:
+
+  $$
+  \hat z_t \leftarrow \max\!\big(0,\ \hat z_t - \beta \, H_f[t]\big)
+  $$
+
+  with $\beta \in (0,1]$. For v1, just set $\beta=1$. (This is a first-order proxy; it ignores exact rates/FIFO delays.)
+
+* **When you remove a flow from the selection (SelectFlows.RemoveFlow$f$):**
+  Put its contribution back:
+
+  $$
+  \hat z_t \leftarrow \hat z_t + \beta \, H_f[t]
+  $$
+
+* **Potential and shaped reward:**
+  We track the scalar
+
+  $$
+  \phi(s) = -\theta_2 \sum_t \hat z_t^2\quad(\theta_2>0)
+  $$
+
+  and use $\Delta\phi=\phi(s')-\phi(s)$ to shape non-commit steps. Because we touched only a few minutes, we update $\sum_t \hat z_t^2$ **incrementally** (subtract old squares for touched bins, apply the change, add new squares).
+
+* **At commit:**
+  We run the real **rate\_finder + evaluator** to get the true $\Delta J$. After applying the commit, we **reset** $\hat z$ to the new baseline $z^{\text{base}}$ from the updated plan. (No shaping at terminal: $\phi(\text{terminal})=0$.)
+
+* **Why this works (v1):**
+  It’s cheap (array adds/subtracts), monotone (never makes overload look worse when you add a regulated flow), and gives the MCTS a smooth “less overload is better” hill to climb—without paying evaluator cost until commit.
