@@ -181,12 +181,12 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
 
     # Configure agent budgets small to keep runtime reasonable
     # Limit to a single regulation to shorten runtime and match the request
-    mcts_cfg = MCTSConfig(max_sims=1024, commit_depth=16, commit_eval_limit=-1, seed=69420) # commit_eval_limit is legacy, we can set it to anything
+    mcts_cfg = MCTSConfig(max_sims=128, commit_depth=16, commit_eval_limit=-1, seed=69420) # commit_eval_limit is legacy, we can set it to anything
     rf_cfg = RateFinderConfig(use_adaptive_grid=True, max_eval_calls=4)
     disc_cfg = HotspotDiscoveryConfig(
         threshold=0.0,
-        top_hotspots=64,
-        top_flows=64,
+        top_hotspots=32,
+        top_flows=6,
         max_flights_per_flow=64,
         leiden_params={"threshold": 0.64, "resolution": 1.0, "seed": 0},
         direction_opts={"mode": "none"},
@@ -212,6 +212,8 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     )
 
     last_payload: Dict[str, Any] = {}
+    # Track total simulations attempted across all internal MCTS runs
+    sim_counter: Dict[str, Any] = {"total": 0, "last_sd": 0, "init": False}
     live_holder: Dict[str, Any] = {"live": None}
 
     def _sig_to_label(sig: Any) -> str:
@@ -283,6 +285,20 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         evals = int(payload.get("commit_evals", 0))
         best_s = f"{best:.3f}" if isinstance(best, (int, float)) else "—"
         last_s = f"{last:.3f}" if isinstance(last, (int, float)) else "—"
+        # Accumulate simulations across runs. If sims_done resets (new run),
+        # only count the forward progress and ignore negative deltas.
+        if not sim_counter["init"]:
+            sim_counter["init"] = True
+            sim_counter["total"] += max(0, sims_done)
+            sim_counter["last_sd"] = sims_done
+        else:
+            delta = sims_done - int(sim_counter["last_sd"])
+            if delta >= 0:
+                sim_counter["total"] += delta
+            else:
+                # New run likely started (counter reset); add current as progress from 0
+                sim_counter["total"] += max(0, sims_done)
+            sim_counter["last_sd"] = sims_done
         prog.update(
             task_id,
             completed=sims_done,
@@ -332,6 +348,11 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
 
     # Final summary and quick checks (non-fatal)
     console.print(f"[runner] Commits: {info.commits}")
+    # Also report total simulations tried across all MCTS runs
+    try:
+        console.print(f"[runner] Total simulations tried: {int(sim_counter['total'])}")
+    except Exception:
+        pass
     if info.summary:
         console.print(f"[runner] Final objective: {info.summary.get('objective')}")
     if info.log_path:
