@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, ContextManager, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -28,6 +29,7 @@ class RunInfo:
     total_delta_j: float
     log_path: Optional[str]
     summary: Dict[str, Any]
+    action_counts: Dict[str, int]
 
 
 class MCTSAgent:
@@ -49,6 +51,7 @@ class MCTSAgent:
         discovery_cfg: Optional[HotspotDiscoveryConfig] = None,
         logger: Optional[SearchLogger] = None,
         max_regulations: Optional[int] = None,
+        timer: Optional[Callable[[str], ContextManager[Any]]] = None,
     ) -> None:
         self.evaluator = evaluator
         self.flight_list = flight_list
@@ -57,34 +60,42 @@ class MCTSAgent:
         self.discovery_cfg = discovery_cfg or HotspotDiscoveryConfig()
         self.logger = logger
         self.max_regulations = None if max_regulations is None else int(max(0, max_regulations))
+        self._timer_factory = timer
 
         self.rate_finder = RateFinder(
             evaluator=evaluator,
             flight_list=flight_list,
             indexer=indexer,
             config=rate_finder_cfg or RateFinderConfig(use_adaptive_grid=True),
+            timer=timer,
         )
         self.inventory = HotspotInventory(evaluator=evaluator, flight_list=flight_list, indexer=indexer)
+
+    def _timed(self, name: str) -> ContextManager[Any]:
+        if self._timer_factory is None:
+            return nullcontext()
+        return self._timer_factory(name)
 
     # ------------------------------------------------------------------
     def run(self) -> Tuple[PlanState, RunInfo]:
         # Build hotspot inventory and seed plan state
         cfg = self.discovery_cfg
-        descs = self.inventory.build_from_segments(
-            threshold=float(cfg.threshold),
-            top_hotspots=int(cfg.top_hotspots),
-            top_flows=int(cfg.top_flows),
-            max_flights_per_flow=int(cfg.max_flights_per_flow),
-            leiden_params=cfg.leiden_params,
-            direction_opts=cfg.direction_opts,
-        )
-        candidates = self.inventory.to_candidate_payloads(descs)
+        with self._timed("agent.hotspot_inventory"):
+            descs = self.inventory.build_from_segments(
+                threshold=float(cfg.threshold),
+                top_hotspots=int(cfg.top_hotspots),
+                top_flows=int(cfg.top_flows),
+                max_flights_per_flow=int(cfg.max_flights_per_flow),
+                leiden_params=cfg.leiden_params,
+                direction_opts=cfg.direction_opts,
+            )
+            candidates = self.inventory.to_candidate_payloads(descs)
 
         state = PlanState()
         state.metadata["hotspot_candidates"] = candidates
 
         transition = CheapTransition()
-        mcts = MCTS(transition=transition, rate_finder=self.rate_finder, config=self.mcts_cfg)
+        mcts = MCTS(transition=transition, rate_finder=self.rate_finder, config=self.mcts_cfg, timer=self._timer_factory)
 
         if self.logger is not None:
             self.logger.event("run_start", {"num_candidates": len(candidates), "mcts_cfg": self.mcts_cfg.__dict__})
@@ -95,15 +106,20 @@ class MCTSAgent:
         limit = int(self.mcts_cfg.commit_depth)
         if self.max_regulations is not None:
             limit = min(limit, int(self.max_regulations))
+        aggregated_counts: Dict[str, int] = {}
         for _ in range(max(1, limit)):
             # Ensure we are in idle to start a new regulation
             state.stage = "idle"
             try:
-                commit_action = mcts.run(state)
+                with self._timed("agent.mcts.run"):
+                    commit_action = mcts.run(state)
             except Exception as exc:
                 if self.logger is not None:
                     self.logger.event("mcts_error", {"error": str(exc)})
                 break
+
+            for k, v in mcts.action_counts.items():
+                aggregated_counts[k] = aggregated_counts.get(k, 0) + int(v)
 
             # Extract improvement for bookkeeping
             info = (commit_action.diagnostics or {}).get("rate_finder", {})
@@ -155,7 +171,10 @@ class MCTSAgent:
             self.logger.event("regulation_limit_reached", {"limit": int(self.max_regulations)})
 
         # Final global objective across all committed regulations
-        final_summary = self._compute_final_objective(state)
+        with self._timed("agent.final_objective"):
+            final_summary = self._compute_final_objective(state)
+        if aggregated_counts:
+            final_summary = {**final_summary, "action_counts": aggregated_counts}
         if self.logger is not None:
             self.logger.event("run_end", {"commits": commits, **final_summary})
 
@@ -164,6 +183,7 @@ class MCTSAgent:
             total_delta_j=float(total_delta_j),
             log_path=(self.logger.path if self.logger else None),
             summary=final_summary,
+            action_counts=aggregated_counts,
         )
         return state, info
 

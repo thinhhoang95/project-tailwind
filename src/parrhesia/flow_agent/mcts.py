@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import math
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Callable, ContextManager, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -88,6 +89,7 @@ class MCTS:
         rate_finder: RateFinder,
         config: Optional[MCTSConfig] = None,
         rng: Optional[np.random.Generator] = None,
+        timer: Optional[Callable[[str], ContextManager[Any]]] = None,
     ) -> None:
         self.transition = transition
         self.rate_finder = rate_finder
@@ -97,6 +99,21 @@ class MCTS:
         self._commit_eval_cache: Dict[Tuple, Tuple[Dict[str, float] | int, float, Dict[str, Any]]] = {}
         self._commit_calls = 0
         self._best_commit: Optional[Tuple[CommitRegulation, float]] = None  # (action, deltaJ)
+        self._timer_factory = timer
+        self._action_counts: Dict[str, int] = {}
+
+    def _timed(self, name: str) -> ContextManager[Any]:
+        if self._timer_factory is None:
+            return nullcontext()
+        return self._timer_factory(name)
+
+    @property
+    def action_counts(self) -> Dict[str, int]:
+        return dict(self._action_counts)
+
+    def _record_action(self, action: Action) -> None:
+        key = type(action).__name__
+        self._action_counts[key] = self._action_counts.get(key, 0) + 1
 
     # ------------------------------- Public API ---------------------------
     def run(self, root: PlanState, *, max_sims: Optional[int] = None, commit_depth: Optional[int] = None) -> CommitRegulation:
@@ -104,6 +121,7 @@ class MCTS:
         depth_limit = int(commit_depth if commit_depth is not None else self.cfg.commit_depth)
         self._commit_calls = 0
         self._best_commit = None
+        self._action_counts.clear()
 
         t_end = time.perf_counter() + float(self.cfg.max_time_s)
 
@@ -201,6 +219,8 @@ class MCTS:
                 # Track best commit observed across sims (at root or deeper)
                 if self._best_commit is None or delta_j < self._best_commit[1]:
                     self._best_commit = (commit_action, float(delta_j))
+
+            self._record_action(action)
 
             next_state, is_commit, is_terminal = self.transition.step(state, action)
             # Set child key now that next_state exists
@@ -381,13 +401,14 @@ class MCTS:
                 # Treat as no-op commit with zero improvement to avoid extra cost
                 rates, delta_j, info = ({}, 0.0, {"reason": "eval_budget_exhausted"})
             else:
-                rates, delta_j, info = self.rate_finder.find_rates(
-                    plan_state=state,
-                    control_volume_id=str(ctx.control_volume_id),
-                    window_bins=tuple(int(b) for b in ctx.window_bins),
-                    flows=flows,
-                    mode="per_flow" if ctx.mode == "per_flow" else "blanket",
-                )
+                with self._timed("mcts.rate_finder.find_rates"):
+                    rates, delta_j, info = self.rate_finder.find_rates(
+                        plan_state=state,
+                        control_volume_id=str(ctx.control_volume_id),
+                        window_bins=tuple(int(b) for b in ctx.window_bins),
+                        flows=flows,
+                        mode="per_flow" if ctx.mode == "per_flow" else "blanket",
+                    )
                 self._commit_calls += 1
                 self._commit_eval_cache[base_key] = (rates, delta_j, info)
 

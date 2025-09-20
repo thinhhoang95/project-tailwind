@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -9,7 +9,7 @@ from project_tailwind.optimize.eval.network_evaluator import NetworkEvaluator
 from project_tailwind.optimize.eval.flight_list import FlightList
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 
-from parrhesia.flows.flow_pipeline import build_global_flows, collect_hotspot_flights
+from parrhesia.flows.flow_pipeline import build_global_flows
 from parrhesia.optim.sa_optimizer import prepare_flow_scheduling_inputs
 
 
@@ -33,6 +33,26 @@ class HotspotDescriptor:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class _CrossingCache:
+    bins_by_flight: Dict[str, Tuple[int, ...]] = field(default_factory=dict)
+    flights_by_bin: Dict[int, Tuple[str, ...]] = field(default_factory=dict)
+
+    @classmethod
+    def from_events(cls, events: Iterable[Tuple[str, int]]) -> "_CrossingCache":
+        by_flight: Dict[str, set[int]] = {}
+        by_bin: Dict[int, set[str]] = {}
+        for fid, bin_idx in events:
+            sfid = str(fid)
+            b = int(bin_idx)
+            by_flight.setdefault(sfid, set()).add(b)
+            by_bin.setdefault(b, set()).add(sfid)
+        return cls(
+            bins_by_flight={k: tuple(sorted(v)) for k, v in by_flight.items()},
+            flights_by_bin={k: tuple(sorted(v)) for k, v in by_bin.items()},
+        )
+
+
 class HotspotInventory:
     """Builds and caches hotspot descriptors from evaluator + flights.
 
@@ -50,6 +70,7 @@ class HotspotInventory:
         self.flight_list = flight_list
         self.indexer = indexer
         self._cache: Dict[Tuple[str, Tuple[int, int]], HotspotDescriptor] = {}
+        self._crossings_cache: Dict[str, _CrossingCache] = {}
 
     # ------------------------------- Public API ---------------------------
     def build_from_segments(
@@ -92,6 +113,10 @@ class HotspotInventory:
         segs_ranked = sorted(segs_filt, key=_seg_score, reverse=True)
         if top_hotspots is not None and top_hotspots > 0:
             segs_ranked = segs_ranked[: int(top_hotspots)]
+
+        # Pre-load crossing caches once for the TVs that survived filtering
+        unique_tvs = {str(seg.get("traffic_volume_id")) for seg in segs_ranked}
+        self._preload_crossings(unique_tvs)
 
         out: List[HotspotDescriptor] = []
         for seg in segs_ranked:
@@ -141,10 +166,13 @@ class HotspotInventory:
         if not active_bins:
             active_bins = [t0]
 
-        # Flights touching (tv, window)
-        union_ids, _meta = collect_hotspot_flights(
-            self.flight_list, [control_volume_id], active_windows={control_volume_id: active_bins}
-        )
+        cache = self._crossings_cache.get(str(control_volume_id))
+        if cache is None:
+            return None
+
+        active_set = set(int(b) for b in active_bins)
+        union_ids = [fid for fid, bins in cache.bins_by_flight.items() if any(int(b) in active_set for b in bins)]
+        union_ids.sort()
         if not union_ids:
             return None
 
@@ -164,6 +192,7 @@ class HotspotInventory:
             flight_list=self.flight_list,
             flow_map=flow_map,
             hotspot_ids=[control_volume_id],
+            flight_ids=union_ids,
         )
         flows_for_ctrl: Dict[str, List[str]] = {}
         for flow_id, ctrl in ctrl_by_flow.items():
@@ -183,22 +212,22 @@ class HotspotInventory:
         proxies: Dict[str, np.ndarray] = {}
         entrants_count: Dict[str, int] = {}
         total = 0
-        # Derive entrants by scanning FlightList crossings over the window; cheap and deterministic
         reverse: Dict[str, str] = {}
         for fid, flights in flows_for_ctrl.items():
             for fl in flights:
                 reverse[str(fl)] = str(fid)
-        iter_fn = getattr(self.flight_list, "iter_hotspot_crossings", None)
-        if callable(iter_fn):
-            for fl_id, tv, _dt, t in iter_fn([control_volume_id], active_windows={control_volume_id: active_bins}):  # type: ignore[misc]
-                flow = reverse.get(str(fl_id))
+
+        for b in active_bins:
+            offset = int(b) - int(window_bins[0])
+            if not (0 <= offset < win_len):
+                continue
+            for fl in cache.flights_by_bin.get(int(b), ()):  # type: ignore[arg-type]
+                flow = reverse.get(str(fl))
                 if flow is None:
                     continue
-                tt = int(t) - int(window_bins[0])
-                if 0 <= tt < win_len:
-                    proxies.setdefault(flow, np.zeros(win_len, dtype=float))[tt] += 1.0
-                    entrants_count[flow] = entrants_count.get(flow, 0) + 1
-                    total += 1
+                proxies.setdefault(flow, np.zeros(win_len, dtype=float))[offset] += 1.0
+                entrants_count[flow] = entrants_count.get(flow, 0) + 1
+                total += 1
 
         # Trim flows by entrants count and cap per-flow flights
         flow_ids_sorted = sorted(flows_for_ctrl.keys(), key=lambda f: (-int(entrants_count.get(f, 0)), int(f)))
@@ -229,6 +258,60 @@ class HotspotInventory:
         )
         return desc
 
+    def _preload_crossings(self, tv_ids: Iterable[str]) -> None:
+        remaining = [str(tv) for tv in tv_ids if str(tv) not in self._crossings_cache]
+        if not remaining:
+            return
+
+        events: Dict[str, List[Tuple[str, int]]] = {tv: [] for tv in remaining}
+        iter_fn = getattr(self.flight_list, "iter_hotspot_crossings", None)
+        if callable(iter_fn):
+            for fid, tv, _dt, t in iter_fn(remaining, None):  # type: ignore[misc]
+                key = str(tv)
+                bucket = events.get(key)
+                if bucket is not None:
+                    bucket.append((str(fid), int(t)))
+        else:
+            # Fallback to scanning flight metadata once
+            meta_map = getattr(self.flight_list, "flight_metadata", {}) or {}
+            idx_obj = getattr(self.flight_list, "indexer", None)
+            decode = getattr(idx_obj, "get_tvtw_from_index", None)
+            if decode is None:
+                bins_per_tv = int(getattr(self.flight_list, "num_time_bins_per_tv"))
+                idx_to_tv_id = getattr(self.flight_list, "idx_to_tv_id")
+
+                def _decode(val: int) -> Optional[Tuple[str, int]]:
+                    tv_idx = int(val) // int(bins_per_tv)
+                    tbin = int(val) % int(bins_per_tv)
+                    tv_id = idx_to_tv_id.get(int(tv_idx))
+                    if tv_id is None:
+                        return None
+                    return str(tv_id), int(tbin)
+
+                decode_fn: Callable[[int], Optional[Tuple[str, int]]] = _decode
+            else:
+                decode_fn = lambda v: decode(int(v))  # type: ignore[misc]
+
+            target = set(remaining)
+            for fid, meta in meta_map.items():
+                for iv in meta.get("occupancy_intervals", []) or []:
+                    try:
+                        tvtw_idx = int(iv.get("tvtw_index"))
+                    except Exception:
+                        continue
+                    decoded = decode_fn(tvtw_idx)
+                    if not decoded:
+                        continue
+                    tv_id, tbin = decoded
+                    if str(tv_id) not in target:
+                        continue
+                    bucket = events.get(str(tv_id))
+                    if bucket is not None:
+                        bucket.append((str(fid), int(tbin)))
+
+        for tv, ev in events.items():
+            self._crossings_cache[tv] = _CrossingCache.from_events(ev)
+
     # ------------------------------ Serialization -------------------------
     @staticmethod
     def to_candidate_payloads(descriptors: Iterable[HotspotDescriptor]) -> List[Dict[str, Any]]:
@@ -252,4 +335,3 @@ __all__ = [
     "HotspotDescriptor",
     "HotspotInventory",
 ]
-

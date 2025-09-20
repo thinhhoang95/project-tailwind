@@ -3,10 +3,11 @@ from __future__ import annotations
 import math
 import time
 from collections import Counter, OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from statistics import median
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, ContextManager, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -72,6 +73,7 @@ class RateFinder:
         flight_list: FlightList,
         indexer: TVTWIndexer,
         config: Optional[RateFinderConfig] = None,
+        timer: Optional[Callable[[str], ContextManager[Any]]] = None,
     ) -> None:
         self.evaluator = evaluator
         self._base_flight_list = flight_list
@@ -80,6 +82,12 @@ class RateFinder:
         self._score_context_cache: Dict[Tuple, ScoreContext] = {}
         self._baseline_cache: Dict[Tuple, _BaselineResult] = {}
         self._candidate_cache: "OrderedDict[Tuple, _CandidateResult]" = OrderedDict()
+        self._timer_factory = timer
+
+    def _timed(self, name: str) -> ContextManager[Any]:
+        if self._timer_factory is None:
+            return nullcontext()
+        return self._timer_factory(name)
 
     # ------------------------------------------------------------------
     def find_rates(
@@ -106,13 +114,14 @@ class RateFinder:
         active_windows = list(range(window_start, window_end))
         plan_key = plan_state.canonical_key()
 
-        rate_grid = self._resolve_rate_grid(
-            control_volume_id=control_volume_id,
-            window_bins=window_bins,
-            flow_map=flow_map,
-            mode=mode,
-            active_windows=active_windows,
-        )
+        with self._timed("rate_finder.resolve_rate_grid"):
+            rate_grid = self._resolve_rate_grid(
+                control_volume_id=control_volume_id,
+                window_bins=window_bins,
+                flow_map=flow_map,
+                mode=mode,
+                active_windows=active_windows,
+            )
 
         if mode == "per_flow":
             for flow_id in flow_ids:
@@ -120,7 +129,8 @@ class RateFinder:
         else:
             print(f"[RateFinder] candidate rates (blanket mode): {tuple(rate_grid)}")
 
-        entrants = self._compute_entrants(control_volume_id, active_windows, flow_map)
+        with self._timed("rate_finder.compute_entrants"):
+            entrants = self._compute_entrants(control_volume_id, active_windows, flow_map)
         flow_order = sorted(flow_ids, key=lambda f: (-len(entrants.get(f, [])), f))
 
         context_flow_ids = flow_ids if mode == "per_flow" else ["__blanket__"]
@@ -131,27 +141,30 @@ class RateFinder:
             flow_ids=context_flow_ids,
         )
 
-        flights_by_flow = self._build_flights_by_flow(
-            control_volume_id=control_volume_id,
-            active_windows=active_windows,
-            flow_map=flow_map,
-            entrants=entrants,
-            mode=mode,
-        )
-        capacities_by_tv = self._build_capacities_for_tv(control_volume_id)
+        with self._timed("rate_finder.build_flights_by_flow"):
+            flights_by_flow = self._build_flights_by_flow(
+                control_volume_id=control_volume_id,
+                active_windows=active_windows,
+                flow_map=flow_map,
+                entrants=entrants,
+                mode=mode,
+            )
+        with self._timed("rate_finder.build_capacities"):
+            capacities_by_tv = self._build_capacities_for_tv(control_volume_id)
 
         target_cells = {(str(control_volume_id), int(t)) for t in active_windows}
         weights_cfg = self.config.objective_weights or {}
         weights = ObjectiveWeights(**weights_cfg) if weights_cfg else ObjectiveWeights()
 
-        context, baseline = self._ensure_context_and_baseline(
-            context_key=context_key,
-            flights_by_flow=flights_by_flow,
-            capacities_by_tv=capacities_by_tv,
-            target_cells=target_cells,
-            weights=weights,
-            tv_filter=[control_volume_id],
-        )
+        with self._timed("rate_finder.ensure_context_and_baseline"):
+            context, baseline = self._ensure_context_and_baseline(
+                context_key=context_key,
+                flights_by_flow=flights_by_flow,
+                capacities_by_tv=capacities_by_tv,
+                target_cells=target_cells,
+                weights=weights,
+                tv_filter=[control_volume_id],
+            )
         baseline_obj = baseline.objective
         baseline_components = baseline.components
         baseline_artifacts = baseline.artifacts
@@ -196,21 +209,23 @@ class RateFinder:
                         else:
                             candidate_rates = dict(best_rates)
                             candidate_rates[flow_id] = rate_val
-                            schedule = self._build_schedule_from_rates(
-                                rates_map=candidate_rates,
-                                context=context,
-                                active_bins=active_bins_sorted,
-                                bin_minutes=bin_minutes,
-                            )
-                            result = self._evaluate_candidate(
-                                signature=signature,
-                                schedule=schedule,
-                                flights_by_flow=flights_by_flow,
-                                capacities_by_tv=capacities_by_tv,
-                                flight_list=self._base_flight_list,
-                                context=context,
-                                baseline_obj=baseline_obj,
-                            )
+                            with self._timed("rate_finder.build_schedule"):
+                                schedule = self._build_schedule_from_rates(
+                                    rates_map=candidate_rates,
+                                    context=context,
+                                    active_bins=active_bins_sorted,
+                                    bin_minutes=bin_minutes,
+                                )
+                            with self._timed("rate_finder.evaluate_candidate"):
+                                result = self._evaluate_candidate(
+                                    signature=signature,
+                                    schedule=schedule,
+                                    flights_by_flow=flights_by_flow,
+                                    capacities_by_tv=capacities_by_tv,
+                                    flight_list=self._base_flight_list,
+                                    context=context,
+                                    baseline_obj=baseline_obj,
+                                )
                             eval_calls += 1
                             if eval_calls >= self.config.max_eval_calls:
                                 stopped_early = True
@@ -249,21 +264,23 @@ class RateFinder:
                         cache_hits += 1
                     else:
                         candidate_rates = {context_flow_ids[0]: rate_val}
-                        schedule = self._build_schedule_from_rates(
-                            rates_map=candidate_rates,
-                            context=context,
-                            active_bins=active_bins_sorted,
-                            bin_minutes=bin_minutes,
-                        )
-                        result = self._evaluate_candidate(
-                            signature=signature,
-                            schedule=schedule,
-                            flights_by_flow=flights_by_flow,
-                            capacities_by_tv=capacities_by_tv,
-                            flight_list=self._base_flight_list,
-                            context=context,
-                            baseline_obj=baseline_obj,
-                        )
+                        with self._timed("rate_finder.build_schedule"):
+                            schedule = self._build_schedule_from_rates(
+                                rates_map=candidate_rates,
+                                context=context,
+                                active_bins=active_bins_sorted,
+                                bin_minutes=bin_minutes,
+                            )
+                        with self._timed("rate_finder.evaluate_candidate"):
+                            result = self._evaluate_candidate(
+                                signature=signature,
+                                schedule=schedule,
+                                flights_by_flow=flights_by_flow,
+                                capacities_by_tv=capacities_by_tv,
+                                flight_list=self._base_flight_list,
+                                context=context,
+                                baseline_obj=baseline_obj,
+                            )
                         eval_calls += 1
                         if eval_calls >= self.config.max_eval_calls:
                             stopped_early = True
@@ -292,21 +309,23 @@ class RateFinder:
         if final_result is not None:
             cache_hits += 1
         else:
-            final_schedule = self._build_schedule_from_rates(
-                rates_map=final_rates_map,
-                context=context,
-                active_bins=active_bins_sorted,
-                bin_minutes=bin_minutes,
-            )
-            final_result = self._evaluate_candidate(
-                signature=final_signature,
-                schedule=final_schedule,
-                flights_by_flow=flights_by_flow,
-                capacities_by_tv=capacities_by_tv,
-                flight_list=self._base_flight_list,
-                context=context,
-                baseline_obj=baseline_obj,
-            )
+            with self._timed("rate_finder.build_schedule"):
+                final_schedule = self._build_schedule_from_rates(
+                    rates_map=final_rates_map,
+                    context=context,
+                    active_bins=active_bins_sorted,
+                    bin_minutes=bin_minutes,
+                )
+            with self._timed("rate_finder.evaluate_candidate"):
+                final_result = self._evaluate_candidate(
+                    signature=final_signature,
+                    schedule=final_schedule,
+                    flights_by_flow=flights_by_flow,
+                    capacities_by_tv=capacities_by_tv,
+                    flight_list=self._base_flight_list,
+                    context=context,
+                    baseline_obj=baseline_obj,
+                )
             eval_calls += 1
 
         best_delta = final_result.delta_j
@@ -373,27 +392,29 @@ class RateFinder:
         target_arg = target_set if target_set else None
 
         if context is None:
-            context = build_score_context(
-                flights_by_flow,
-                indexer=self._indexer,
-                capacities_by_tv=capacities_by_tv,
-                target_cells=target_arg,
-                ripple_cells=None,
-                flight_list=self._base_flight_list,
-                weights=weights,
-                tv_filter=tv_filter,
-            )
+            with self._timed("rate_finder.build_score_context"):
+                context = build_score_context(
+                    flights_by_flow,
+                    indexer=self._indexer,
+                    capacities_by_tv=capacities_by_tv,
+                    target_cells=target_arg,
+                    ripple_cells=None,
+                    flight_list=self._base_flight_list,
+                    weights=weights,
+                    tv_filter=tv_filter,
+                )
             self._score_context_cache[context_key] = context
 
         baseline = self._baseline_cache.get(context_key)
         if baseline is None:
-            objective, components, artifacts = score_with_context(
-                context.d_by_flow,
-                flights_by_flow=flights_by_flow,
-                capacities_by_tv=capacities_by_tv,
-                flight_list=self._base_flight_list,
-                context=context,
-            )
+            with self._timed("rate_finder.score_with_context.baseline"):
+                objective, components, artifacts = score_with_context(
+                    context.d_by_flow,
+                    flights_by_flow=flights_by_flow,
+                    capacities_by_tv=capacities_by_tv,
+                    flight_list=self._base_flight_list,
+                    context=context,
+                )
             baseline = _BaselineResult(
                 objective=float(objective),
                 components=components,
@@ -522,13 +543,14 @@ class RateFinder:
         context: ScoreContext,
         baseline_obj: float,
     ) -> _CandidateResult:
-        objective, components, artifacts = score_with_context(
-            schedule,
-            flights_by_flow=flights_by_flow,
-            capacities_by_tv=capacities_by_tv,
-            flight_list=flight_list,
-            context=context,
-        )
+        with self._timed("rate_finder.score_with_context.candidate"):
+            objective, components, artifacts = score_with_context(
+                schedule,
+                flights_by_flow=flights_by_flow,
+                capacities_by_tv=capacities_by_tv,
+                flight_list=flight_list,
+                context=context,
+            )
         delta_j = float(objective) - float(baseline_obj)
         result = _CandidateResult(
             delta_j=delta_j,
@@ -617,142 +639,148 @@ class RateFinder:
         active_windows: Sequence[int],
         mode: str,
     ) -> Tuple[float, ...]:
-        if not flow_map:
-            return (math.inf,)
+        _timer_cm = self._timed("rate_finder.build_adaptive_rate_grid")
+        _timer_exit = _timer_cm.__exit__
+        _timer_cm.__enter__()
+        try:
+            if not flow_map:
+                return (math.inf,)
 
-        window_start = int(window_bins[0])
-        window_end = int(window_bins[1])
-        if window_end <= window_start:
-            window_end = window_start + 1
-        active_bins = list(range(window_start, window_end))
-        if not active_bins:
-            active_bins = [window_start]
+            window_start = int(window_bins[0])
+            window_end = int(window_bins[1])
+            if window_end <= window_start:
+                window_end = window_start + 1
+            active_bins = list(range(window_start, window_end))
+            if not active_bins:
+                active_bins = [window_start]
 
-        bin_minutes = max(1, int(getattr(self._indexer, "time_bin_minutes", 60)))
-        window_length_bins = max(1, window_end - window_start)
-        window_hours = max(window_length_bins * bin_minutes / 60.0, 1e-3)
-        bins_per_hour = max(1, int(round(60.0 / float(bin_minutes))))
+            bin_minutes = max(1, int(getattr(self._indexer, "time_bin_minutes", 60)))
+            window_length_bins = max(1, window_end - window_start)
+            window_hours = max(window_length_bins * bin_minutes / 60.0, 1e-3)
+            bins_per_hour = max(1, int(round(60.0 / float(bin_minutes))))
 
-        entrants = self._compute_entrants(control_volume_id, active_bins, flow_map)
+            entrants = self._compute_entrants(control_volume_id, active_bins, flow_map)
 
-        flow_stats: Dict[str, Dict[str, float]] = {}
-        total_counts: Counter[int] = Counter()
-        total_entrants = 0
+            flow_stats: Dict[str, Dict[str, float]] = {}
+            total_counts: Counter[int] = Counter()
+            total_entrants = 0
 
-        for flow_id, flights in flow_map.items():
-            entries = entrants.get(flow_id, [])
-            bin_counter: Counter[int] = Counter()
-            for _, _, time_idx in entries:
-                idx = int(time_idx)
-                if idx < window_start or idx >= window_end:
+            for flow_id, flights in flow_map.items():
+                entries = entrants.get(flow_id, [])
+                bin_counter: Counter[int] = Counter()
+                for _, _, time_idx in entries:
+                    idx = int(time_idx)
+                    if idx < window_start or idx >= window_end:
+                        continue
+                    bin_counter[idx] += 1
+                total_counts.update(bin_counter)
+                num_entrants = sum(bin_counter.values())
+                total_entrants += num_entrants
+                peak = self._max_rolling_count(bin_counter, active_bins, bins_per_hour)
+                clear_rate = math.ceil(num_entrants / window_hours) if num_entrants else 0
+                flow_stats[str(flow_id)] = {
+                    "entrants": float(num_entrants),
+                    "peak": float(peak),
+                    "clear_rate": float(clear_rate),
+                }
+
+            if total_entrants <= 0:
+                return (math.inf,)
+
+            for flow_id, stats in flow_stats.items():
+                stats["share"] = stats["entrants"] / float(total_entrants)
+
+            total_peak = self._max_rolling_count(total_counts, active_bins, bins_per_hour)
+            total_clear = math.ceil(total_entrants / window_hours)
+
+            cap_map = self.evaluator.hourly_capacity_by_tv.get(str(control_volume_id)) or {}
+            hour_indices = {int(bin_idx // bins_per_hour) for bin_idx in active_bins}
+            caps: list[float] = []
+            for hour in sorted(hour_indices):
+                value = cap_map.get(hour)
+                if isinstance(value, (int, float)) and value >= 0:
+                    caps.append(float(value))
+            cap_stat: float = 0.0
+            if caps:
+                try:
+                    cap_stat = float(median(caps))
+                except Exception:
+                    cap_stat = float(caps[0])
+
+            max_rate = max(1, int(self.config.max_adaptive_rate))
+            candidate_ints: set[int] = set()
+
+            def _push_rate(value: float) -> None:
+                if value is None or math.isnan(value) or math.isinf(value):
+                    return
+                if value <= 0:
+                    return
+                normalized = max(1, min(max_rate, int(round(value))))
+                candidate_ints.add(normalized)
+
+            # Always consider global anchors.
+            _push_rate(total_clear)
+            _push_rate(total_peak)
+            if cap_stat > 0:
+                _push_rate(cap_stat)
+
+            # Flow-aware anchors.
+            multipliers = (0.5, 0.67, 0.8, 1.0, 1.25, 1.5)
+            for flow_id, stats in flow_stats.items():
+                entrants_count = stats["entrants"]
+                if entrants_count <= 0:
                     continue
-                bin_counter[idx] += 1
-            total_counts.update(bin_counter)
-            num_entrants = sum(bin_counter.values())
-            total_entrants += num_entrants
-            peak = self._max_rolling_count(bin_counter, active_bins, bins_per_hour)
-            clear_rate = math.ceil(num_entrants / window_hours) if num_entrants else 0
-            flow_stats[str(flow_id)] = {
-                "entrants": float(num_entrants),
-                "peak": float(peak),
-                "clear_rate": float(clear_rate),
-            }
+                _push_rate(stats["clear_rate"])
+                _push_rate(stats["peak"])
+                share = stats.get("share", 0.0)
+                if cap_stat > 0 and share > 0:
+                    base = cap_stat * share
+                    for mult in multipliers:
+                        _push_rate(base * mult)
+                peak_base = stats["peak"]
+                if peak_base > 0:
+                    for mult in (0.67, 1.0, 1.5):
+                        _push_rate(peak_base * mult)
 
-        if total_entrants <= 0:
-            return (math.inf,)
-
-        for flow_id, stats in flow_stats.items():
-            stats["share"] = stats["entrants"] / float(total_entrants)
-
-        total_peak = self._max_rolling_count(total_counts, active_bins, bins_per_hour)
-        total_clear = math.ceil(total_entrants / window_hours)
-
-        cap_map = self.evaluator.hourly_capacity_by_tv.get(str(control_volume_id)) or {}
-        hour_indices = {int(bin_idx // bins_per_hour) for bin_idx in active_bins}
-        caps: list[float] = []
-        for hour in sorted(hour_indices):
-            value = cap_map.get(hour)
-            if isinstance(value, (int, float)) and value >= 0:
-                caps.append(float(value))
-        cap_stat: float = 0.0
-        if caps:
-            try:
-                cap_stat = float(median(caps))
-            except Exception:
-                cap_stat = float(caps[0])
-
-        max_rate = max(1, int(self.config.max_adaptive_rate))
-        candidate_ints: set[int] = set()
-
-        def _push_rate(value: float) -> None:
-            if value is None or math.isnan(value) or math.isinf(value):
-                return
-            if value <= 0:
-                return
-            normalized = max(1, min(max_rate, int(round(value))))
-            candidate_ints.add(normalized)
-
-        # Always consider global anchors.
-        _push_rate(total_clear)
-        _push_rate(total_peak)
-        if cap_stat > 0:
-            _push_rate(cap_stat)
-
-        # Flow-aware anchors.
-        multipliers = (0.5, 0.67, 0.8, 1.0, 1.25, 1.5)
-        for flow_id, stats in flow_stats.items():
-            entrants_count = stats["entrants"]
-            if entrants_count <= 0:
-                continue
-            _push_rate(stats["clear_rate"])
-            _push_rate(stats["peak"])
-            share = stats.get("share", 0.0)
-            if cap_stat > 0 and share > 0:
-                base = cap_stat * share
+            # Global multipliers around capacity and peak.
+            for base in (cap_stat, float(total_peak), float(total_clear)):
+                if base <= 0:
+                    continue
                 for mult in multipliers:
                     _push_rate(base * mult)
-            peak_base = stats["peak"]
-            if peak_base > 0:
-                for mult in (0.67, 1.0, 1.5):
-                    _push_rate(peak_base * mult)
 
-        # Global multipliers around capacity and peak.
-        for base in (cap_stat, float(total_peak), float(total_clear)):
-            if base <= 0:
-                continue
-            for mult in multipliers:
-                _push_rate(base * mult)
+            if not candidate_ints:
+                candidate_ints.update({1, 2, 3})
 
-        if not candidate_ints:
-            candidate_ints.update({1, 2, 3})
+            max_candidates = max(1, int(self.config.max_adaptive_candidates))
+            finite_limit = max(1, max_candidates - 1)
 
-        max_candidates = max(1, int(self.config.max_adaptive_candidates))
-        finite_limit = max(1, max_candidates - 1)
+            ordered = sorted(candidate_ints, reverse=True)
+            if len(ordered) > finite_limit:
+                # Prefer to keep extremes and a balanced middle.
+                selected: list[int] = []
+                selected.append(ordered[0])
+                if ordered[-1] not in selected:
+                    selected.append(ordered[-1])
 
-        ordered = sorted(candidate_ints, reverse=True)
-        if len(ordered) > finite_limit:
-            # Prefer to keep extremes and a balanced middle.
-            selected: list[int] = []
-            selected.append(ordered[0])
-            if ordered[-1] not in selected:
-                selected.append(ordered[-1])
+                remaining_slots = finite_limit - len(selected)
+                if remaining_slots > 0:
+                    step = max(1, len(ordered) // remaining_slots)
+                    idx = step // 2
+                    while len(selected) < finite_limit and idx < len(ordered):
+                        candidate = ordered[idx]
+                        if candidate not in selected:
+                            selected.append(candidate)
+                        idx += step
+                ordered = sorted(set(selected), reverse=True)
 
-            remaining_slots = finite_limit - len(selected)
-            if remaining_slots > 0:
-                step = max(1, len(ordered) // remaining_slots)
-                idx = step // 2
-                while len(selected) < finite_limit and idx < len(ordered):
-                    candidate = ordered[idx]
-                    if candidate not in selected:
-                        selected.append(candidate)
-                    idx += step
-            ordered = sorted(set(selected), reverse=True)
-
-        rates_out: list[float] = [math.inf]
-        for value in ordered[:finite_limit]:
-            if value not in rates_out:
-                rates_out.append(float(value))
-        return tuple(rates_out)
+            rates_out: list[float] = [math.inf]
+            for value in ordered[:finite_limit]:
+                if value not in rates_out:
+                    rates_out.append(float(value))
+            return tuple(rates_out)
+        finally:
+            _timer_exit(None, None, None)
 
     @staticmethod
     def _max_rolling_count(counter: Counter[int], bins: Sequence[int], window: int) -> int:

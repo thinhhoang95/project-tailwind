@@ -143,11 +143,27 @@ def prepare_flow_scheduling_inputs(
     flight_list: FlightList,
     flow_map: Mapping[str, int],
     hotspot_ids: Sequence[str],
+    flight_ids: Optional[Iterable[str]] = None,
 ) -> Tuple[Dict[int, List[Dict[str, Any]]], Dict[int, Optional[str]]]:
     """
     Construct `flights_by_flow` for scheduling under a controlled volume.
 
-    Returns a mapping:
+    Parameters
+    ----------
+    flight_list : FlightList
+        Provider for flight metadata and decoding helpers.
+    flow_map : Mapping[str, int]
+        Mapping from flight_id -> flow_id.
+    hotspot_ids : Sequence[str]
+        Hotspots considered for selecting the controlled volume.
+    flight_ids : Optional[Iterable[str]], default=None
+        Optional restriction to a subset of flights when computing earliest
+        crossings. When omitted, all flights in `flight_list` are scanned.
+
+    Returns
+    -------
+    Tuple[Dict[int, List[Dict[str, Any]]], Dict[int, Optional[str]]]
+        Mapping:
       - flights_by_flow[flow_id] = list of flight specs, each as
             { 'flight_id': str, 'requested_bin': int }
         where requested_bin is the earliest crossing bin at the chosen
@@ -178,6 +194,20 @@ def prepare_flow_scheduling_inputs(
     flights_specs_by_flow: Dict[int, List[Dict[str, Any]]] = {}
     controlled_by_flow: Dict[int, Optional[str]] = {}
 
+    # Restrict iteration to the union of relevant flights when provided.
+    subset: Optional[List[str]]
+    if flight_ids is not None:
+        subset = list(dict.fromkeys(str(fid) for fid in flight_ids))
+    else:
+        subset = None
+
+    meta_items: Iterable[Tuple[str, Any]]
+    if subset is None:
+        meta_items = flight_list.flight_metadata.items()
+    else:
+        meta_map = flight_list.flight_metadata
+        meta_items = ((fid, meta_map.get(fid)) for fid in subset)
+
     # Precompute earliest crossing per flight per hotspot, capturing entry_time_s
     # - earliest_bin_by_flight_by_hotspot: fid -> tv -> earliest bin (int)
     # - earliest_crossing_by_flight_by_tv: fid -> tv -> (earliest_bin, entry_time_s_at_that_bin)
@@ -185,7 +215,9 @@ def prepare_flow_scheduling_inputs(
     earliest_crossing_by_flight_by_tv: Dict[str, Dict[str, Tuple[int, float]]] = {}
     hotspot_set = set(str(h) for h in hotspot_ids)
 
-    for fid, meta in flight_list.flight_metadata.items():
+    for fid, meta in meta_items:
+        if not meta:
+            continue
         d_bin: Dict[str, int] = {}
         d_full: Dict[str, Tuple[int, float]] = {}
         for iv in meta.get("occupancy_intervals", []) or []:
