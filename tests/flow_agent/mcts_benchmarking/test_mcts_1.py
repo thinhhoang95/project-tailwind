@@ -76,6 +76,7 @@ def test_mcts_agent_real_data_smoke(tmp_path: Path):
         Path("D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"),
         Path("/Volumes/CrucialX/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"),
         project_root / "data" / "cirrus" / "wxm_sm_ih_maxpool.geojson",
+        project_root / "output" / "wxm_sm_ih_maxpool.geojson"
     ]
 
     def _pick_path(cands: List[Path]) -> Path | None:
