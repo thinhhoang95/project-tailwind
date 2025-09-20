@@ -181,7 +181,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
 
     # Configure agent budgets small to keep runtime reasonable
     # Limit to a single regulation to shorten runtime and match the request
-    mcts_cfg = MCTSConfig(max_sims=128, commit_depth=16, commit_eval_limit=-1, seed=69420) # commit_eval_limit is legacy, we can set it to anything
+    mcts_cfg = MCTSConfig(max_sims=128, commit_depth=16, commit_eval_limit=-1, seed=69420, debug_prints=True) # commit_eval_limit is legacy, we can set it to anything
     rf_cfg = RateFinderConfig(use_adaptive_grid=True, max_eval_calls=4)
     disc_cfg = HotspotDiscoveryConfig(
         threshold=0.0,

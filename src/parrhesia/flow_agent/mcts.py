@@ -46,6 +46,8 @@ class MCTSConfig:
     phi_scale: float = 1.0
     # RNG
     seed: int = 0
+    # Debug prints
+    debug_prints: bool = False
 
 
 @dataclass
@@ -110,6 +112,55 @@ class MCTS:
             return nullcontext()
         return self._timer_factory(name)
 
+    # ------------------------------- Debug helpers -------------------------
+    def _dbg(self, message: str) -> None:
+        if getattr(self.cfg, "debug_prints", False):
+            try:
+                print(message)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _sig_to_label(sig: Tuple) -> str:
+        try:
+            if not isinstance(sig, (list, tuple)) or not sig:
+                return str(sig)
+            kind = sig[0]
+            if kind == "add":
+                return f"add({sig[1]})"
+            if kind == "rem":
+                return f"rem({sig[1]})"
+            if kind == "cont":
+                return "cont"
+            if kind == "back":
+                return "back"
+            if kind == "commit":
+                return f"commit({max(0, len(sig)-1)})"
+            if kind == "new_reg":
+                return "new_reg"
+            if kind == "hotspot":
+                return f"hotspot({sig[1]},{sig[2]}-{sig[3]})"
+            if kind == "stop":
+                return "stop"
+            return str(sig)
+        except Exception:
+            return str(sig)
+
+    @staticmethod
+    def _state_brief(state: PlanState) -> str:
+        try:
+            n_regs = len(getattr(state, "plan", []) or [])
+            stage = getattr(state, "stage", "?")
+            ctx = getattr(state, "hotspot_context", None)
+            tv = getattr(ctx, "control_volume_id", None) if ctx is not None else None
+            wb = getattr(ctx, "window_bins", None) if ctx is not None else None
+            n_flows = len(getattr(ctx, "selected_flow_ids", []) or []) if ctx is not None else 0
+            tv_s = str(tv) if tv is not None else "—"
+            wb_s = f"{int(wb[0])}-{int(wb[1])}" if isinstance(wb, (tuple, list)) and len(wb) == 2 else "—"
+            return f"plan_regs={n_regs} stage={stage} tv={tv_s} win={wb_s} sel_flows={n_flows}"
+        except Exception:
+            return "plan_regs=? stage=?"
+
     @property
     def action_counts(self) -> Dict[str, int]:
         return dict(self._action_counts)
@@ -130,11 +181,15 @@ class MCTS:
         t_start = time.perf_counter()
         t_end = t_start + float(self.cfg.max_time_s)
 
+        self._dbg(f"[MCTS] run start: sims={sims} depth={depth_limit} {self._state_brief(root)}")
+
         for i in range(sims):
             now = time.perf_counter()
             if now > t_end:
                 break
+            self._dbg(f"[MCTS] simulate[{i+1}/{sims}] start nodes={len(self.nodes)} {self._state_brief(root)}")
             last_ret = self._simulate(root, depth_limit)
+            self._dbg(f"[MCTS] simulate[{i+1}/{sims}] end   return={float(last_ret):.3f} best_dJ={(self._best_commit[1] if self._best_commit is not None else None)} nodes={len(self.nodes)}")
             # Progress callback (best-effort, non-fatal)
             if self._progress_cb is not None:
                 try:
@@ -185,8 +240,10 @@ class MCTS:
             node = self.nodes.get(key)
             if node is None:
                 node = self._create_node(state)
+                self._dbg(f"[MCTS/expand] create_leaf node={key[:24]}… phi={float(node.phi):.3f} {self._state_brief(state)}")
                 # Leaf bootstrap: return -phi
                 v = -node.phi
+                self._dbg(f"[MCTS/simulate] leaf_bootstrap return={float(v):.3f} {self._state_brief(state)} path_len={len(path)}")
                 self._backup(path, v)
                 return v
 
@@ -199,6 +256,7 @@ class MCTS:
                     node.P[sig] = float(p)
             m_allow = int(self.cfg.k0 + self.cfg.k1 * (node.N ** self.cfg.alpha))
             m_allow = max(1, m_allow)
+            self._dbg(f"[MCTS/expand] node={key[:24]}… allow={m_allow} priors={len(priors)} children_before={len(node.children)} {self._state_brief(state)}")
             while len(node.children) < m_allow and len(node.children) < len(priors):
                 # Expand top-ranked by prior not already expanded
                 for sig, _ in sorted(priors.items(), key=lambda kv: (-kv[1], kv[0])):
@@ -206,6 +264,7 @@ class MCTS:
                         continue
                     node.children[sig] = "?"  # placeholder child key; will be set after step
                     node.edges[sig] = node.edges.get(sig, EdgeStats())
+                    self._dbg(f"[MCTS/expand]   + child {self._sig_to_label(sig)} P={float(priors.get(sig, 0.0)):.3f} children_now={len(node.children)}")
                     break
                 else:
                     break
@@ -214,6 +273,7 @@ class MCTS:
             if not node.children:
                 # No viable moves -> terminal; bootstrap
                 v = -node.phi
+                self._dbg(f"[MCTS/select] no_children -> terminal bootstrap={float(v):.3f} {self._state_brief(state)}")
                 self._backup(path, v)
                 return v
 
@@ -226,6 +286,7 @@ class MCTS:
                 viable.append((sig, est))
             if not viable:
                 v = -node.phi
+                self._dbg(f"[MCTS/select] no_viable_moves -> bootstrap={float(v):.3f} commits_used={commits_used}/{commit_depth} {self._state_brief(state)}")
                 self._backup(path, v)
                 return v
 
@@ -240,6 +301,10 @@ class MCTS:
                     best_score = U
                     best_sig = sig
             assert best_sig is not None
+            est_sel = node.edges.get(best_sig, EdgeStats())
+            self._dbg(
+                f"[MCTS/select] pick {self._sig_to_label(best_sig)} U={float(best_score):.3f} Q={float(est_sel.Q):.3f} P={float(node.P.get(best_sig, 0.0)):.3f} N_edge={int(est_sel.N)} node_N={int(node.N)} children={len(node.children)} {self._state_brief(state)}"
+            )
 
             # Materialize action from signature and step
             action = self._action_from_signature(state, best_sig)
@@ -250,9 +315,14 @@ class MCTS:
                 if commits_used >= commit_depth:
                     # Treat as terminal; bootstrap
                     v = -node.phi
+                    self._dbg(f"[MCTS/simulate] commit_blocked budget commits_used={commits_used}/{commit_depth} -> bootstrap={float(v):.3f}")
                     self._backup(path, v)
                     return v
+                self._dbg(
+                    f"[MCTS/simulate] evaluate_commit flows={len(getattr(getattr(state, 'hotspot_context', None), 'selected_flow_ids', []) or [])} {self._state_brief(state)}"
+                )
                 commit_action, delta_j = self._evaluate_commit(state)
+                self._dbg(f"[MCTS/simulate] evaluate_commit_done ΔJ={float(delta_j):.3f} calls={int(self._commit_calls)}")
                 action = commit_action
                 r_base = -float(delta_j)
                 # Track best commit observed across sims (at root or deeper)
@@ -271,6 +341,9 @@ class MCTS:
             phi_sp = self._phi(next_state)
             r_shaped = r_base + (phi_sp - phi_s)
             total_return += r_shaped
+            self._dbg(
+                f"[MCTS/step] {type(action).__name__} commit={bool(is_commit)} term={bool(is_terminal)} r_base={float(r_base):.3f} Δphi={(phi_sp - phi_s):.3f} r={float(r_shaped):.3f} G={float(total_return):.3f} {self._state_brief(next_state)}"
+            )
 
             # Push to path and continue
             path.append((key, best_sig))
@@ -281,6 +354,9 @@ class MCTS:
                 # Terminal or used up commit budget -> stop and bootstrap at leaf
                 leaf_v = -self._phi(state)
                 total_return += leaf_v
+                self._dbg(
+                    f"[MCTS/simulate] terminal_or_budget commits_used={commits_used}/{commit_depth} leaf_bootstrap={float(leaf_v):.3f} return={float(total_return):.3f} path_len={len(path)}"
+                )
                 self._backup(path, total_return)
                 return total_return
 
@@ -556,6 +632,18 @@ class MCTS:
             est.N += 1
             est.W += v
             est.Q = est.W / max(1, est.N)
+        if getattr(self.cfg, "debug_prints", False):
+            try:
+                root_key = path[0][0] if path else None
+                root_node = self.nodes.get(root_key) if root_key is not None else None
+                if root_node is not None:
+                    print(
+                        f"[MCTS/backprop] value={v:.3f} path_len={len(path)} root_visits={int(root_node.N)} root_Q={float(root_node.Q):.3f}"
+                    )
+                else:
+                    print(f"[MCTS/backprop] value={v:.3f} path_len={len(path)} (no_root)")
+            except Exception:
+                pass
 
 
 __all__ = ["MCTS", "MCTSConfig", "TreeNode", "EdgeStats"]
