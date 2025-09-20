@@ -15,6 +15,9 @@ from .actions import (
 from .transition import CheapTransition
 from .mcts import MCTS, MCTSConfig
 from .rate_finder import RateFinder, RateFinderConfig
+from .logging import SearchLogger
+from .hotspot_discovery import HotspotDiscoveryConfig, HotspotDescriptor, HotspotInventory
+from .agent import MCTSAgent
 
 __all__ = [
     "PlanState",
@@ -34,4 +37,9 @@ __all__ = [
     "RateFinderConfig",
     "MCTS",
     "MCTSConfig",
+    "SearchLogger",
+    "HotspotDiscoveryConfig",
+    "HotspotDescriptor",
+    "HotspotInventory",
+    "MCTSAgent",
 ]

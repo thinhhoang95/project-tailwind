@@ -9,7 +9,8 @@ Contents
 - Priors and Progressive Widening
 - Potential Shaping (phi)
 - Commit Evaluation and Caching
-- Usage Guide (Quickstart)
+- Hotspot Selection
+- Full Agent Usage
 - Tips and Performance Notes
 - Limitations and Next Steps
 
@@ -67,6 +68,7 @@ Internal structures
 
 Priors
 - Derived heuristically from flow “proxies” (histograms of entrants within the hotspot window). A larger mass of entrants yields a higher prior for AddFlow(flow_id).
+- For PickHotspot actions, priors are proportional to a supplied `hotspot_prior` in `PlanState.metadata["hotspot_candidates"]`.
 - RemoveFlow is mildly discouraged initially; Continue, Commit, Back, Stop receive neutral/low priors.
 - Softmax with temperature combines to a probability distribution used by PUCT.
 
@@ -89,6 +91,42 @@ Reward
 - CommitRegulation triggers a RateFinder.find_rates(...) call with the current state’s hotspot, window, and selected flows (mapping flow_id → flight IDs) supplied via hotspot context metadata.
 - Results (rates, ΔJ, diagnostics) are cached with a stable key to avoid recomputation across simulations.
 - A strict commit_eval_limit throttles the number of evaluator calls per MCTS.run() to keep end-to-end runtime manageable.
+
+## Hotspot Selection
+
+- The state machine includes these stages: `idle`, `select_hotspot`, `select_flows`, `confirm`, `stopped`.
+- Action enumeration has been extended to:
+  - `idle`: `NewRegulation`, `Stop`
+  - `select_hotspot`: one `PickHotspot` per entry in `PlanState.metadata["hotspot_candidates"]`, plus `Stop`
+  - `select_flows` and `confirm`: unchanged
+- Candidates must be injected as a list of dicts with keys `control_volume_id`, `window_bins`, `candidate_flow_ids`, `mode`, `metadata` (must include `flow_to_flights` and `flow_proxies`), and `hotspot_prior`.
+
+## Full Agent Usage
+
+High-level agent wiring the full pipeline is available in `src/parrhesia/flow_agent/agent.py` via `MCTSAgent`.
+
+Example:
+```python
+from parrhesia.flow_agent import MCTSAgent, MCTSConfig, RateFinderConfig, SearchLogger, HotspotDiscoveryConfig
+from project_tailwind.optimize.eval.network_evaluator import NetworkEvaluator
+
+agent = MCTSAgent(
+    evaluator=NetworkEvaluator(caps_gdf, flight_list),
+    flight_list=flight_list,
+    indexer=indexer,
+    mcts_cfg=MCTSConfig(max_sims=48, commit_depth=2, commit_eval_limit=6, seed=0),
+    rate_finder_cfg=RateFinderConfig(use_adaptive_grid=True),
+    discovery_cfg=HotspotDiscoveryConfig(threshold=0.0, top_hotspots=10, top_flows=4, max_flights_per_flow=20),
+    logger=SearchLogger.to_timestamped("output/flow_agent_runs"),
+)
+state, info = agent.run()
+```
+
+The agent:
+- Discovers hotspot candidates from `NetworkEvaluator.get_hotspot_segments`.
+- Builds flows and flow proxies per hotspot and seeds `PlanState.metadata`.
+- Runs MCTS to select flows and commit rates (multi-commit supported by `commit_depth`).
+- Computes a final global objective using `parrhesia.optim.objective` and logs a JSONL trace if a logger is provided.
 
 ## Usage Guide (Quickstart)
 
@@ -145,4 +183,3 @@ assert is_commit
 - The current action set assumes a prior hotspot selection; extending candidate generation to include picking hotspots and a STOP policy is straightforward.
 - We use a heuristic potential and priors; a learned value function or policy could improve guidance.
 - Multi-commit trajectories per simulation are supported via commit_depth > 1 but the example tests focus on a single-commit improvement.
-

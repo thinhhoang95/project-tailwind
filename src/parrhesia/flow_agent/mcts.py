@@ -13,6 +13,8 @@ from .actions import (
     Back,
     CommitRegulation,
     Continue,
+    NewRegulation,
+    PickHotspot,
     RemoveFlow,
     Stop,
 )
@@ -245,6 +247,33 @@ class MCTS:
         actions: List[Action] = []
         ctx = state.hotspot_context
 
+        if state.stage == "idle":
+            # Start a new regulation or stop
+            actions.append(NewRegulation())
+            actions.append(Stop())
+            return actions
+
+        if state.stage == "select_hotspot":
+            # Enumerate candidate hotspots from inventory metadata
+            cands = state.metadata.get("hotspot_candidates") if isinstance(state.metadata, dict) else None
+            if isinstance(cands, list):
+                for item in cands:
+                    try:
+                        tv = str(item.get("control_volume_id"))
+                        wb = item.get("window_bins") or []
+                        t0, t1 = int(wb[0]), int(wb[1])
+                    except Exception:
+                        continue
+                    actions.append(PickHotspot(
+                        control_volume_id=tv,
+                        window_bins=(t0, t1),
+                        candidate_flow_ids=tuple(str(x) for x in (item.get("candidate_flow_ids") or [])),
+                        mode=str(item.get("mode", "per_flow")),
+                        metadata=dict(item.get("metadata", {})),
+                    ))
+            actions.append(Stop())
+            return actions
+
         if state.stage == "select_flows" and ctx is not None:
             selected = set(ctx.selected_flow_ids)
             for fid in ctx.candidate_flow_ids:
@@ -281,6 +310,24 @@ class MCTS:
             if isinstance(a, AddFlow):
                 proxy = np.asarray(proxies.get(a.flow_id, []), dtype=float)
                 logits[sig] = float(proxy.sum()) if proxy.size else 1.0
+            elif isinstance(a, PickHotspot):
+                # Read prior from candidate metadata when available
+                prior = None
+                if isinstance(state.metadata, Mapping):
+                    for item in (state.metadata.get("hotspot_candidates") or []):
+                        try:
+                            tv = str(item.get("control_volume_id"))
+                            wb = item.get("window_bins") or []
+                            t0, t1 = int(wb[0]), int(wb[1])
+                        except Exception:
+                            continue
+                        if tv == a.control_volume_id and (t0, t1) == tuple(int(b) for b in a.window_bins):
+                            try:
+                                prior = float(item.get("hotspot_prior", 1.0))
+                            except Exception:
+                                prior = 1.0
+                            break
+                logits[sig] = float(prior if prior is not None else 1.0)
             elif isinstance(a, RemoveFlow):
                 logits[sig] = 0.5  # mildly discouraged initially
             elif isinstance(a, Continue):
@@ -381,6 +428,11 @@ class MCTS:
             ctx = state.hotspot_context
             chosen = tuple(sorted(ctx.selected_flow_ids)) if ctx is not None else tuple()
             return ("commit",) + chosen
+        if isinstance(action, NewRegulation):
+            return ("new_reg",)
+        if isinstance(action, PickHotspot):
+            t0, t1 = int(action.window_bins[0]), int(action.window_bins[1])
+            return ("hotspot", str(action.control_volume_id), t0, t1)
         if isinstance(action, Stop):
             return ("stop",)
         return (type(action).__name__,)
@@ -397,6 +449,30 @@ class MCTS:
             return Back()
         if kind == "commit":
             return CommitRegulation()
+        if kind == "new_reg":
+            return NewRegulation()
+        if kind == "hotspot":
+            # Reconstruct payload from metadata candidates
+            tv = str(sig[1])
+            t0, t1 = int(sig[2]), int(sig[3])
+            if isinstance(state.metadata, Mapping):
+                for item in (state.metadata.get("hotspot_candidates") or []):
+                    try:
+                        tv_i = str(item.get("control_volume_id"))
+                        wb = item.get("window_bins") or []
+                        tt0, tt1 = int(wb[0]), int(wb[1])
+                    except Exception:
+                        continue
+                    if tv_i == tv and tt0 == t0 and tt1 == t1:
+                        return PickHotspot(
+                            control_volume_id=tv,
+                            window_bins=(t0, t1),
+                            candidate_flow_ids=tuple(str(x) for x in (item.get("candidate_flow_ids") or [])),
+                            mode=str(item.get("mode", "per_flow")),
+                            metadata=dict(item.get("metadata", {})),
+                        )
+            # Fallback minimal action if metadata missing
+            return PickHotspot(control_volume_id=tv, window_bins=(t0, t1), candidate_flow_ids=tuple(), metadata={})
         if kind == "stop":
             return Stop()
         # Fallback should not occur in tests
