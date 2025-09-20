@@ -5,7 +5,7 @@ import time
 from collections import Counter, OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from statistics import median
 from typing import Any, Callable, ContextManager, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -20,6 +20,7 @@ from parrhesia.optim.objective import (
     ScoreContext,
     build_score_context,
     score_with_context,
+    score_with_context_precomputed_occ,
 )
 from .state import PlanState
 
@@ -45,7 +46,10 @@ class RateFinderConfig:
     objective_weights: Optional[Dict[str, float]] = None
     use_adaptive_grid: bool = False
     max_adaptive_rate: int = 120
-    max_adaptive_candidates: int = 12
+    max_adaptive_candidates: int = 8
+    # Fast scorer and verbosity controls
+    fast_scorer_enabled: bool = True
+    verbose: bool = False
 
 
 @dataclass
@@ -84,6 +88,7 @@ class RateFinder:
         self._candidate_cache: "OrderedDict[Tuple, _CandidateResult]" = OrderedDict()
         self._entrants_cache: "OrderedDict[Tuple, Dict[str, Tuple[Tuple[Any, Any, int], ...]]]" = OrderedDict()
         self._rate_grid_cache: "OrderedDict[Tuple, Tuple[float, ...]]" = OrderedDict()
+        self._base_occ_cache: "OrderedDict[Tuple[str, str], Tuple[np.ndarray, np.ndarray]]" = OrderedDict()
         self._timer_factory = timer
 
     def _timed(self, name: str) -> ContextManager[Any]:
@@ -129,11 +134,12 @@ class RateFinder:
                 entrants=entrants,
             )
 
-        if mode == "per_flow":
-            for flow_id in flow_ids:
-                print(f"[RateFinder] candidate rates for flow {flow_id}: {tuple(rate_grid)}")
-        else:
-            print(f"[RateFinder] candidate rates (blanket mode): {tuple(rate_grid)}")
+        if self.config.verbose:
+            if mode == "per_flow":
+                for flow_id in flow_ids:
+                    print(f"[RateFinder] candidate rates for flow {flow_id}: {tuple(rate_grid)}")
+            else:
+                print(f"[RateFinder] candidate rates (blanket mode): {tuple(rate_grid)}")
 
         flow_order = sorted(flow_ids, key=lambda f: (-len(entrants.get(f, [])), f))
 
@@ -168,6 +174,8 @@ class RateFinder:
                 target_cells=target_cells,
                 weights=weights,
                 tv_filter=[control_volume_id],
+                plan_key=str(plan_key),
+                control_volume_id=str(control_volume_id),
             )
         baseline_obj = baseline.objective
         baseline_components = baseline.components
@@ -186,11 +194,19 @@ class RateFinder:
         T = int(self._indexer.num_time_bins)
         active_bins_sorted = sorted({int(b) for b in active_windows if 0 <= int(b) < T})
 
+        # Adaptive pass control
+        passes_to_use = 1 if bool(self.config.use_adaptive_grid) else int(self.config.passes)
+
+        # Evaluation call budgeting
+        rate_grid_len = len(rate_grid)
+        flow_count = len(context_flow_ids)
+        eval_call_limit = min(int(self.config.max_eval_calls), int(flow_count) * (int(rate_grid_len) + 3))
+
         if mode == "per_flow":
             best_rates: Dict[str, float] = {fid: math.inf for fid in context_flow_ids}
             history_out: Dict[str, Dict[str, float]] = {fid: {} for fid in context_flow_ids}
 
-            for _ in range(int(self.config.passes)):
+            for _ in range(int(passes_to_use)):
                 prev_delta = best_delta
                 for flow_id in flow_order:
                     if stopped_early:
@@ -231,7 +247,7 @@ class RateFinder:
                                     baseline_obj=baseline_obj,
                                 )
                             eval_calls += 1
-                            if eval_calls >= self.config.max_eval_calls:
+                            if eval_calls >= eval_call_limit:
                                 stopped_early = True
                         history_out.setdefault(flow_id, {})[str(rate_val)] = result.delta_j
                         if result.delta_j < best_delta:
@@ -249,7 +265,7 @@ class RateFinder:
         else:
             history_out = {"__blanket__": {}}
             best_rate = math.inf
-            for _ in range(int(self.config.passes)):
+            for _ in range(int(passes_to_use)):
                 prev_delta = best_delta
                 for rate in rate_grid:
                     rate_val = float(rate)
@@ -286,7 +302,7 @@ class RateFinder:
                                 baseline_obj=baseline_obj,
                             )
                         eval_calls += 1
-                        if eval_calls >= self.config.max_eval_calls:
+                        if eval_calls >= eval_call_limit:
                             stopped_early = True
                     history_out.setdefault("__blanket__", {})[str(rate_val)] = result.delta_j
                     if result.delta_j < best_delta:
@@ -390,6 +406,8 @@ class RateFinder:
         target_cells: Iterable[Tuple[str, int]],
         weights: ObjectiveWeights,
         tv_filter: Sequence[str],
+        plan_key: Optional[str] = None,
+        control_volume_id: Optional[str] = None,
     ) -> Tuple[ScoreContext, _BaselineResult]:
         context = self._score_context_cache.get(context_key)
         target_set = set(target_cells)
@@ -407,6 +425,29 @@ class RateFinder:
                     weights=weights,
                     tv_filter=tv_filter,
                 )
+                # Inject/reuse base occupancy arrays across flow subsets when possible
+                try:
+                    T = int(self._indexer.num_time_bins)
+                    tv = str(control_volume_id or (tv_filter[0] if tv_filter else next(iter(capacities_by_tv.keys()))))
+                    pk = str(plan_key) if plan_key is not None else str(context_key[0])
+                    occ_key = (pk, tv)
+                    cached_bases = self._base_occ_cache.get(occ_key)
+                    if cached_bases is not None:
+                        base_all, base_zero = cached_bases
+                        if base_all.size == T and base_zero.size == T:
+                            context.base_occ_all_by_tv[tv] = np.asarray(base_all, dtype=np.int64)
+                            context.base_occ_sched_zero_by_tv[tv] = np.asarray(base_zero, dtype=np.int64)
+                        # refresh LRU position
+                        self._base_occ_cache.move_to_end(occ_key)
+                    else:
+                        # Store for reuse if available
+                        ba = np.asarray(context.base_occ_all_by_tv.get(tv, np.zeros(T, dtype=np.int64)), dtype=np.int64)
+                        bz = np.asarray(context.base_occ_sched_zero_by_tv.get(tv, np.zeros(T, dtype=np.int64)), dtype=np.int64)
+                        self._base_occ_cache[occ_key] = (ba, bz)
+                        self._base_occ_cache.move_to_end(occ_key)
+                        self._trim_lru_cache(self._base_occ_cache)
+                except Exception:
+                    pass
             self._score_context_cache[context_key] = context
 
         baseline = self._baseline_cache.get(context_key)
@@ -547,14 +588,49 @@ class RateFinder:
         context: ScoreContext,
         baseline_obj: float,
     ) -> _CandidateResult:
-        with self._timed("rate_finder.score_with_context.candidate"):
-            objective, components, artifacts = score_with_context(
-                schedule,
-                flights_by_flow=flights_by_flow,
-                capacities_by_tv=capacities_by_tv,
-                flight_list=flight_list,
-                context=context,
-            )
+        # Fast scorer toggle via config and env var (RATE_FINDER_FAST_SCORER=0 disables)
+        use_fast = bool(getattr(self.config, "fast_scorer_enabled", True))
+        try:
+            import os
+            env_flag = os.getenv("RATE_FINDER_FAST_SCORER")
+            if env_flag is not None and str(env_flag).strip().lower() in {"0", "false", "no"}:
+                use_fast = False
+        except Exception:
+            pass
+
+        if use_fast:
+            # Build occ_by_tv for the single control TV using base caches + schedule sum
+            T = int(self._indexer.num_time_bins)
+            sched_sum = np.zeros(T, dtype=np.int64)
+            for f, arr in schedule.items():
+                a = np.asarray(arr, dtype=np.int64)
+                if a.size > 0:
+                    take = a[:T] if a.size >= T else np.pad(a, (0, T - a.size), mode="constant")[:T]
+                    sched_sum += take.astype(np.int64, copy=False)
+            # Assume single TV in capacities/context
+            tv_id = next(iter(capacities_by_tv.keys())) if capacities_by_tv else next(iter(context.tvs_of_interest))
+            base_all = np.asarray(context.base_occ_all_by_tv.get(str(tv_id), np.zeros(T, dtype=np.int64)), dtype=np.int64)
+            base_zero = np.asarray(context.base_occ_sched_zero_by_tv.get(str(tv_id), np.zeros(T, dtype=np.int64)), dtype=np.int64)
+            occ_tv = base_all - base_zero + sched_sum
+            occ_by_tv = {str(tv_id): occ_tv.astype(np.int64, copy=False)}
+            with self._timed("rate_finder.score_with_context.candidate"):
+                objective, components, artifacts = score_with_context_precomputed_occ(
+                    schedule,
+                    flights_by_flow=flights_by_flow,
+                    capacities_by_tv=capacities_by_tv,
+                    flight_list=flight_list,
+                    context=context,
+                    occ_by_tv=occ_by_tv,
+                )
+        else:
+            with self._timed("rate_finder.score_with_context.candidate"):
+                objective, components, artifacts = score_with_context(
+                    schedule,
+                    flights_by_flow=flights_by_flow,
+                    capacities_by_tv=capacities_by_tv,
+                    flight_list=flight_list,
+                    context=context,
+                )
         delta_j = float(objective) - float(baseline_obj)
         result = _CandidateResult(
             delta_j=delta_j,
@@ -571,19 +647,45 @@ class RateFinder:
         active_windows: Sequence[int],
         flow_map: Mapping[str, Sequence[str]],
     ) -> Dict[str, list]:
-        key = self._entrants_cache_key(control_volume_id, active_windows)
+        # Restrict to selected flights only
+        allowed_fids: Tuple[str, ...] = tuple(sorted({str(fid) for flights in flow_map.values() for fid in flights}))
+        key = self._entrants_cache_key(control_volume_id, active_windows, allowed_fids)
         cached = self._entrants_cache_lookup(key)
         if cached is None:
             entries_by_flight: Dict[str, list[Tuple[Any, Any, int]]] = {}
-            iter_fn = getattr(self._base_flight_list, "iter_hotspot_crossings", None)
-            if callable(iter_fn):
-                normalized_windows = list(int(b) for b in active_windows)
-                for fid, tv_id, entry_dt, time_idx in iter_fn(
-                    [control_volume_id], active_windows={control_volume_id: normalized_windows}
-                ):
+            # Decode intervals arithmetically for allowed flights only
+            fm = getattr(self._base_flight_list, "flight_metadata", {}) or {}
+            indexer = self._indexer
+            T = int(getattr(indexer, "num_time_bins", 0))
+            tv_to_idx = getattr(indexer, "tv_id_to_idx", {}) or {}
+            target_row = int(tv_to_idx.get(str(control_volume_id), -1))
+            aw_set = {int(b) for b in active_windows}
+            for fid in allowed_fids:
+                meta = fm.get(str(fid)) or {}
+                takeoff = meta.get("takeoff_time")
+                if not isinstance(takeoff, datetime):
+                    # If we don't have a datetime, we still collect the time_idx without entry_dt
+                    takeoff = None
+                for iv in (meta.get("occupancy_intervals") or []):
+                    try:
+                        tvtw_idx = int(iv.get("tvtw_index"))
+                    except Exception:
+                        continue
+                    if T <= 0:
+                        continue
+                    row = tvtw_idx // T
+                    bin_idx = int(tvtw_idx - row * T)
+                    if row != target_row or bin_idx not in aw_set:
+                        continue
+                    entry_s = iv.get("entry_time_s", 0)
+                    try:
+                        entry_s = float(entry_s)
+                    except Exception:
+                        entry_s = 0.0
+                    entry_dt = (takeoff + timedelta(seconds=entry_s)) if isinstance(takeoff, datetime) else None
                     fid_key = str(fid)
                     bucket = entries_by_flight.setdefault(fid_key, [])
-                    bucket.append((fid, entry_dt, int(time_idx)))
+                    bucket.append((fid, entry_dt, int(bin_idx)))
             cached = {
                 fid_key: tuple(values)
                 for fid_key, values in entries_by_flight.items()
@@ -852,13 +954,14 @@ class RateFinder:
         return best
 
     def _entrants_cache_key(
-        self, control_volume_id: str, active_windows: Sequence[int]
-    ) -> Tuple[str, Tuple[int, ...]]:
+        self, control_volume_id: str, active_windows: Sequence[int], allowed_fids: Sequence[str]
+    ) -> Tuple[str, Tuple[int, ...], Tuple[str, ...]]:
         windows_key = tuple(sorted(int(b) for b in active_windows))
-        return (str(control_volume_id), windows_key)
+        allowed_key = tuple(sorted(str(x) for x in allowed_fids))
+        return (str(control_volume_id), windows_key, allowed_key)
 
     def _entrants_cache_lookup(
-        self, key: Tuple[str, Tuple[int, ...]]
+        self, key: Tuple[str, Tuple[int, ...], Tuple[str, ...]]
     ) -> Optional[Dict[str, Tuple[Tuple[Any, Any, int], ...]]]:
         cached = self._entrants_cache.get(key)
         if cached is not None:
@@ -867,7 +970,7 @@ class RateFinder:
 
     def _entrants_cache_store(
         self,
-        key: Tuple[str, Tuple[int, ...]],
+        key: Tuple[str, Tuple[int, ...], Tuple[str, ...]],
         value: Dict[str, Tuple[Tuple[Any, Any, int], ...]],
     ) -> None:
         self._entrants_cache[key] = value

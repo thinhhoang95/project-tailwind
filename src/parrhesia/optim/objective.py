@@ -364,6 +364,99 @@ def score_with_context(
     return float(J_total), components, artifacts
 
 
+def score_with_context_precomputed_occ(
+    n_f_t: Mapping[Any, Union[Sequence[int], Mapping[int, int]]],
+    *,
+    flights_by_flow: Mapping[Any, Sequence[Any]],
+    capacities_by_tv: Mapping[str, np.ndarray],
+    flight_list: Optional[object],
+    context: ScoreContext,
+    occ_by_tv: Mapping[str, np.ndarray],
+    audit_exceedances: bool = False,
+) -> Tuple[float, Dict[str, float], Dict[str, Any]]:
+    """
+    Fast scoring variant that skips occupancy recomputation and uses provided
+    occ_by_tv for capacity exceedance. Other components follow
+    score_with_context semantics.
+
+    Parameters are identical to score_with_context, with an extra `occ_by_tv`.
+    """
+    # Use module-level DEBUG_TIMING; do not override here
+    weights = context.weights
+    indexer = context.indexer
+    T = int(indexer.num_time_bins)
+
+    # Normalize n
+    n_by_flow: Dict[Any, np.ndarray] = {f: _to_len_T_plus_1_array(arr, T) for f, arr in n_f_t.items()}
+
+    # Delays using preprocessed sorted flights
+    import time
+    if DEBUG_TIMING:
+        time_start = time.time()
+    delays_min, realised_start = assign_delays_flowful_preparsed(context.flights_sorted_by_flow, n_by_flow, indexer)
+    if DEBUG_TIMING:
+        time_end = time.time(); print(f"assign_delays_flowful(pre) time: {time_end - time_start} seconds")
+
+    # Use provided occupancy for J_cap
+    if DEBUG_TIMING:
+        time_start = time.time()
+    K = int(indexer.rolling_window_size())
+    J_cap = _compute_J_cap(
+        occ_by_tv,
+        capacities_by_tv,
+        context.alpha_by_tv,
+        K,
+        audit_exceedances=audit_exceedances,
+        indexer=indexer,
+        target_cells=context.target_cells,
+        ripple_cells=context.ripple_cells,
+    )
+    if DEBUG_TIMING:
+        time_end = time.time(); print(f"J_cap time (precomputed occ): {time_end - time_start} seconds")
+
+    # J_delay, J_reg, J_tv
+    if DEBUG_TIMING:
+        time_start = time.time()
+    total_delay_min = sum(int(v) for v in delays_min.values())
+    J_delay = float(weights.lambda_delay) * float(total_delay_min)
+    J_reg, J_tv = _compute_J_reg_and_J_tv(n_by_flow, context.d_by_flow, context.beta_gamma_by_flow, weights.beta_ctx, weights.gamma_ctx)
+    if DEBUG_TIMING:
+        time_end = time.time(); print(f"J_reg, J_delay and J_tv time: {time_end - time_start} seconds")
+
+    # Optional terms
+    if DEBUG_TIMING:
+        time_start = time.time()
+    J_share = _compute_J_share(n_by_flow, context.d_by_flow, weights.theta_share) if weights.theta_share > 0 else 0.0
+    if DEBUG_TIMING:
+        time_end = time.time(); print(f"J_share time: {time_end - time_start} seconds")
+    J_spill = _compute_J_spill(n_by_flow, weights.eta_spill) if weights.eta_spill > 0 else 0.0
+
+    J_total = J_cap + J_delay + J_reg + J_tv + J_share + J_spill
+
+    components: Dict[str, float] = {
+        "J_cap": float(J_cap),
+        "J_delay": float(J_delay),
+        "J_reg": float(J_reg),
+        "J_tv": float(J_tv),
+    }
+    if weights.theta_share > 0:
+        components["J_share"] = float(J_share)
+    if weights.eta_spill > 0:
+        components["J_spill"] = float(J_spill)
+
+    artifacts: Dict[str, Any] = {
+        "delays_min": delays_min,
+        "realised_start": realised_start,
+        "occupancy": dict(occ_by_tv),
+        "demand": context.d_by_flow,
+        "n": n_by_flow,
+        "beta_gamma": context.beta_gamma_by_flow,
+        "alpha": context.alpha_by_tv,
+    }
+
+    return float(J_total), components, artifacts
+
+
 # --------------------------------- Public API --------------------------------
 
 
@@ -1219,4 +1312,5 @@ __all__ = [
     "ScoreContext",
     "build_score_context",
     "score_with_context",
+    "score_with_context_precomputed_occ",
 ]
