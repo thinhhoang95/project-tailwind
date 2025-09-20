@@ -4,7 +4,7 @@ This guide shows how to run the MCTS-based flow agent end-to-end: discover hotsp
 
 - For detailed internals, see: docs/flow_agent/mcts.md
 - New end-to-end agent: src/parrhesia/flow_agent/agent.py
-- Real‑data test example: tests/flow_agent/test_mcts_agent.py
+- Benchmark example: tests/flow_agent/mcts_benchmarking/test_mcts_1.py
 
 ## Overview
 
@@ -63,7 +63,7 @@ from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 project_root = Path.cwd()
 occupancy_path = project_root / "output" / "so6_occupancy_matrix_with_times.json"
 indexer_path   = project_root / "output" / "tvtw_indexer.json"
-caps_path      = project_root / "data" / "cirrus" / "wxm_sm_ih_maxpool.geojson"
+caps_path      = project_root / "output" / "wxm_sm_ih_maxpool.geojson"
 
 # Load artifacts
 indexer = TVTWIndexer.load(str(indexer_path))
@@ -162,7 +162,7 @@ What you get:
 ## Run the Quick Smoke Test
 
 ```bash
-conda run -n silverdrizzle pytest tests/flow_agent/test_mcts_agent.py -s -q
+conda run -n silverdrizzle pytest tests/flow_agent/mcts_benchmarking/test_mcts_1.py -s -q
 ```
 
 If artifacts are missing, the test will be skipped.
