@@ -32,7 +32,7 @@ class SearchLogger:
         os.makedirs(base_dir, exist_ok=True)
         stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         path = os.path.join(base_dir, f"{prefix}_{stamp}.jsonl")
-        return SearchLogger.open(path)
+        return SearchLogger.open(path), path
 
     @staticmethod
     def open(path: str) -> "SearchLogger":

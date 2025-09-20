@@ -90,6 +90,7 @@ class MCTS:
         config: Optional[MCTSConfig] = None,
         rng: Optional[np.random.Generator] = None,
         timer: Optional[Callable[[str], ContextManager[Any]]] = None,
+        progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.transition = transition
         self.rate_finder = rate_finder
@@ -101,6 +102,8 @@ class MCTS:
         self._best_commit: Optional[Tuple[CommitRegulation, float]] = None  # (action, deltaJ)
         self._timer_factory = timer
         self._action_counts: Dict[str, int] = {}
+        self._progress_cb = progress_cb
+        self._last_delta_j: Optional[float] = None
 
     def _timed(self, name: str) -> ContextManager[Any]:
         if self._timer_factory is None:
@@ -122,13 +125,49 @@ class MCTS:
         self._commit_calls = 0
         self._best_commit = None
         self._action_counts.clear()
+        self._last_delta_j = None
 
-        t_end = time.perf_counter() + float(self.cfg.max_time_s)
+        t_start = time.perf_counter()
+        t_end = t_start + float(self.cfg.max_time_s)
 
-        for _ in range(sims):
-            if time.perf_counter() > t_end:
+        for i in range(sims):
+            now = time.perf_counter()
+            if now > t_end:
                 break
-            self._simulate(root, depth_limit)
+            last_ret = self._simulate(root, depth_limit)
+            # Progress callback (best-effort, non-fatal)
+            if self._progress_cb is not None:
+                try:
+                    root_key = root.canonical_key()
+                    root_node = self.nodes.get(root_key)
+                    root_children = 0
+                    root_top: List[Tuple] = []
+                    if root_node is not None:
+                        root_children = len(root_node.children)
+                        tmp: List[Tuple] = []
+                        for sig, est in root_node.edges.items():
+                            p = float(root_node.P.get(sig, 0.0))
+                            tmp.append((sig, int(est.N), float(est.Q), p))
+                        tmp.sort(key=lambda x: (-x[1], -x[2]))
+                        root_top = tmp[:5]
+                    payload = {
+                        "sims_done": i + 1,
+                        "sims_total": sims,
+                        "elapsed_s": now - t_start,
+                        "eta_s": max(0.0, t_end - now),
+                        "nodes": len(self.nodes),
+                        "root_visits": (root_node.N if root_node is not None else 0),
+                        "root_children": root_children,
+                        "root_top": root_top,
+                        "commit_evals": self._commit_calls,
+                        "best_delta_j": (self._best_commit[1] if self._best_commit is not None else None),
+                        "last_delta_j": self._last_delta_j,
+                        "last_return": float(last_ret),
+                        "action_counts": dict(self._action_counts),
+                    }
+                    self._progress_cb(payload)
+                except Exception:
+                    pass
 
         if self._best_commit is None:
             raise RuntimeError("MCTS did not evaluate any commit; increase sims or adjust state")
@@ -410,6 +449,7 @@ class MCTS:
                         mode="per_flow" if ctx.mode == "per_flow" else "blanket",
                     )
                 self._commit_calls += 1
+                self._last_delta_j = float(delta_j)
                 self._commit_eval_cache[base_key] = (rates, delta_j, info)
 
         # Sanitize committed rates for serialization and canonicalization

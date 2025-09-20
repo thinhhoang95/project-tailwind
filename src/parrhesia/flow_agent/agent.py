@@ -52,6 +52,7 @@ class MCTSAgent:
         logger: Optional[SearchLogger] = None,
         max_regulations: Optional[int] = None,
         timer: Optional[Callable[[str], ContextManager[Any]]] = None,
+        progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.evaluator = evaluator
         self.flight_list = flight_list
@@ -61,6 +62,7 @@ class MCTSAgent:
         self.logger = logger
         self.max_regulations = None if max_regulations is None else int(max(0, max_regulations))
         self._timer_factory = timer
+        self._progress_cb = progress_cb
 
         self.rate_finder = RateFinder(
             evaluator=evaluator,
@@ -95,7 +97,13 @@ class MCTSAgent:
         state.metadata["hotspot_candidates"] = candidates
 
         transition = CheapTransition()
-        mcts = MCTS(transition=transition, rate_finder=self.rate_finder, config=self.mcts_cfg, timer=self._timer_factory)
+        mcts = MCTS(
+            transition=transition,
+            rate_finder=self.rate_finder,
+            config=self.mcts_cfg,
+            timer=self._timer_factory,
+            progress_cb=self._progress_cb,
+        )
 
         if self.logger is not None:
             self.logger.event("run_start", {"num_candidates": len(candidates), "mcts_cfg": self.mcts_cfg.__dict__})

@@ -283,3 +283,6 @@ print(f"Final plan: {final_state.plan}")
 print(f"Final objective summary: {run_info.summary}")
 print(f"Log file at: {run_info.log_path}")
 ```
+
+# Notes
+- All demands and capacities are rolling-hour values.
