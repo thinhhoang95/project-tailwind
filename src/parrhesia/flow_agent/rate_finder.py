@@ -82,6 +82,8 @@ class RateFinder:
         self._score_context_cache: Dict[Tuple, ScoreContext] = {}
         self._baseline_cache: Dict[Tuple, _BaselineResult] = {}
         self._candidate_cache: "OrderedDict[Tuple, _CandidateResult]" = OrderedDict()
+        self._entrants_cache: "OrderedDict[Tuple, Dict[str, Tuple[Tuple[Any, Any, int], ...]]]" = OrderedDict()
+        self._rate_grid_cache: "OrderedDict[Tuple, Tuple[float, ...]]" = OrderedDict()
         self._timer_factory = timer
 
     def _timed(self, name: str) -> ContextManager[Any]:
@@ -114,6 +116,9 @@ class RateFinder:
         active_windows = list(range(window_start, window_end))
         plan_key = plan_state.canonical_key()
 
+        with self._timed("rate_finder.compute_entrants"):
+            entrants = self._compute_entrants(control_volume_id, active_windows, flow_map)
+
         with self._timed("rate_finder.resolve_rate_grid"):
             rate_grid = self._resolve_rate_grid(
                 control_volume_id=control_volume_id,
@@ -121,6 +126,7 @@ class RateFinder:
                 flow_map=flow_map,
                 mode=mode,
                 active_windows=active_windows,
+                entrants=entrants,
             )
 
         if mode == "per_flow":
@@ -129,8 +135,6 @@ class RateFinder:
         else:
             print(f"[RateFinder] candidate rates (blanket mode): {tuple(rate_grid)}")
 
-        with self._timed("rate_finder.compute_entrants"):
-            entrants = self._compute_entrants(control_volume_id, active_windows, flow_map)
         flow_order = sorted(flow_ids, key=lambda f: (-len(entrants.get(f, [])), f))
 
         context_flow_ids = flow_ids if mode == "per_flow" else ["__blanket__"]
@@ -567,19 +571,35 @@ class RateFinder:
         active_windows: Sequence[int],
         flow_map: Mapping[str, Sequence[str]],
     ) -> Dict[str, list]:
+        key = self._entrants_cache_key(control_volume_id, active_windows)
+        cached = self._entrants_cache_lookup(key)
+        if cached is None:
+            entries_by_flight: Dict[str, list[Tuple[Any, Any, int]]] = {}
+            iter_fn = getattr(self._base_flight_list, "iter_hotspot_crossings", None)
+            if callable(iter_fn):
+                normalized_windows = list(int(b) for b in active_windows)
+                for fid, tv_id, entry_dt, time_idx in iter_fn(
+                    [control_volume_id], active_windows={control_volume_id: normalized_windows}
+                ):
+                    fid_key = str(fid)
+                    bucket = entries_by_flight.setdefault(fid_key, [])
+                    bucket.append((fid, entry_dt, int(time_idx)))
+            cached = {
+                fid_key: tuple(values)
+                for fid_key, values in entries_by_flight.items()
+                if values
+            }
+            self._entrants_cache_store(key, cached)
+
         entrants: Dict[str, list] = {fid: [] for fid in flow_map}
-        reverse: Dict[str, str] = {}
         for flow_id, flights in flow_map.items():
+            records = entrants.setdefault(flow_id, [])
             for fid in flights:
-                reverse[str(fid)] = flow_id
-        iter_fn = getattr(self._base_flight_list, "iter_hotspot_crossings", None)
-        if callable(iter_fn):
-            for fid, tv_id, entry_dt, time_idx in iter_fn(
-                [control_volume_id], active_windows={control_volume_id: active_windows}
-            ):
-                flow = reverse.get(str(fid))
-                if flow is not None:
-                    entrants.setdefault(flow, []).append((fid, entry_dt, int(time_idx)))
+                fid_key = str(fid)
+                entries = cached.get(fid_key) if cached else None
+                if not entries:
+                    continue
+                records.extend(entries)
         return entrants
 
     def _resolve_rate_grid(
@@ -590,10 +610,23 @@ class RateFinder:
         flow_map: Mapping[str, Sequence[str]],
         mode: str,
         active_windows: Sequence[int],
+        entrants: Optional[Mapping[str, Sequence[Tuple[Any, Any, int]]]] = None,
     ) -> Tuple[float, ...]:
         base_grid: Tuple[float, ...] = tuple(self.config.rate_grid) if self.config.rate_grid else tuple()
         if not self.config.use_adaptive_grid:
             return base_grid or (math.inf,)
+
+        cache_key = self._rate_grid_cache_key(
+            control_volume_id=control_volume_id,
+            window_bins=window_bins,
+            flow_map=flow_map,
+            mode=mode,
+            active_windows=active_windows,
+            base_grid=base_grid,
+        )
+        cached = self._rate_grid_cache_lookup(cache_key)
+        if cached is not None:
+            return cached
 
         adaptive = self._build_adaptive_rate_grid(
             control_volume_id=control_volume_id,
@@ -601,6 +634,7 @@ class RateFinder:
             flow_map=flow_map,
             active_windows=active_windows,
             mode=mode,
+            entrants=entrants,
         )
 
         # Merge explicit grid values with adaptive suggestions for reproducibility.
@@ -628,7 +662,9 @@ class RateFinder:
         finite_sorted = sorted(set(finite), reverse=True)
         result = [math.inf]
         result.extend(finite_sorted)
-        return tuple(result)
+        resolved = tuple(result)
+        self._rate_grid_cache_store(cache_key, resolved)
+        return resolved
 
     def _build_adaptive_rate_grid(
         self,
@@ -638,6 +674,7 @@ class RateFinder:
         flow_map: Mapping[str, Sequence[str]],
         active_windows: Sequence[int],
         mode: str,
+        entrants: Optional[Mapping[str, Sequence[Tuple[Any, Any, int]]]] = None,
     ) -> Tuple[float, ...]:
         _timer_cm = self._timed("rate_finder.build_adaptive_rate_grid")
         _timer_exit = _timer_cm.__exit__
@@ -659,14 +696,16 @@ class RateFinder:
             window_hours = max(window_length_bins * bin_minutes / 60.0, 1e-3)
             bins_per_hour = max(1, int(round(60.0 / float(bin_minutes))))
 
-            entrants = self._compute_entrants(control_volume_id, active_bins, flow_map)
+            entrants_map = entrants
+            if entrants_map is None:
+                entrants_map = self._compute_entrants(control_volume_id, active_bins, flow_map)
 
             flow_stats: Dict[str, Dict[str, float]] = {}
             total_counts: Counter[int] = Counter()
             total_entrants = 0
 
             for flow_id, flights in flow_map.items():
-                entries = entrants.get(flow_id, [])
+                entries = entrants_map.get(flow_id, []) if entrants_map else []
                 bin_counter: Counter[int] = Counter()
                 for _, _, time_idx in entries:
                     idx = int(time_idx)
@@ -811,6 +850,82 @@ class RateFinder:
             if current > best:
                 best = current
         return best
+
+    def _entrants_cache_key(
+        self, control_volume_id: str, active_windows: Sequence[int]
+    ) -> Tuple[str, Tuple[int, ...]]:
+        windows_key = tuple(sorted(int(b) for b in active_windows))
+        return (str(control_volume_id), windows_key)
+
+    def _entrants_cache_lookup(
+        self, key: Tuple[str, Tuple[int, ...]]
+    ) -> Optional[Dict[str, Tuple[Tuple[Any, Any, int], ...]]]:
+        cached = self._entrants_cache.get(key)
+        if cached is not None:
+            self._entrants_cache.move_to_end(key)
+        return cached
+
+    def _entrants_cache_store(
+        self,
+        key: Tuple[str, Tuple[int, ...]],
+        value: Dict[str, Tuple[Tuple[Any, Any, int], ...]],
+    ) -> None:
+        self._entrants_cache[key] = value
+        self._entrants_cache.move_to_end(key)
+        self._trim_lru_cache(self._entrants_cache)
+
+    def _rate_grid_cache_key(
+        self,
+        *,
+        control_volume_id: str,
+        window_bins: Tuple[int, int],
+        flow_map: Mapping[str, Sequence[str]],
+        mode: str,
+        active_windows: Sequence[int],
+        base_grid: Tuple[float, ...],
+    ) -> Tuple:
+        windows_key = tuple(sorted(int(b) for b in active_windows))
+        flow_signature = self._flow_map_signature(flow_map)
+        return (
+            str(control_volume_id),
+            tuple(int(b) for b in window_bins),
+            windows_key,
+            flow_signature,
+            str(mode),
+            tuple(float(x) for x in base_grid),
+            int(self.config.max_adaptive_rate),
+            int(self.config.max_adaptive_candidates),
+        )
+
+    def _rate_grid_cache_lookup(self, key: Tuple) -> Optional[Tuple[float, ...]]:
+        cached = self._rate_grid_cache.get(key)
+        if cached is not None:
+            self._rate_grid_cache.move_to_end(key)
+        return cached
+
+    def _rate_grid_cache_store(self, key: Tuple, value: Tuple[float, ...]) -> None:
+        self._rate_grid_cache[key] = value
+        self._rate_grid_cache.move_to_end(key)
+        self._trim_lru_cache(self._rate_grid_cache)
+
+    def _flow_map_signature(
+        self, flow_map: Mapping[str, Sequence[str]]
+    ) -> Tuple[Tuple[str, Tuple[str, ...]], ...]:
+        normalized: list[Tuple[str, Tuple[str, ...]]] = []
+        for flow_id in sorted(flow_map.keys()):
+            flights = flow_map[flow_id]
+            normalized.append(
+                (
+                    str(flow_id),
+                    tuple(sorted(str(f) for f in flights)),
+                )
+            )
+        return tuple(normalized)
+
+    def _trim_lru_cache(self, cache: "OrderedDict[Tuple, Any]") -> None:
+        max_size = max(1, int(self.config.cache_size))
+        while len(cache) > max_size:
+            cache.popitem(last=False)
 
     def _candidate_signature(
         self,
