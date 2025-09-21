@@ -384,6 +384,17 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
 
     # Final summary and quick checks (non-fatal)
     console.print(f"[runner] Commits: {info.commits}")
+    try:
+        reason = getattr(info, "stop_reason", None)
+        if reason:
+            console.print(f"[runner] Stop reason: {reason}")
+            si = getattr(info, "stop_info", None) or {}
+            if isinstance(si, dict) and si:
+                # Keep it concise on one line
+                compact = {k: si[k] for k in list(si.keys())[:6]}
+                console.print(f"[runner] Stop info: {compact}")
+    except Exception:
+        pass
     # Also report total simulations tried across all MCTS runs
     try:
         console.print(f"[runner] Total simulations tried: {int(sim_counter['total'])}")
@@ -398,7 +409,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Print the last 200 lines from the debug log for quick visibility
     try:
         dbg_path = Path(info.debug_log_path) if getattr(info, "debug_log_path", None) else debug_logger_path
-        print_last_debug_lines(dbg_path, 200)
+        # print_last_debug_lines(dbg_path, 200)
     except Exception:
         pass
     # Repeat the Action Counts table again for downstream quality-control parsing

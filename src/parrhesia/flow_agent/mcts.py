@@ -269,6 +269,8 @@ class MCTS:
         self._dbg(f"[MCTS] run start: sims={sims} depth={depth_limit} {self._state_brief(root)}")
 
         simulations_run = 0
+        stop_reason = "max_sims_exhausted"
+        stop_info: Dict[str, Any] = {}
         for i in range(sims):
             now = time.perf_counter()
             if now > t_end:
@@ -280,6 +282,8 @@ class MCTS:
                         "time_budget_s": float(self.cfg.max_time_s),
                     },
                 )
+                stop_reason = "time_budget_exhausted"
+                stop_info = {"index": i + 1, "elapsed_s": now - t_start, "time_budget_s": float(self.cfg.max_time_s)}
                 break
             self._current_sim = i + 1
             self._log_debug_event(
@@ -299,6 +303,8 @@ class MCTS:
                     "sim_action_budget_exhausted_pre",
                     {"index": i + 1, "actions_done": int(self._actions_done), "max_actions": int(self._action_budget)},
                 )
+                stop_reason = "action_budget_exhausted_pre"
+                stop_info = {"index": i + 1, "actions_done": int(self._actions_done), "max_actions": int(self._action_budget)}
                 break
             try:
                 last_ret = self._simulate(root, depth_limit, sim_index=i + 1)
@@ -314,6 +320,13 @@ class MCTS:
                     },
                     sim_index=i + 1,
                 )
+                stop_reason = "action_budget_exhausted_mid"
+                stop_info = {
+                    "index": i + 1,
+                    "elapsed_s": elapsed,
+                    "actions_done": int(self._actions_done),
+                    "max_actions": int(self._action_budget) if self._action_budget is not None else None,
+                }
                 # Best effort progress callback before exiting
                 if self._progress_cb is not None:
                     try:
@@ -403,12 +416,30 @@ class MCTS:
                 except Exception:
                     pass
 
+        # Compute final stop metadata and emit end-of-run record
+        elapsed_total = time.perf_counter() - t_start
+        # If no commit was evaluated at all, mark explicitly (the outer agent will handle the exception)
+        if self._best_commit is None:
+            stop_info = {**stop_info, "underlying": stop_reason} if stop_info else {"underlying": stop_reason}
+            stop_reason = "no_commit_evaluated"
+
         self._log_debug_event(
             "search_run_end",
             {
                 "simulations": simulations_run,
+                "sims_target": sims,
+                "stop_reason": stop_reason,
+                "stop_info": stop_info or None,
+                "elapsed_s": elapsed_total,
                 "best_delta_j": (self._best_commit[1] if self._best_commit is not None else None),
+                "last_delta_j": self._last_delta_j,
                 "nodes": len(self.nodes),
+                "actions_done": int(self._actions_done),
+                "max_actions": int(self._action_budget) if self._action_budget is not None else None,
+                "commit_eval_limit": int(self.cfg.commit_eval_limit),
+                "commit_calls": int(self._commit_calls),
+                "commit_depth": depth_limit,
+                "action_counts": dict(self._action_counts),
             },
         )
 
