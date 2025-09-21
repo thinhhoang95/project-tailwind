@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from .state import PlanState
 from .agent import RunInfo
@@ -64,12 +65,36 @@ def save_plan_to_file(
 
     # Build plan payload
     plan_items: List[Dict[str, Any]] = []
+    seen_specs: Set[Tuple[str, Tuple[int, int], Tuple[str, ...], str, Tuple[Tuple[str, int], ...] | int]] = set()
     for reg in getattr(state, "plan", []) or []:
         try:
             t0 = _safe_int(reg.window_bins[0])
             t1 = _safe_int(reg.window_bins[1])
         except Exception:
             t0, t1 = 0, 1
+
+        raw_flow_ids = getattr(reg, "flow_ids", ()) or ()
+        flow_ids = tuple(str(fid) for fid in raw_flow_ids)
+        mode = str(getattr(reg, "mode", "per_flow"))
+        rates = getattr(reg, "committed_rates", None)
+
+        # Skip regulations with no flows or no effective rates
+        valid = False
+        rates_per_flow_out: Optional[Dict[str, int]] = None
+        blanket_rate_out: Optional[int] = None
+        if isinstance(rates, dict):
+            cleaned = {str(k): _safe_int(v) for k, v in (rates or {}).items() if _safe_int(v) > 0}
+            if cleaned and flow_ids:
+                valid = True
+                rates_per_flow_out = cleaned
+        else:
+            br = _safe_int(rates) if rates is not None else 0
+            if br > 0 and flow_ids:
+                valid = True
+                blanket_rate_out = br
+
+        if not valid:
+            continue
 
         item: Dict[str, Any] = {
             "control_volume_id": str(getattr(reg, "control_volume_id", "")),
@@ -79,21 +104,29 @@ def save_plan_to_file(
                 "start": _bin_label(indexer, t0),
                 "end": _bin_label(indexer, max(0, t1 - 1)),
             },
-            "mode": str(getattr(reg, "mode", "per_flow")),
-            "flow_ids": list(getattr(reg, "flow_ids", ())) or [],
+            "mode": mode,
+            "flow_ids": list(flow_ids),
         }
 
-        rates = getattr(reg, "committed_rates", None)
-        if isinstance(rates, dict):
-            item["rates_per_flow"] = {str(k): _safe_int(v) for k, v in rates.items()}
+        if rates_per_flow_out is not None:
+            item["rates_per_flow"] = rates_per_flow_out
             item["blanket_rate"] = None
-        elif rates is not None:
-            item["rates_per_flow"] = None
-            item["blanket_rate"] = _safe_int(rates)
+            canonical_rates: Tuple[Tuple[str, int], ...] | int = tuple(sorted(rates_per_flow_out.items()))
         else:
-            item["rates_per_flow"] = {}
-            item["blanket_rate"] = None
+            item["rates_per_flow"] = None
+            item["blanket_rate"] = blanket_rate_out
+            canonical_rates = int(blanket_rate_out or 0)
 
+        spec_key = (
+            item["control_volume_id"],
+            (t0, t1),
+            tuple(item["flow_ids"]),
+            item["mode"],
+            canonical_rates,
+        )
+        if spec_key in seen_specs:
+            continue
+        seen_specs.add(spec_key)
         plan_items.append(item)
 
     payload: Dict[str, Any] = {

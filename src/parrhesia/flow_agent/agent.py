@@ -163,7 +163,6 @@ class MCTSAgent:
             # Extract improvement for bookkeeping
             info = (commit_action.diagnostics or {}).get("rate_finder", {})
             delta_j = float(info.get("delta_j", 0.0))
-            total_delta_j += delta_j
 
             # Materialize regulation and append to plan without relying on stage guards
             # Extract details from diagnostics
@@ -188,15 +187,80 @@ class MCTSAgent:
             if ctrl is None:
                 # As a fallback, skip appending if control volume is unknown
                 break
+
+            rates = commit_action.committed_rates
+            valid = False
+            rates_to_store: Optional[object] = None
+            if isinstance(rates, dict):
+                cleaned: Dict[str, int] = {}
+                for k, v in (rates or {}).items():
+                    try:
+                        iv = int(v)
+                    except Exception:
+                        iv = 0
+                    if iv > 0:
+                        cleaned[str(k)] = iv
+                if cleaned and len(flow_ids) > 0:
+                    valid = True
+                    rates_to_store = cleaned
+            else:
+                try:
+                    iv = int(round(float(rates))) if rates is not None else 0
+                except Exception:
+                    iv = 0
+                if iv > 0 and len(flow_ids) > 0:
+                    valid = True
+                    rates_to_store = iv
+
+            if not valid:
+                if self.debug_logger is not None:
+                    try:
+                        self.debug_logger.event(
+                            "outer_skip_empty_regulation",
+                            {
+                                "control_volume_id": ctrl,
+                                "window_bins": [int(wb[0]), int(wb[1])],
+                                "mode": mode,
+                                "flow_ids": list(flow_ids),
+                                "committed_rates": rates,
+                                "reason": "no_effective_rates_or_no_flows",
+                            },
+                        )
+                    except Exception:
+                        pass
+                continue
+
             regulation = RegulationSpec(
                 control_volume_id=ctrl,
                 window_bins=wb,
                 flow_ids=flow_ids,
                 mode="per_flow" if mode == "per_flow" else "blanket",
-                committed_rates=commit_action.committed_rates,
+                committed_rates=rates_to_store,
                 diagnostics=dict(commit_action.diagnostics or {}),
             )
+
+            if any(
+                existing.to_canonical_dict() == regulation.to_canonical_dict()
+                for existing in state.plan
+            ):
+                if self.debug_logger is not None:
+                    try:
+                        self.debug_logger.event(
+                            "outer_skip_duplicate_regulation",
+                            {
+                                "control_volume_id": ctrl,
+                                "window_bins": [int(wb[0]), int(wb[1])],
+                                "mode": mode,
+                                "flow_ids": list(flow_ids),
+                                "committed_rates": rates_to_store,
+                            },
+                        )
+                    except Exception:
+                        pass
+                continue
+
             state.plan.append(regulation)
+            total_delta_j += delta_j
             commits += 1
 
             if self.logger is not None:
