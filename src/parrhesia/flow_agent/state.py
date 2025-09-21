@@ -141,7 +141,13 @@ class PlanState:
     def _z_hat_signature(self) -> Optional[List[float]]:
         if self.z_hat is None:
             return None
-        return [float(x) for x in np.asarray(self.z_hat, dtype=float).tolist()]
+        # Quantize to reduce key churn from tiny numeric differences while
+        # preserving meaningful distinctions between states. This stabilizes
+        # MCTS node reuse (especially at the confirm stage) so visit counts
+        # and Q-values accumulate on the same logical node.
+        arr = np.asarray(self.z_hat, dtype=float)
+        arr_q = np.round(arr, decimals=2)
+        return [float(x) for x in arr_q.tolist()]
 
     def reset_hotspot(self, *, next_stage: Optional[StageLiteral] = None) -> None:
         self.hotspot_context = None

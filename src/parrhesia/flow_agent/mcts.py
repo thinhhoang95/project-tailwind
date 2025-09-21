@@ -42,6 +42,10 @@ class MCTSConfig:
     max_sims: int = 24
     max_time_s: float = 20.0
     commit_eval_limit: int = 3
+    # Global action budget across the search run. When set, the search stops
+    # once this many low-level actions (selection, expansion, step, backup) are performed.
+    # None or 0 disables this budget.
+    max_actions: Optional[int] = None
     # Priors
     priors_temperature: float = 1.0
     # Shaping
@@ -111,6 +115,13 @@ class MCTS:
         self._last_delta_j: Optional[float] = None
         self._debug_logger = debug_logger
         self._current_sim: Optional[int] = None
+        # Global action budget tracking
+        self._actions_done: int = 0
+        self._action_budget: Optional[int] = (None if getattr(self.cfg, "max_actions", None) in (None, 0)
+                                              else int(self.cfg.max_actions))
+
+    class _ActionBudgetExhausted(Exception):
+        pass
 
     def _timed(self, name: str) -> ContextManager[Any]:
         if self._timer_factory is None:
@@ -216,6 +227,18 @@ class MCTS:
         key = type(action).__name__
         self._action_counts[key] = self._action_counts.get(key, 0) + 1
 
+    def _inc_action(self, kind: str, *, sim_index: Optional[int] = None, step_index: Optional[int] = None) -> None:
+        # Increment global low-level action counter and enforce budget if configured
+        self._actions_done += 1
+        if self._action_budget is not None and self._actions_done >= self._action_budget:
+            self._log_debug_event(
+                "action_budget_exhausted",
+                {"kind": kind, "actions_done": int(self._actions_done), "max_actions": int(self._action_budget)},
+                sim_index=sim_index,
+                step_index=step_index,
+            )
+            raise MCTS._ActionBudgetExhausted()
+
     # ------------------------------- Public API ---------------------------
     def run(self, root: PlanState, *, max_sims: Optional[int] = None, commit_depth: Optional[int] = None) -> CommitRegulation:
         sims = int(max_sims if max_sims is not None else self.cfg.max_sims)
@@ -224,6 +247,10 @@ class MCTS:
         self._best_commit = None
         self._action_counts.clear()
         self._last_delta_j = None
+        # Reset global action counter and budget view for this run
+        self._actions_done = 0
+        self._action_budget = (None if getattr(self.cfg, "max_actions", None) in (None, 0)
+                               else int(self.cfg.max_actions))
 
         t_start = time.perf_counter()
         t_end = t_start + float(self.cfg.max_time_s)
@@ -266,7 +293,63 @@ class MCTS:
                 sim_index=i + 1,
             )
             self._dbg(f"[MCTS] simulate[{i+1}/{sims}] start nodes={len(self.nodes)} {self._state_brief(root)}")
-            last_ret = self._simulate(root, depth_limit, sim_index=i + 1)
+            # If action budget is already exhausted, stop before starting the next simulation
+            if self._action_budget is not None and self._actions_done >= self._action_budget:
+                self._log_debug_event(
+                    "sim_action_budget_exhausted_pre",
+                    {"index": i + 1, "actions_done": int(self._actions_done), "max_actions": int(self._action_budget)},
+                )
+                break
+            try:
+                last_ret = self._simulate(root, depth_limit, sim_index=i + 1)
+            except MCTS._ActionBudgetExhausted:
+                elapsed = time.perf_counter() - t_start
+                self._log_debug_event(
+                    "sim_action_budget_exhausted",
+                    {
+                        "index": i + 1,
+                        "elapsed_s": elapsed,
+                        "actions_done": int(self._actions_done),
+                        "max_actions": int(self._action_budget) if self._action_budget is not None else None,
+                    },
+                    sim_index=i + 1,
+                )
+                # Best effort progress callback before exiting
+                if self._progress_cb is not None:
+                    try:
+                        root_key = root.canonical_key()
+                        root_node = self.nodes.get(root_key)
+                        root_children = 0
+                        root_top: List[Tuple] = []
+                        if root_node is not None:
+                            root_children = len(root_node.children)
+                            tmp: List[Tuple] = []
+                            for sig, est in root_node.edges.items():
+                                p = float(root_node.P.get(sig, 0.0))
+                                tmp.append((sig, int(est.N), float(est.Q), p))
+                            tmp.sort(key=lambda x: (-x[1], -x[2]))
+                            root_top = tmp[:5]
+                        payload = {
+                            "sims_done": i,
+                            "sims_total": sims,
+                            "elapsed_s": now - t_start,
+                            "eta_s": max(0.0, t_end - now),
+                            "nodes": len(self.nodes),
+                            "root_visits": (root_node.N if root_node is not None else 0),
+                            "root_children": root_children,
+                            "root_top": root_top,
+                            "commit_evals": self._commit_calls,
+                            "best_delta_j": (self._best_commit[1] if self._best_commit is not None else None),
+                            "last_delta_j": self._last_delta_j,
+                            "last_return": None,
+                            "action_counts": dict(self._action_counts),
+                            "actions_done": int(self._actions_done),
+                            "max_actions": int(self._action_budget) if self._action_budget is not None else None,
+                        }
+                        self._progress_cb(payload)
+                    except Exception:
+                        pass
+                break
             elapsed = time.perf_counter() - t_start
             self._dbg(
                 f"[MCTS] simulate[{i+1}/{sims}] end   return={float(last_ret):.3f} best_dJ={(self._best_commit[1] if self._best_commit is not None else None)} nodes={len(self.nodes)}"
@@ -313,6 +396,8 @@ class MCTS:
                         "last_delta_j": self._last_delta_j,
                         "last_return": float(last_ret),
                         "action_counts": dict(self._action_counts),
+                        "actions_done": int(self._actions_done),
+                        "max_actions": int(self._action_budget) if self._action_budget is not None else None,
                     }
                     self._progress_cb(payload)
                 except Exception:
@@ -467,6 +552,8 @@ class MCTS:
                         continue
                     node.children[sig] = "?"
                     node.edges[sig] = node.edges.get(sig, EdgeStats())
+                    # Count expansion of a new child as one action
+                    self._inc_action("expand", sim_index=sim_index, step_index=step_index)
                     self._dbg(
                         f"[MCTS/expand]   + child {self._sig_to_label(sig)} P={float(priors.get(sig, 0.0)):.3f} children_now={len(node.children)}"
                     )
@@ -481,6 +568,7 @@ class MCTS:
                 children_snapshot.append(
                     {
                         "sig": self._sig_to_json(sig),
+                        "action": self._sig_to_label(sig),
                         "label": self._sig_to_label(sig),
                         "child_hash": child_hash,
                         "P": float(node.P.get(sig, 0.0)),
@@ -570,6 +658,7 @@ class MCTS:
                         "P": P,
                         "N_edge": int(est.N),
                         "explore": float(explore),
+                        "U": float(explore),
                         "score": float(score),
                     }
                 )
@@ -579,6 +668,12 @@ class MCTS:
             assert best_sig is not None
             est_sel = node.edges.get(best_sig, EdgeStats())
             created_flag = key in created_nodes
+
+            # Chosen edge score components and tie-break info
+            P_best = float(node.P.get(best_sig, 0.0))
+            U_best = float(self.cfg.c_puct) * P_best * (sqrtN / (1.0 + est_sel.N))
+            tie_candidates = [rec for rec in selection_records if abs(float(rec.get("score", 0.0)) - float(best_score)) <= 1e-12]
+            tie_break_applied = len(tie_candidates) > 1
 
             if state.stage == "confirm":
                 commit_sig = self._signature_for_action(state, CommitRegulation())
@@ -614,7 +709,14 @@ class MCTS:
                 "chosen": {
                     "sig": self._sig_to_json(best_sig),
                     "label": self._sig_to_label(best_sig),
+                    "Q": float(est_sel.Q),
+                    "U": float(U_best),
                     "score": float(best_score),
+                    "tie_break": {
+                        "applied": bool(tie_break_applied),
+                        "strategy": ("lexicographic" if tie_break_applied else "none"),
+                        "tied_count": int(len(tie_candidates)),
+                    },
                 },
                 "viable_count": len(viable),
                 "path_len": len(path),
@@ -625,6 +727,8 @@ class MCTS:
                 f"[MCTS/select] pick {self._sig_to_label(best_sig)} U={float(best_score):.3f} Q={float(est_sel.Q):.3f} P={float(node.P.get(best_sig, 0.0)):.3f} N_edge={int(est_sel.N)} node_N={int(node.N)} children={len(node.children)} {self._state_brief(state)}"
             )
 
+            # Count selection of the best action
+            self._inc_action("select", sim_index=sim_index, step_index=step_index)
             action = self._action_from_signature(state, best_sig)
 
             r_base = 0.0
@@ -692,6 +796,8 @@ class MCTS:
 
             self._record_action(action)
 
+            # Count environment/state transition as one action
+            self._inc_action("step", sim_index=sim_index, step_index=step_index)
             next_state, is_commit, is_terminal = self.transition.step(state, action)
             child_key = next_state.canonical_key()
             node.children[best_sig] = child_key
@@ -1102,6 +1208,7 @@ class MCTS:
                     "depth": depth,
                     "node_hash": self._short_hash(node_key),
                     "action": self._sig_to_label(sig),
+                    "action_sig": self._sig_to_json(sig),
                     "sig": self._sig_to_json(sig),
                 }
             )
@@ -1127,6 +1234,8 @@ class MCTS:
         step_index: Optional[int] = None,
         reason: str = "",
     ) -> None:
+        # Count a single backpropagation pass as one action regardless of path length
+        self._inc_action("backup", sim_index=sim_index, step_index=step_index)
         v = float(value)
         updates: List[Dict[str, Any]] = []
         for depth, (node_key, sig) in enumerate(path):
@@ -1148,6 +1257,7 @@ class MCTS:
                     "depth": depth,
                     "node_hash": self._short_hash(node_key),
                     "action": self._sig_to_label(sig),
+                    "action_sig": self._sig_to_json(sig),
                     "sig": self._sig_to_json(sig),
                     "node_N": int(node.N),
                     "node_Q": float(node.Q),

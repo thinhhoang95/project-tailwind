@@ -18,7 +18,7 @@ from rich.console import Group
 
 # Time Profiling helpers ===
 from contextlib import contextmanager
-from collections import defaultdict
+from collections import defaultdict, deque
 import time, atexit
 
 _stats = defaultdict(lambda: [0, 0.0])  # name -> [calls, total_seconds]
@@ -103,6 +103,24 @@ def _build_params_table(
     return tbl
 
 
+def print_last_debug_lines(log_path: Path | str, num_lines: int = 200) -> None:
+    """Print the last N lines of the given debug log file."""
+    try:
+        p = Path(log_path)
+        if not p.exists():
+            console.print(f"[yellow]Debug log not found:[/yellow] {p}")
+            return
+        with p.open("r", encoding="utf-8", errors="replace") as fh:
+            tail_lines = deque(fh, maxlen=int(num_lines))
+        console.print(f"[bold]Last {int(num_lines)} debug log lines[/bold] — {p}")
+        if tail_lines:
+            console.print("".join(tail_lines))
+        else:
+            console.print("[dim](debug log is empty)[/dim]")
+    except Exception as exc:
+        console.print(f"[red]Failed to read debug log:[/red] {exc}")
+
+
 def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Locate required artifacts
     project_root = Path(__file__).resolve().parents[2]
@@ -183,7 +201,14 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
 
     # Configure agent budgets small to keep runtime reasonable
     # Limit to a single regulation to shorten runtime and match the request
-    mcts_cfg = MCTSConfig(max_sims=128, commit_depth=16, commit_eval_limit=16, seed=69420, debug_prints=True)
+    mcts_cfg = MCTSConfig(
+        max_sims=128,
+        commit_depth=16,
+        commit_eval_limit=16,
+        max_actions=512,
+        seed=69420,
+        debug_prints=False,
+    )
     rf_cfg = RateFinderConfig(use_adaptive_grid=True, max_eval_calls=4)
     disc_cfg = HotspotDiscoveryConfig(
         threshold=0.0,
@@ -201,7 +226,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         TextColumn("{task.completed}/{task.total} sims"),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
-        TextColumn(" • nodes {task.fields[nodes]} • best ΔJ {task.fields[best]} • last ΔJ {task.fields[last]} • evals {task.fields[evals]}")
+        TextColumn(" • nodes {task.fields[nodes]} • best ΔJ {task.fields[best]} • last ΔJ {task.fields[last]} • evals {task.fields[evals]} • acts {task.fields[actions]}/{task.fields[action_budget]}")
     )
 
     task_id = prog.add_task(
@@ -211,6 +236,8 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         best="—",
         last="—",
         evals=0,
+        actions=0,
+        action_budget=(mcts_cfg.max_actions if getattr(mcts_cfg, "max_actions", None) not in (None, 0) else "∞"),
     )
 
     last_payload: Dict[str, Any] = {}
@@ -285,6 +312,9 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         best = payload.get("best_delta_j")
         last = payload.get("last_delta_j")
         evals = int(payload.get("commit_evals", 0))
+        actions_done = int(payload.get("actions_done", 0)) if isinstance(payload.get("actions_done", 0), (int, float)) else 0
+        action_budget = payload.get("max_actions")
+        action_budget_s = int(action_budget) if isinstance(action_budget, (int, float)) and action_budget not in (0, None) else (mcts_cfg.max_actions if getattr(mcts_cfg, "max_actions", None) not in (None, 0) else "∞")
         best_s = f"{best:.3f}" if isinstance(best, (int, float)) else "—"
         last_s = f"{last:.3f}" if isinstance(last, (int, float)) else "—"
         # Accumulate simulations across runs. If sims_done resets (new run),
@@ -309,6 +339,8 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             best=best_s,
             last=last_s,
             evals=evals,
+            actions=actions_done,
+            action_budget=action_budget_s,
         )
         last_payload.clear(); last_payload.update(payload)
         live = live_holder.get("live")
@@ -363,6 +395,17 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         console.print(f"[runner] Log path: {info.log_path}")
     if info.debug_log_path:
         console.print(f"[runner] Debug log path: {info.debug_log_path}")
+    # Print the last 200 lines from the debug log for quick visibility
+    try:
+        dbg_path = Path(info.debug_log_path) if getattr(info, "debug_log_path", None) else debug_logger_path
+        print_last_debug_lines(dbg_path, 200)
+    except Exception:
+        pass
+    # Repeat the Action Counts table again for downstream quality-control parsing
+    try:
+        console.print(_build_actions_table(last_payload))
+    except Exception:
+        pass
     return state, info
 
 if __name__ == '__main__':
