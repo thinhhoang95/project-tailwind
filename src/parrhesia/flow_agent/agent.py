@@ -28,8 +28,11 @@ class RunInfo:
     commits: int
     total_delta_j: float
     log_path: Optional[str]
+    debug_log_path: Optional[str]
     summary: Dict[str, Any]
     action_counts: Dict[str, int]
+    stop_reason: Optional[str] = None
+    stop_info: Dict[str, Any] = None  # type: ignore[assignment]
 
 
 class MCTSAgent:
@@ -50,8 +53,10 @@ class MCTSAgent:
         rate_finder_cfg: Optional[RateFinderConfig] = None,
         discovery_cfg: Optional[HotspotDiscoveryConfig] = None,
         logger: Optional[SearchLogger] = None,
+        debug_logger: Optional[SearchLogger] = None,
         max_regulations: Optional[int] = None,
         timer: Optional[Callable[[str], ContextManager[Any]]] = None,
+        progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.evaluator = evaluator
         self.flight_list = flight_list
@@ -59,8 +64,10 @@ class MCTSAgent:
         self.mcts_cfg = mcts_cfg or MCTSConfig()
         self.discovery_cfg = discovery_cfg or HotspotDiscoveryConfig()
         self.logger = logger
+        self.debug_logger = debug_logger
         self.max_regulations = None if max_regulations is None else int(max(0, max_regulations))
         self._timer_factory = timer
+        self._progress_cb = progress_cb
 
         self.rate_finder = RateFinder(
             evaluator=evaluator,
@@ -95,10 +102,33 @@ class MCTSAgent:
         state.metadata["hotspot_candidates"] = candidates
 
         transition = CheapTransition()
-        mcts = MCTS(transition=transition, rate_finder=self.rate_finder, config=self.mcts_cfg, timer=self._timer_factory)
+        mcts = MCTS(
+            transition=transition,
+            rate_finder=self.rate_finder,
+            config=self.mcts_cfg,
+            timer=self._timer_factory,
+            progress_cb=self._progress_cb,
+            debug_logger=self.debug_logger,
+        )
 
         if self.logger is not None:
             self.logger.event("run_start", {"num_candidates": len(candidates), "mcts_cfg": self.mcts_cfg.__dict__})
+        if self.debug_logger is not None:
+            try:
+                self.debug_logger.event(
+                    "outer_run_start",
+                    {
+                        "num_candidates": len(candidates),
+                        "commit_depth": int(self.mcts_cfg.commit_depth),
+                        "max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
+                        "max_sims": int(self.mcts_cfg.max_sims),
+                        "max_time_s": float(self.mcts_cfg.max_time_s),
+                        "commit_eval_limit": int(self.mcts_cfg.commit_eval_limit),
+                        "max_actions": (int(self.mcts_cfg.max_actions) if getattr(self.mcts_cfg, "max_actions", None) not in (None, 0) else None),
+                    },
+                )
+            except Exception:
+                pass
 
         commits = 0
         total_delta_j = 0.0
@@ -107,6 +137,8 @@ class MCTSAgent:
         if self.max_regulations is not None:
             limit = min(limit, int(self.max_regulations))
         aggregated_counts: Dict[str, int] = {}
+        outer_stop_reason: Optional[str] = None
+        outer_stop_info: Dict[str, Any] = {}
         for _ in range(max(1, limit)):
             # Ensure we are in idle to start a new regulation
             state.stage = "idle"
@@ -116,6 +148,13 @@ class MCTSAgent:
             except Exception as exc:
                 if self.logger is not None:
                     self.logger.event("mcts_error", {"error": str(exc)})
+                if self.debug_logger is not None:
+                    try:
+                        self.debug_logger.event("mcts_error", {"error": str(exc), "exc_type": type(exc).__name__})
+                    except Exception:
+                        pass
+                outer_stop_reason = "mcts_error"
+                outer_stop_info = {"error": str(exc), "exc_type": type(exc).__name__}
                 break
 
             for k, v in mcts.action_counts.items():
@@ -162,13 +201,40 @@ class MCTSAgent:
 
             if self.logger is not None:
                 self.logger.event("after_commit", {"reg": state.plan[-1].to_canonical_dict(), "delta_j": delta_j, "commits": commits})
+            if self.debug_logger is not None:
+                try:
+                    self.debug_logger.event(
+                        "outer_after_commit",
+                        {
+                            "delta_j": float(delta_j),
+                            "commits": int(commits),
+                            "reg": state.plan[-1].to_canonical_dict(),
+                        },
+                    )
+                except Exception:
+                    pass
 
             # Optional early stop if no improvement
             if delta_j >= 0.0:
+                if self.debug_logger is not None:
+                    try:
+                        self.debug_logger.event(
+                            "outer_stop_no_improvement",
+                            {"delta_j": float(delta_j), "commits": int(commits), "limit": int(limit)},
+                        )
+                    except Exception:
+                        pass
+                outer_stop_reason = "no_improvement"
+                outer_stop_info = {"delta_j": float(delta_j), "commits": int(commits), "limit": int(limit)}
                 break
 
         if self.max_regulations is not None and commits >= self.max_regulations and self.logger is not None:
             self.logger.event("regulation_limit_reached", {"limit": int(self.max_regulations)})
+        if self.max_regulations is not None and commits >= self.max_regulations and self.debug_logger is not None:
+            try:
+                self.debug_logger.event("outer_stop_regulation_limit", {"limit": int(self.max_regulations), "commits": int(commits)})
+            except Exception:
+                pass
 
         # Final global objective across all committed regulations
         with self._timed("agent.final_objective"):
@@ -178,12 +244,43 @@ class MCTSAgent:
         if self.logger is not None:
             self.logger.event("run_end", {"commits": commits, **final_summary})
 
+        # Emit a consolidated outer-run termination record to the debug log
+        if self.debug_logger is not None:
+            try:
+                reason = outer_stop_reason
+                if reason is None:
+                    # If no explicit break, determine from limits
+                    if self.max_regulations is not None and commits >= self.max_regulations:
+                        reason = "regulation_limit_reached"
+                    elif commits >= limit:
+                        reason = "loop_limit_reached"
+                    else:
+                        reason = "completed"
+                payload = {
+                    "stop_reason": reason,
+                    "stop_info": (outer_stop_info or None),
+                    "commits": int(commits),
+                    "limit": int(limit),
+                    "commit_depth": int(self.mcts_cfg.commit_depth),
+                    "max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
+                    "total_delta_j": float(total_delta_j),
+                    "objective": float(final_summary.get("objective", 0.0)),
+                    "num_flows": int(final_summary.get("num_flows", 0)),
+                    "action_counts": aggregated_counts,
+                }
+                self.debug_logger.event("outer_run_end", payload)
+            except Exception:
+                pass
+
         info = RunInfo(
             commits=commits,
             total_delta_j=float(total_delta_j),
             log_path=(self.logger.path if self.logger else None),
+            debug_log_path=(self.debug_logger.path if self.debug_logger else None),
             summary=final_summary,
             action_counts=aggregated_counts,
+            stop_reason=reason,
+            stop_info=(outer_stop_info or {}),
         )
         return state, info
 

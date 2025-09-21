@@ -209,3 +209,6 @@ __marimo__/
 # output
 output/*
 !output/data_pack.zip
+
+# agent runs
+agent_runs/
