@@ -424,6 +424,7 @@ class MCTS:
         total_return = 0.0
         step_index = 0
         created_nodes: Set[str] = set()
+        visited_keys: Dict[str, int] = {root.canonical_key(): 0}
 
         while True:
             step_index += 1
@@ -850,6 +851,54 @@ class MCTS:
             state = next_state
             if is_commit:
                 commits_used += 1
+
+            prev_visit_depth = visited_keys.get(child_key)
+            if prev_visit_depth is not None:
+                loop_hash = self._short_hash(child_key)
+                self._dbg(
+                    "[MCTS/simulate] cycle_detected node=%s depth=%s path_len=%s return=%.3f"
+                    % (child_key[:24], int(prev_visit_depth), len(path), float(total_return))
+                )
+                self._log_debug_event(
+                    "cycle_detected",
+                    {
+                        "node_hash": loop_hash,
+                        "first_visit_depth": int(prev_visit_depth),
+                        "path_len": len(path),
+                        "value": float(total_return),
+                        "commits_used": commits_used,
+                    },
+                    sim_index=sim_index,
+                    step_index=step_index,
+                )
+                self._log_backup_path(
+                    path,
+                    total_return,
+                    sim_index=sim_index,
+                    step_index=step_index,
+                    reason="cycle",
+                )
+                self._backup(
+                    path,
+                    total_return,
+                    sim_index=sim_index,
+                    step_index=step_index,
+                    reason="cycle",
+                )
+                self._log_debug_event(
+                    "simulate_return",
+                    {
+                        "reason": "cycle",
+                        "value": float(total_return),
+                        "path_len": len(path),
+                        "node_hash": loop_hash,
+                    },
+                    sim_index=sim_index,
+                    step_index=step_index,
+                )
+                return total_return
+
+            visited_keys[child_key] = len(path)
 
             if is_terminal or commits_used >= commit_depth:
                 leaf_key = state.canonical_key()
