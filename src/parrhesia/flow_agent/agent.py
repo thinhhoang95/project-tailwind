@@ -83,6 +83,57 @@ class MCTSAgent:
             return nullcontext()
         return self._timer_factory(name)
 
+    def _ban_regulation_spec(
+        self,
+        state: PlanState,
+        *,
+        control_volume_id: Optional[str],
+        window_bins: Tuple[int, int],
+        flow_ids: Sequence[str],
+        mode: str,
+    ) -> None:
+        if not control_volume_id or not flow_ids:
+            return
+        entry = {
+            "control_volume_id": str(control_volume_id),
+            "window_bins": [int(window_bins[0]), int(window_bins[1])],
+            "flow_ids": [str(fid) for fid in sorted(flow_ids)],
+            "mode": "per_flow" if mode == "per_flow" else "blanket",
+        }
+        banned_key = "banned_regulations"
+        banned = list(state.metadata.get(banned_key) or [])
+        if entry not in banned:
+            banned.append(entry)
+            state.metadata[banned_key] = banned
+
+    def _remove_hotspot_candidate(
+        self,
+        state: PlanState,
+        *,
+        control_volume_id: Optional[str],
+        window_bins: Tuple[int, int],
+    ) -> None:
+        if not control_volume_id:
+            return
+        cands = list(state.metadata.get("hotspot_candidates") or [])
+        target = (str(control_volume_id), int(window_bins[0]), int(window_bins[1]))
+        filtered: List[Dict[str, Any]] = []
+        removed = False
+        for item in cands:
+            try:
+                tv = str(item.get("control_volume_id"))
+                wb = item.get("window_bins") or []
+                t0, t1 = int(wb[0]), int(wb[1])
+            except Exception:
+                filtered.append(item)
+                continue
+            if (tv, t0, t1) == target:
+                removed = True
+                continue
+            filtered.append(item)
+        if removed:
+            state.metadata["hotspot_candidates"] = filtered
+
     # ------------------------------------------------------------------
     def run(self) -> Tuple[PlanState, RunInfo]:
         # Build hotspot inventory and seed plan state
@@ -146,15 +197,32 @@ class MCTSAgent:
                 with self._timed("agent.mcts.run"):
                     commit_action = mcts.run(state)
             except Exception as exc:
+                message = str(exc)
+                for k, v in mcts.action_counts.items():
+                    aggregated_counts[k] = aggregated_counts.get(k, 0) + int(v)
+                if isinstance(exc, RuntimeError) and "MCTS did not evaluate any commit" in message:
+                    if self.logger is not None:
+                        self.logger.event("mcts_no_commit", {"error": message})
+                    if self.debug_logger is not None:
+                        try:
+                            self.debug_logger.event(
+                                "mcts_no_commit",
+                                {"error": message, "exc_type": type(exc).__name__},
+                            )
+                        except Exception:
+                            pass
+                    outer_stop_reason = "no_commit_available"
+                    outer_stop_info = {"status": "no_commit_evaluated", "exc_type": type(exc).__name__}
+                    break
                 if self.logger is not None:
-                    self.logger.event("mcts_error", {"error": str(exc)})
+                    self.logger.event("mcts_error", {"error": message})
                 if self.debug_logger is not None:
                     try:
-                        self.debug_logger.event("mcts_error", {"error": str(exc), "exc_type": type(exc).__name__})
+                        self.debug_logger.event("mcts_error", {"error": message, "exc_type": type(exc).__name__})
                     except Exception:
                         pass
                 outer_stop_reason = "mcts_error"
-                outer_stop_info = {"error": str(exc), "exc_type": type(exc).__name__}
+                outer_stop_info = {"error": message, "exc_type": type(exc).__name__}
                 break
 
             for k, v in mcts.action_counts.items():
@@ -163,7 +231,6 @@ class MCTSAgent:
             # Extract improvement for bookkeeping
             info = (commit_action.diagnostics or {}).get("rate_finder", {})
             delta_j = float(info.get("delta_j", 0.0))
-            total_delta_j += delta_j
 
             # Materialize regulation and append to plan without relying on stage guards
             # Extract details from diagnostics
@@ -188,15 +255,111 @@ class MCTSAgent:
             if ctrl is None:
                 # As a fallback, skip appending if control volume is unknown
                 break
+
+            rates = commit_action.committed_rates
+            valid = False
+            rates_to_store: Optional[object] = None
+            if isinstance(rates, dict):
+                cleaned: Dict[str, int] = {}
+                for k, v in (rates or {}).items():
+                    try:
+                        iv = int(v)
+                    except Exception:
+                        iv = 0
+                    if iv > 0:
+                        cleaned[str(k)] = iv
+                if cleaned and len(flow_ids) > 0:
+                    valid = True
+                    rates_to_store = cleaned
+            else:
+                try:
+                    iv = int(round(float(rates))) if rates is not None else 0
+                except Exception:
+                    iv = 0
+                if iv > 0 and len(flow_ids) > 0:
+                    valid = True
+                    rates_to_store = iv
+
+            if not valid:
+                self._ban_regulation_spec(
+                    state,
+                    control_volume_id=ctrl,
+                    window_bins=wb,
+                    flow_ids=flow_ids,
+                    mode=mode,
+                )
+                if self.debug_logger is not None:
+                    try:
+                        self.debug_logger.event(
+                            "outer_skip_empty_regulation",
+                            {
+                                "control_volume_id": ctrl,
+                                "window_bins": [int(wb[0]), int(wb[1])],
+                                "mode": mode,
+                                "flow_ids": list(flow_ids),
+                                "committed_rates": rates,
+                                "reason": "no_effective_rates_or_no_flows",
+                            },
+                        )
+                    except Exception:
+                        pass
+                continue
+
             regulation = RegulationSpec(
                 control_volume_id=ctrl,
                 window_bins=wb,
                 flow_ids=flow_ids,
                 mode="per_flow" if mode == "per_flow" else "blanket",
-                committed_rates=commit_action.committed_rates,
+                committed_rates=rates_to_store,
                 diagnostics=dict(commit_action.diagnostics or {}),
             )
+
+            if any(
+                existing.to_canonical_dict() == regulation.to_canonical_dict()
+                for existing in state.plan
+            ):
+                self._ban_regulation_spec(
+                    state,
+                    control_volume_id=ctrl,
+                    window_bins=wb,
+                    flow_ids=flow_ids,
+                    mode=mode,
+                )
+                self._remove_hotspot_candidate(
+                    state,
+                    control_volume_id=ctrl,
+                    window_bins=wb,
+                )
+                if self.debug_logger is not None:
+                    try:
+                        self.debug_logger.event(
+                            "outer_skip_duplicate_regulation",
+                            {
+                                "control_volume_id": ctrl,
+                                "window_bins": [int(wb[0]), int(wb[1])],
+                                "mode": mode,
+                                "flow_ids": list(flow_ids),
+                                "committed_rates": rates_to_store,
+                            },
+                        )
+                    except Exception:
+                        pass
+                continue
+
             state.plan.append(regulation)
+            self._ban_regulation_spec(
+                state,
+                control_volume_id=ctrl,
+                window_bins=wb,
+                flow_ids=flow_ids,
+                mode=mode,
+            )
+            self._remove_hotspot_candidate(
+                state,
+                control_volume_id=ctrl,
+                window_bins=wb,
+            )
+            total_delta_j += delta_j
             commits += 1
 
             if self.logger is not None:

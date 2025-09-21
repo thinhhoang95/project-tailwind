@@ -260,6 +260,36 @@ class RateFinder:
                 tol = self.config.epsilon * max(1.0, abs(baseline_obj))
                 if pass_improvements[-1] <= tol or stopped_early:
                     break
+            tie_tol = max(1e-6, abs(best_delta) * 1e-6)
+            for flow_id in context_flow_ids:
+                current = float(best_rates.get(flow_id, math.inf))
+                if math.isfinite(current) and current > 0:
+                    continue
+                history = (history_out.get(flow_id) or {})
+                candidate_rate = None
+                candidate_delta = None
+                for rate_key, delta_val in history.items():
+                    try:
+                        rate_candidate = float(rate_key)
+                        delta_candidate = float(delta_val)
+                    except Exception:
+                        continue
+                    if not math.isfinite(rate_candidate) or rate_candidate <= 0:
+                        continue
+                    if delta_candidate > best_delta + tie_tol:
+                        continue
+                    if (
+                        candidate_delta is None
+                        or delta_candidate < candidate_delta - tie_tol
+                        or (
+                            abs(delta_candidate - candidate_delta) <= tie_tol
+                            and (candidate_rate is None or rate_candidate < candidate_rate)
+                        )
+                    ):
+                        candidate_delta = delta_candidate
+                        candidate_rate = rate_candidate
+                if candidate_rate is not None:
+                    best_rates[flow_id] = float(candidate_rate)
             rates_out: Union[int, Dict[str, float]] = {fid: float(best_rates[fid]) for fid in context_flow_ids}
             final_rates_map = {fid: float(best_rates[fid]) for fid in context_flow_ids}
         else:
@@ -313,6 +343,33 @@ class RateFinder:
                 tol = self.config.epsilon * max(1.0, abs(baseline_obj))
                 if pass_improvements[-1] <= tol or stopped_early:
                     break
+            tie_tol = max(1e-6, abs(best_delta) * 1e-6)
+            if not (math.isfinite(best_rate) and best_rate > 0):
+                candidate_rate = None
+                candidate_delta = None
+                history = history_out.get("__blanket__") or {}
+                for rate_key, delta_val in history.items():
+                    try:
+                        rate_candidate = float(rate_key)
+                        delta_candidate = float(delta_val)
+                    except Exception:
+                        continue
+                    if not math.isfinite(rate_candidate) or rate_candidate <= 0:
+                        continue
+                    if delta_candidate > best_delta + tie_tol:
+                        continue
+                    if (
+                        candidate_delta is None
+                        or delta_candidate < candidate_delta - tie_tol
+                        or (
+                            abs(delta_candidate - candidate_delta) <= tie_tol
+                            and (candidate_rate is None or rate_candidate < candidate_rate)
+                        )
+                    ):
+                        candidate_delta = delta_candidate
+                        candidate_rate = rate_candidate
+                if candidate_rate is not None:
+                    best_rate = float(candidate_rate)
             rates_out = float(best_rate)
             final_rates_map = {context_flow_ids[0]: float(best_rate)}
 
