@@ -177,11 +177,13 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Logger to tmp path
     log_dir = tmp_path / "runs"
     logger, loggerpath = SearchLogger.to_timestamped(str(log_dir))
+    debug_logger, debug_logger_path = SearchLogger.to_timestamped(str(log_dir), prefix="debug")
     console.print(f"[runner] Log path: {loggerpath}")
+    console.print(f"[runner] Debug log path: {debug_logger_path}")
 
     # Configure agent budgets small to keep runtime reasonable
     # Limit to a single regulation to shorten runtime and match the request
-    mcts_cfg = MCTSConfig(max_sims=128, commit_depth=16, commit_eval_limit=-1, seed=69420, debug_prints=True) # commit_eval_limit is legacy, we can set it to anything
+    mcts_cfg = MCTSConfig(max_sims=128, commit_depth=16, commit_eval_limit=16, seed=69420, debug_prints=True)
     rf_cfg = RateFinderConfig(use_adaptive_grid=True, max_eval_calls=4)
     disc_cfg = HotspotDiscoveryConfig(
         threshold=0.0,
@@ -321,6 +323,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         rate_finder_cfg=rf_cfg,
         discovery_cfg=disc_cfg,
         logger=logger,
+        debug_logger=debug_logger,
         max_regulations=24,
         timer=timed,
         progress_cb=_on_progress,
@@ -345,6 +348,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             state, info = agent.run()
         live_holder["live"] = None
     logger.close()
+    debug_logger.close()
 
     # Final summary and quick checks (non-fatal)
     console.print(f"[runner] Commits: {info.commits}")
@@ -357,6 +361,8 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         console.print(f"[runner] Final objective: {info.summary.get('objective')}")
     if info.log_path:
         console.print(f"[runner] Log path: {info.log_path}")
+    if info.debug_log_path:
+        console.print(f"[runner] Debug log path: {info.debug_log_path}")
     return state, info
 
 if __name__ == '__main__':

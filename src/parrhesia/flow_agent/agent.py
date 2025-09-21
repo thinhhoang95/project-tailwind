@@ -28,6 +28,7 @@ class RunInfo:
     commits: int
     total_delta_j: float
     log_path: Optional[str]
+    debug_log_path: Optional[str]
     summary: Dict[str, Any]
     action_counts: Dict[str, int]
 
@@ -50,6 +51,7 @@ class MCTSAgent:
         rate_finder_cfg: Optional[RateFinderConfig] = None,
         discovery_cfg: Optional[HotspotDiscoveryConfig] = None,
         logger: Optional[SearchLogger] = None,
+        debug_logger: Optional[SearchLogger] = None,
         max_regulations: Optional[int] = None,
         timer: Optional[Callable[[str], ContextManager[Any]]] = None,
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -60,6 +62,7 @@ class MCTSAgent:
         self.mcts_cfg = mcts_cfg or MCTSConfig()
         self.discovery_cfg = discovery_cfg or HotspotDiscoveryConfig()
         self.logger = logger
+        self.debug_logger = debug_logger
         self.max_regulations = None if max_regulations is None else int(max(0, max_regulations))
         self._timer_factory = timer
         self._progress_cb = progress_cb
@@ -103,6 +106,7 @@ class MCTSAgent:
             config=self.mcts_cfg,
             timer=self._timer_factory,
             progress_cb=self._progress_cb,
+            debug_logger=self.debug_logger,
         )
 
         if self.logger is not None:
@@ -190,6 +194,7 @@ class MCTSAgent:
             commits=commits,
             total_delta_j=float(total_delta_j),
             log_path=(self.logger.path if self.logger else None),
+            debug_log_path=(self.debug_logger.path if self.debug_logger else None),
             summary=final_summary,
             action_counts=aggregated_counts,
         )
