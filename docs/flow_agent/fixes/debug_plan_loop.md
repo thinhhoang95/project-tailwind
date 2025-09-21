@@ -1,60 +1,33 @@
-### Next steps to hunt it down
+Short answer: the search is bouncing between two already-expanded nodes because of how the PUCT scores line up, and because visits aren’t being incremented (or otherwise penalized) during this in-simulation loop. Nothing changes the scores, so it keeps picking the same two actions forever.
 
-- Verify state key stability
-  - Log a short hash of `state.canonical_key()` on every visit, plus `stage`, and whether the node existed or was created. Confirm the confirm-state key is identical across `select_flows → Continue → confirm → Back → select_flows → Continue → confirm`.
-  - Also log a short hash of `z_hat.tobytes()` to ensure no drift across `Continue/Back`.
+What the log shows
 
-- Check node reuse and edge stats across sims
-  - On every visit to confirm, print: `node.N`, `len(node.children)`, and for each of `commit/back/stop`: `P`, `N_edge`, `Q`.
-  - After `_backup`, print updated `N_edge/Q` for the edge just taken so you can see if they actually accumulate.
+You alternate between two nodes:
+select_flows node 1cb90b7654b7, where the chosen action is always cont
+confirm node b61ca92ecac6, where the chosen action is always back
+At select_flows:
+cont has an enormous Q = 9269.5, while the unvisited rem(…) moves have Q = 0 and exploration U ≈ 0.34.
+Score = Q + U, so cont’s score ≈ 9269.69 dwarfs every alternative (≈ 0.34). You never try rem(…).
+At confirm:
+commit has been tried once (N_edge=1, Q=0), so its exploration term is smaller: U ≈ 0.4083.
+back and stop are unvisited, so their exploration terms are larger: back U ≈ 0.636, stop U ≈ 0.547.
+With Q = 0 for all three, back always wins on U, so you go “back” to select_flows again.
+Why this turns into a loop
 
-- Decompose the selection score
-  - In the confirm state logs, print both parts explicitly: `score = Q + (c_puct * P * sqrt(N_parent) / (1+N_edge))`. Verify numbers match and whether ties happen; remember lexicographic tie-break favors `back` over `commit`.
+The transition cont → back → cont returns you to the same select_flows state (z_hash stays the same; phi_s == phi_sp; reward = 0). It’s a pure loop with no progress.
+Critically, the node and edge visit counts don’t change inside this loop:
+confirm node shows node_N = 1 every time, and N_edge(back) stays 0, even though you keep selecting back.
+select_flows node shows node_N = 2 and keeps cont’s edge stats unchanged.
+Because N and N_edge don’t increase during this intra-simulation loop, the PUCT exploration bonuses (U) don’t decay, and the ordering never flips. back keeps beating commit/stop at confirm, and cont keeps beating rem(…) at select_flows.
+Likely underlying issues
 
-- Inspect reward shaping and leaf bootstrap
-  - For steps around the loop, print `phi(s)` and `phi(s')` so you can see `Δphi`. `Continue` and `Back` should have `Δphi=0`. Confirm the leaf bootstrap at first-time visits uses `-phi(leaf)` as intended and is what’s inflating upstream Q.
+Scale mismatch: Q(cont) is huge (9269.5) relative to U (~0.2–0.6). That virtually guarantees cont wins at select_flows, blocking exploration of rem(…). Note 9269.5 equals roughly -phi/2 given phi_s = -18539; if that’s intentional, it still needs normalization so Q is commensurate with U.
+No within-simulation visit updates or cycle handling: because you don’t increment N/N_edge (or apply virtual visits/loss) as you traverse, the U terms for back/stop don’t change, so you never break the tie by experience. And there’s no cycle detection to prevent returning to a node already on the current path.
+How to prevent getting stuck
 
-- Confirm priors at confirm
-  - Log the computed priors at confirm; they should come out with `commit > back > stop`. If they’re equal/near-zero, debug why (temperature, logits, unexpected candidates).
-
-- Audit backprop path integrity
-  - Log the full `path` as `(node_hash, action_sig)` just before `_backup`, and then the same nodes’ `N/Q` after, to ensure the intended nodes/edges are being updated.
-
-- Check commit evaluation budget
-  - In your runner you set `commit_eval_limit=-1`. With current code, that makes every commit return `delta_j=0` (treated as budget exhausted). Temporarily run with a positive value (e.g., 16) and compare behavior; this can strongly affect Q at confirm.
-
-- Minimal repro sim
-  - Run a tiny scenario (one hotspot, a few flows, fixed proxies) with `debug_prints=True`. Stop after ~50 sims. You should see: confirm-node hash stable, `N_edge/Q` for confirm actions increasing across sims, and selection occasionally choosing `commit`.
-
-- If the loop persists with stable keys
-  - Print `U` components at select_flows vs confirm to see if the continue edge’s large Q (from leaf bootstrap) starves confirm of visits. If so, consider temporarily lowering `c_puct` or increasing priors for `commit` to validate the hypothesis without changing code permanently.
-
-- Sanity checks
-  - Ensure `selected_flow_ids` are unchanged across `Back/Continue`.
-  - Verify no NaNs/Infs in `z_hat` or priors; add guards to log and skip if detected.
-
-- Optional one-off diagnostics
-  - For confirm only, log whether the visited node was created this sim vs pre-existing in `self.nodes` and print the first 12 chars of its key to correlate across sims.
-
-- Seed/replication
-  - Run with a fixed seed and once with a different seed (even though selection is deterministic) to confirm determinism of the loop.
-
-- Data capture for offline inspection
-  - Dump a small JSON trace per sim with: stage, node_hash, children signatures with (P,N,Q), chosen action, `phi`, `Δphi`, total return. Diff traces between “looping” vs “non-looping” runs.
-
-- If keys are unstable after all
-  - Narrow it to which field flips: compare two consecutive confirm payloads (plan, context, stage, z_hat hash). Focus on `z_hat` content and `candidate_flow_ids` order.
-
-- If keys are stable but `back` dominates
-  - You’ve confirmed a Q update dynamic: continue’s edge gets repeatedly boosted by bootstrap, confirm edges stay cold. Validate by artificially warming `commit` (e.g., 1 forced rollout per visit) to see if loop breaks; that isolates Q/backprop as the root cause.
-
-- Final quick check in code reading
-  - Ensure `_signature_for_action` for `commit` is only based on chosen flows (it is) and not on `committed_rates`, so edges aggregate correctly.
-
-- Highest-impact checks first
-  - 1) commit_eval_limit positive vs -1
-  - 2) confirm-node key/hash stability across the loop
-  - 3) per-edge `N/Q` at confirm increasing across sims (or not)
-
-- What to collect to decide next fix
-  - A 30–50 sim trace showing confirm-node key stability, confirm-edge `N/Q` across time, and selection scores; with that we can tell if it’s key instability or Q/backprop dynamics.
+Normalize/scale Q so it’s on the same order as the U term, or increase c_puct accordingly; typical MCTS keeps Q in a bounded range (e.g., [-1, 1]).
+Increment edge/node visits (or apply “virtual visits/loss”) immediately on selection, not only at backup, so repeated choices in the same simulation reduce their U and allow alternatives to surface.
+Add cycle detection for a single simulation path (e.g., if selecting an action would revisit a node already on the path, disallow it, penalize it, or treat it as terminal with a small negative).
+Consider domain rules to avoid immediate backtracking (e.g., forbid back right after cont), or add a small step penalty to break indifference.
+If appropriate, inject exploration (e.g., Dirichlet noise) at the relevant node to let rem(…) get tried at least once.
+In short: the agent “gets stuck” because it enters a deterministic cont ↔ back loop where PUCT scores never change (no visit updates, huge Q on cont), so the same two choices keep winning and the simulation never progresses to expansion or backup.
