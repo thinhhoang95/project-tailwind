@@ -58,7 +58,9 @@ from parrhesia.flow_agent import (
     RateFinderConfig,
     SearchLogger,
     HotspotDiscoveryConfig,
+    validate_plan_file,
 )
+from parrhesia.flow_agent.plan_export import save_plan_to_file
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.optimize.eval.flight_list import FlightList
 from project_tailwind.optimize.eval.network_evaluator import NetworkEvaluator
@@ -203,7 +205,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Limit to a single regulation to shorten runtime and match the request
     mcts_cfg = MCTSConfig(
         max_sims=128,
-        commit_depth=16,
+        commit_depth=128,
         commit_eval_limit=16,
         max_actions=512,
         seed=69420,
@@ -298,9 +300,22 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             tbl.add_row("—", "0")
         return tbl
 
+    def _build_delta_table(payload: Dict[str, Any]) -> Table:
+        tbl = Table(title="ΔJ", box=box.SIMPLE_HEAVY)
+        tbl.add_column("Metric", style="green")
+        tbl.add_column("Value", justify="right")
+        best = payload.get("best_delta_j")
+        last = payload.get("last_delta_j")
+        best_s = f"{float(best):.3f}" if isinstance(best, (int, float)) else "—"
+        last_s = f"{float(last):.3f}" if isinstance(last, (int, float)) else "—"
+        tbl.add_row("Best ΔJ", best_s)
+        tbl.add_row("Latest ΔJ", last_s)
+        return tbl
+
     def _compose_live() -> Group:
         return Group(
             prog,
+            _build_delta_table(last_payload),
             _build_root_table(last_payload),
             _build_actions_table(last_payload),
         )
@@ -356,7 +371,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         discovery_cfg=disc_cfg,
         logger=logger,
         debug_logger=debug_logger,
-        max_regulations=24,
+        max_regulations=128,
         timer=timed,
         progress_cb=_on_progress,
     )
@@ -417,6 +432,17 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         console.print(_build_actions_table(last_payload))
     except Exception:
         pass
+
+    # Persist best-found regulation plan (including per-flow rates) next to logs
+    try:
+        out_path = save_plan_to_file(state, info, indexer)
+        console.print(f"[runner] Plan exported: {out_path}")
+        try:
+            validate_plan_file(out_path)
+        except Exception as exc:
+            console.print(f"[yellow]Failed to validate plan:[/yellow] {exc}")
+    except Exception as exc:
+        console.print(f"[yellow]Failed to export plan:[/yellow] {exc}")
     return state, info
 
 if __name__ == '__main__':

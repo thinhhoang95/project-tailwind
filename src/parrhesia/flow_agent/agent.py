@@ -253,7 +253,7 @@ class MCTSAgent:
                     if self.max_regulations is not None and commits >= self.max_regulations:
                         reason = "regulation_limit_reached"
                     elif commits >= limit:
-                        reason = "loop_limit_reached"
+                        reason = "commit_depth_limit_reached"
                     else:
                         reason = "completed"
                 payload = {
