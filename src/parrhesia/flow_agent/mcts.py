@@ -823,7 +823,15 @@ class MCTS:
                 )
                 action = commit_action
                 r_base = -float(delta_j)
-                if self._best_commit is None or delta_j < self._best_commit[1]:
+                diag_payload = commit_action.diagnostics or {}
+                banned_commit = False
+                if isinstance(diag_payload, Mapping):
+                    banned_commit = bool(diag_payload.get("banned_regulation"))
+                    if not banned_commit:
+                        rf_diag = diag_payload.get("rate_finder")
+                        if isinstance(rf_diag, Mapping):
+                            banned_commit = bool(rf_diag.get("banned_regulation"))
+                if (not banned_commit) and (self._best_commit is None or delta_j < self._best_commit[1]):
                     self._best_commit = (commit_action, float(delta_j))
 
             self._record_action(action)
@@ -1043,7 +1051,25 @@ class MCTS:
             return actions
 
         if state.stage == "confirm":
-            actions.append(CommitRegulation())
+            ctx_confirm = state.hotspot_context
+            if not self._commit_is_banned(state):
+                actions.append(CommitRegulation())
+            else:
+                if ctx_confirm is not None:
+                    try:
+                        self._log_debug_event(
+                            "commit_action_pruned",
+                            {
+                                "control_volume_id": str(ctx_confirm.control_volume_id),
+                                "window_bins": [
+                                    int(ctx_confirm.window_bins[0]),
+                                    int(ctx_confirm.window_bins[1]),
+                                ],
+                                "selected_flows": list(ctx_confirm.selected_flow_ids),
+                            },
+                        )
+                    except Exception:
+                        pass
             actions.append(Back())
             actions.append(Stop())
             return actions
@@ -1107,6 +1133,40 @@ class MCTS:
         return priors
 
     # ------------------------------ Commits --------------------------------
+    def _commit_is_banned(self, state: PlanState) -> bool:
+        ctx = state.hotspot_context
+        if ctx is None:
+            return False
+        metadata = state.metadata if isinstance(state.metadata, Mapping) else {}
+        banned_entries = metadata.get("banned_regulations") or []
+        try:
+            selected_flows = tuple(sorted(str(fid) for fid in ctx.selected_flow_ids))
+        except Exception:
+            selected_flows = tuple()
+        window_bins = tuple(int(b) for b in ctx.window_bins)
+        mode = "per_flow" if ctx.mode == "per_flow" else "blanket"
+        tv = str(ctx.control_volume_id)
+        for entry in banned_entries:
+            try:
+                entry_tv = str(entry.get("control_volume_id"))
+                raw_window = entry.get("window_bins") or []
+                if len(raw_window) >= 2:
+                    entry_window = (int(raw_window[0]), int(raw_window[1]))
+                else:
+                    entry_window = window_bins
+                entry_mode = "per_flow" if str(entry.get("mode", "per_flow")) == "per_flow" else "blanket"
+                entry_flows = tuple(sorted(str(fid) for fid in (entry.get("flow_ids") or [])))
+            except Exception:
+                continue
+            if (
+                entry_tv == tv
+                and entry_window == window_bins
+                and entry_mode == mode
+                and entry_flows == selected_flows
+            ):
+                return True
+        return False
+
     def _evaluate_commit(
         self,
         state: PlanState,
@@ -1119,6 +1179,75 @@ class MCTS:
             raise RuntimeError("Commit attempted without hotspot context")
         if not ctx.selected_flow_ids:
             raise RuntimeError("Commit attempted without any selected flows")
+
+        selected_flows_norm = tuple(sorted(str(fid) for fid in ctx.selected_flow_ids))
+        mode_norm = "per_flow" if ctx.mode == "per_flow" else "blanket"
+        window_norm = (int(ctx.window_bins[0]), int(ctx.window_bins[1]))
+        existing_reg = None
+        for reg in getattr(state, "plan", []) or []:
+            try:
+                reg_tv = str(reg.control_volume_id)
+                reg_window = (int(reg.window_bins[0]), int(reg.window_bins[1]))
+                reg_mode = "per_flow" if getattr(reg, "mode", "per_flow") == "per_flow" else "blanket"
+                reg_flows = tuple(sorted(str(fid) for fid in reg.flow_ids))
+            except Exception:
+                continue
+            if (
+                reg_tv == str(ctx.control_volume_id)
+                and reg_window == window_norm
+                and reg_mode == mode_norm
+                and reg_flows == selected_flows_norm
+            ):
+                existing_reg = reg
+                break
+
+        if existing_reg is not None:
+            info = {
+                "control_volume_id": str(ctx.control_volume_id),
+                "window_bins": [window_norm[0], window_norm[1]],
+                "mode": mode_norm,
+                "banned_regulation": True,
+                "reason": "duplicate_in_plan",
+            }
+            self._log_debug_event(
+                "commit_eval_duplicate_in_plan",
+                {
+                    "flows": len(ctx.selected_flow_ids),
+                    "control_volume_id": str(ctx.control_volume_id),
+                    "window_bins": [window_norm[0], window_norm[1]],
+                },
+                sim_index=sim_index,
+                step_index=step_index,
+            )
+            commit_action = CommitRegulation(
+                committed_rates={},
+                diagnostics={"rate_finder": info, "banned_regulation": True},
+            )
+            return commit_action, 0.0
+
+        if self._commit_is_banned(state):
+            info = {
+                "control_volume_id": str(ctx.control_volume_id),
+                "window_bins": [window_norm[0], window_norm[1]],
+                "mode": mode_norm,
+                "banned_regulation": True,
+                "reason": "banned_regulation",
+            }
+            self._log_debug_event(
+                "commit_eval_banned",
+                {
+                    "flows": len(ctx.selected_flow_ids),
+                    "control_volume_id": str(ctx.control_volume_id),
+                    "window_bins": [int(ctx.window_bins[0]), int(ctx.window_bins[1])],
+                },
+                sim_index=sim_index,
+                step_index=step_index,
+            )
+            commit_action = CommitRegulation(
+                committed_rates={},
+                diagnostics={"rate_finder": info, "banned_regulation": True},
+            )
+            return commit_action, 0.0
 
         # Build flows map from metadata
         meta = ctx.metadata or {}
