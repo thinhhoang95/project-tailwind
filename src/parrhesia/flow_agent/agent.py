@@ -54,6 +54,7 @@ class MCTSAgent:
         discovery_cfg: Optional[HotspotDiscoveryConfig] = None,
         logger: Optional[SearchLogger] = None,
         debug_logger: Optional[SearchLogger] = None,
+        cold_logger: Optional[SearchLogger] = None,
         max_regulations: Optional[int] = None,
         timer: Optional[Callable[[str], ContextManager[Any]]] = None,
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -65,6 +66,7 @@ class MCTSAgent:
         self.discovery_cfg = discovery_cfg or HotspotDiscoveryConfig()
         self.logger = logger
         self.debug_logger = debug_logger
+        self.cold_logger = cold_logger
         self.max_regulations = None if max_regulations is None else int(max(0, max_regulations))
         self._timer_factory = timer
         self._progress_cb = progress_cb
@@ -160,6 +162,7 @@ class MCTSAgent:
             timer=self._timer_factory,
             progress_cb=self._progress_cb,
             debug_logger=self.debug_logger,
+            cold_logger=self.cold_logger,
         )
 
         if self.logger is not None:
@@ -190,12 +193,15 @@ class MCTSAgent:
         aggregated_counts: Dict[str, int] = {}
         outer_stop_reason: Optional[str] = None
         outer_stop_info: Dict[str, Any] = {}
+        run_idx = 1
+        max_commits_per_inner: List[int] = []
+        commit_calls_per_inner: List[int] = []
         for _ in range(max(1, limit)):
             # Ensure we are in idle to start a new regulation
             state.stage = "idle"
             try:
                 with self._timed("agent.mcts.run"):
-                    commit_action = mcts.run(state)
+                    commit_action = mcts.run(state, run_index=run_idx)
             except Exception as exc:
                 message = str(exc)
                 for k, v in mcts.action_counts.items():
@@ -227,6 +233,36 @@ class MCTSAgent:
 
             for k, v in mcts.action_counts.items():
                 aggregated_counts[k] = aggregated_counts.get(k, 0) + int(v)
+
+            # Cold Feet: capture per-run stats
+            try:
+                stats = getattr(mcts, "last_run_stats", {}) or {}
+                if isinstance(stats, dict):
+                    mx = int(stats.get("max_commits_path", 0))
+                    max_commits_per_inner.append(mx)
+                    try:
+                        commit_calls_per_inner.append(int(stats.get("commit_calls", 0)))
+                    except Exception:
+                        commit_calls_per_inner.append(0)
+                    if self.cold_logger is not None:
+                        try:
+                            self.cold_logger.event(
+                                "cold_inner_run_summary",
+                                {
+                                    "run_index": int(stats.get("run_index") or run_idx),
+                                    "commit_calls": int(stats.get("commit_calls", 0)),
+                                    "stop_reason": stats.get("stop_reason"),
+                                    "stop_info": stats.get("stop_info"),
+                                    "elapsed_s": float(stats.get("elapsed_s", 0.0)),
+                                    "actions_done": int(stats.get("actions_done", 0)),
+                                    "max_actions": stats.get("max_actions"),
+                                    "max_commits_path": mx,
+                                },
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
             # Extract improvement for bookkeeping
             info = (commit_action.diagnostics or {}).get("rate_finder", {})
@@ -391,6 +427,8 @@ class MCTSAgent:
                 outer_stop_info = {"delta_j": float(delta_j), "commits": int(commits), "limit": int(limit)}
                 break
 
+            run_idx += 1
+
         if self.max_regulations is not None and commits >= self.max_regulations and self.logger is not None:
             self.logger.event("regulation_limit_reached", {"limit": int(self.max_regulations)})
         if self.max_regulations is not None and commits >= self.max_regulations and self.debug_logger is not None:
@@ -407,21 +445,23 @@ class MCTSAgent:
         if self.logger is not None:
             self.logger.event("run_end", {"commits": commits, **final_summary})
 
+        # Determine final stop reason and info irrespective of debug logging
+        final_stop_reason = outer_stop_reason
+        if final_stop_reason is None:
+            if self.max_regulations is not None and commits >= self.max_regulations:
+                final_stop_reason = "regulation_limit_reached"
+            elif commits >= limit:
+                final_stop_reason = "commit_depth_limit_reached"
+            else:
+                final_stop_reason = "completed"
+        final_stop_info = outer_stop_info or {}
+
         # Emit a consolidated outer-run termination record to the debug log
         if self.debug_logger is not None:
             try:
-                reason = outer_stop_reason
-                if reason is None:
-                    # If no explicit break, determine from limits
-                    if self.max_regulations is not None and commits >= self.max_regulations:
-                        reason = "regulation_limit_reached"
-                    elif commits >= limit:
-                        reason = "commit_depth_limit_reached"
-                    else:
-                        reason = "completed"
                 payload = {
-                    "stop_reason": reason,
-                    "stop_info": (outer_stop_info or None),
+                    "stop_reason": final_stop_reason,
+                    "stop_info": (final_stop_info or None),
                     "commits": int(commits),
                     "limit": int(limit),
                     "commit_depth": int(self.mcts_cfg.commit_depth),
@@ -435,6 +475,20 @@ class MCTSAgent:
             except Exception:
                 pass
 
+        # Attach cold feet aggregate stats to final summary
+        if max_commits_per_inner:
+            try:
+                final_summary["max_commits_per_inner"] = list(max_commits_per_inner)
+                final_summary["max_commits_overall"] = int(max(max_commits_per_inner))
+            except Exception:
+                pass
+        if commit_calls_per_inner:
+            try:
+                final_summary["commit_calls_per_inner"] = list(commit_calls_per_inner)
+                final_summary["commit_calls_total"] = int(sum(commit_calls_per_inner))
+            except Exception:
+                pass
+
         info = RunInfo(
             commits=commits,
             total_delta_j=float(total_delta_j),
@@ -442,8 +496,8 @@ class MCTSAgent:
             debug_log_path=(self.debug_logger.path if self.debug_logger else None),
             summary=final_summary,
             action_counts=aggregated_counts,
-            stop_reason=reason,
-            stop_info=(outer_stop_info or {}),
+            stop_reason=final_stop_reason,
+            stop_info=final_stop_info,
         )
         return state, info
 

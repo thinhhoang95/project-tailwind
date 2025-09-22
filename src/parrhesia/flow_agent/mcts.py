@@ -100,6 +100,7 @@ class MCTS:
         timer: Optional[Callable[[str], ContextManager[Any]]] = None,
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
         debug_logger: Optional[SearchLogger] = None,
+        cold_logger: Optional[SearchLogger] = None,
     ) -> None:
         self.transition = transition
         self.rate_finder = rate_finder
@@ -115,6 +116,10 @@ class MCTS:
         self._last_delta_j: Optional[float] = None
         self._debug_logger = debug_logger
         self._current_sim: Optional[int] = None
+        self._cold_logger = cold_logger
+        self._max_commits_path: int = 0
+        self._last_run_stats: Dict[str, Any] = {}
+        self._run_index: Optional[int] = None
         # Global action budget tracking
         self._actions_done: int = 0
         self._action_budget: Optional[int] = (None if getattr(self.cfg, "max_actions", None) in (None, 0)
@@ -141,6 +146,31 @@ class MCTS:
         if logger is None:
             return
         row = dict(payload or {})
+        if sim_index is None:
+            sim_index = self._current_sim
+        if sim_index is not None:
+            row.setdefault("sim", int(sim_index))
+        if step_index is not None:
+            row.setdefault("step", int(step_index))
+        try:
+            logger.event(kind, row)
+        except Exception:
+            pass
+
+    def _log_cold_event(
+        self,
+        kind: str,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        sim_index: Optional[int] = None,
+        step_index: Optional[int] = None,
+    ) -> None:
+        logger = self._cold_logger
+        if logger is None:
+            return
+        row = dict(payload or {})
+        if self._run_index is not None:
+            row.setdefault("run_index", int(self._run_index))
         if sim_index is None:
             sim_index = self._current_sim
         if sim_index is not None:
@@ -240,13 +270,16 @@ class MCTS:
             raise MCTS._ActionBudgetExhausted()
 
     # ------------------------------- Public API ---------------------------
-    def run(self, root: PlanState, *, max_sims: Optional[int] = None, commit_depth: Optional[int] = None) -> CommitRegulation:
+    def run(self, root: PlanState, *, max_sims: Optional[int] = None, commit_depth: Optional[int] = None, run_index: Optional[int] = None) -> CommitRegulation:
         sims = int(max_sims if max_sims is not None else self.cfg.max_sims)
         depth_limit = int(commit_depth if commit_depth is not None else self.cfg.commit_depth)
         self._commit_calls = 0
         self._best_commit = None
         self._action_counts.clear()
         self._last_delta_j = None
+        self._max_commits_path = 0
+        self._last_run_stats = {}
+        self._run_index = run_index
         # Reset global action counter and budget view for this run
         self._actions_done = 0
         self._action_budget = (None if getattr(self.cfg, "max_actions", None) in (None, 0)
@@ -267,6 +300,15 @@ class MCTS:
         )
 
         self._dbg(f"[MCTS] run start: sims={sims} depth={depth_limit} {self._state_brief(root)}")
+        self._log_cold_event(
+            "cold_run_start",
+            {
+                "root_hash": root_hash,
+                "max_sims": sims,
+                "commit_depth": depth_limit,
+                "time_budget_s": float(self.cfg.max_time_s),
+            },
+        )
 
         simulations_run = 0
         stop_reason = "max_sims_exhausted"
@@ -443,9 +485,39 @@ class MCTS:
             },
         )
 
+        # Cold feet end-of-run summary
+        self._log_cold_event(
+            "cold_run_end",
+            {
+                "stop_reason": stop_reason,
+                "stop_info": stop_info or None,
+                "elapsed_s": elapsed_total,
+                "commit_calls": int(self._commit_calls),
+                "actions_done": int(self._actions_done),
+                "max_actions": int(self._action_budget) if self._action_budget is not None else None,
+                "max_commits_path": int(getattr(self, "_max_commits_path", 0)),
+            },
+        )
+
+        # Store last-run stats for outer consumer
+        self._last_run_stats = {
+            "run_index": int(self._run_index) if self._run_index is not None else None,
+            "stop_reason": stop_reason,
+            "stop_info": stop_info or None,
+            "elapsed_s": elapsed_total,
+            "commit_calls": int(self._commit_calls),
+            "actions_done": int(self._actions_done),
+            "max_actions": int(self._action_budget) if self._action_budget is not None else None,
+            "max_commits_path": int(getattr(self, "_max_commits_path", 0)),
+        }
+
         if self._best_commit is None:
             raise RuntimeError("MCTS did not evaluate any commit; increase sims or adjust state")
         return self._best_commit[0]
+
+    @property
+    def last_run_stats(self) -> Dict[str, Any]:
+        return dict(self._last_run_stats)
 
     # ----------------------------- Simulation loop ------------------------
     def _simulate(self, root: PlanState, commit_depth: int, *, sim_index: int) -> float:
@@ -730,6 +802,48 @@ class MCTS:
                     confirm_payload["priors"][label] = float(priors.get(sig, node.P.get(sig, 0.0)))
                 self._log_debug_event("confirm_snapshot", confirm_payload, sim_index=sim_index, step_index=step_index)
 
+                # Cold Feet specific: log Q and U for commit/back/stop at confirm
+                def _calc_u(sig: Tuple) -> Dict[str, float]:
+                    est_c = node.edges.get(sig)
+                    P_c = float(node.P.get(sig, 0.0))
+                    N_edge = int(est_c.N if est_c else 0)
+                    U_c = float(self.cfg.c_puct) * P_c * (sqrtN / (1.0 + N_edge))
+                    Q_c = float(est_c.Q if est_c else 0.0)
+                    return {"P": P_c, "Q": Q_c, "U": float(U_c), "N": N_edge}
+
+                cold_payload = {
+                    "node_hash": node_hash,
+                    "node_N": int(node.N),
+                    "sqrtN": float(sqrtN),
+                    "created_this_sim": created_flag,
+                    "z_hash": z_hash,
+                    "actions": {
+                        "commit": _calc_u(commit_sig),
+                        "back": _calc_u(back_sig),
+                        "stop": _calc_u(stop_sig),
+                    },
+                }
+                self._log_cold_event("confirm_q_u", cold_payload, sim_index=sim_index, step_index=step_index)
+
+                # Also record which action was actually chosen at confirm
+                confirm_taken_payload = {
+                    "node_hash": node_hash,
+                    "node_N": int(node.N),
+                    "sqrtN": float(sqrtN),
+                    "created_this_sim": created_flag,
+                    "z_hash": z_hash,
+                    "chosen": {
+                        "sig": self._sig_to_json(best_sig),
+                        "label": self._sig_to_label(best_sig),
+                        "Q": float(est_sel.Q),
+                        "U": float(U_best),
+                        "score": float(best_score),
+                    },
+                    "viable_count": len(viable),
+                    "path_len": len(path),
+                }
+                self._log_cold_event("confirm_action_taken", confirm_taken_payload, sim_index=sim_index, step_index=step_index)
+
             selection_payload = {
                 "stage": state.stage,
                 "node_hash": node_hash,
@@ -890,6 +1004,11 @@ class MCTS:
             state = next_state
             if is_commit:
                 commits_used += 1
+            # Track maximum number of commits reached along any path for this run
+            future_commits = commits_used
+            if hasattr(self, "_max_commits_path"):
+                if int(future_commits) > int(getattr(self, "_max_commits_path", 0)):
+                    self._max_commits_path = int(future_commits)
 
             prev_visit_depth = visited_keys.get(child_key)
             if prev_visit_depth is not None:

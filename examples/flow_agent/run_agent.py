@@ -197,9 +197,12 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Logger to tmp path
     log_dir = tmp_path / "runs"
     logger, loggerpath = SearchLogger.to_timestamped(str(log_dir))
-    debug_logger, debug_logger_path = SearchLogger.to_timestamped(str(log_dir), prefix="debug")
+    cold_logger, cold_logger_path = SearchLogger.to_timestamped(str(log_dir), prefix="cold")
+    # Debug logger intentionally disabled for this run (kept in codebase)
+    debug_logger = None
+    debug_logger_path = None
     console.print(f"[runner] Log path: {loggerpath}")
-    console.print(f"[runner] Debug log path: {debug_logger_path}")
+    console.print(f"[runner] Cold Feet log path: {cold_logger_path}")
 
     # Configure agent budgets small to keep runtime reasonable
     # Limit to a single regulation to shorten runtime and match the request
@@ -207,7 +210,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         max_sims=128,
         commit_depth=128,
         commit_eval_limit=16,
-        max_actions=512,
+        max_actions=3072,
         seed=69420,
         debug_prints=False,
     )
@@ -371,6 +374,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         discovery_cfg=disc_cfg,
         logger=logger,
         debug_logger=debug_logger,
+        cold_logger=cold_logger,
         max_regulations=128,
         timer=timed,
         progress_cb=_on_progress,
@@ -395,7 +399,11 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             state, info = agent.run()
         live_holder["live"] = None
     logger.close()
-    debug_logger.close()
+    try:
+        if cold_logger is not None:
+            cold_logger.close()
+    except Exception:
+        pass
 
     # Final summary and quick checks (non-fatal)
     console.print(f"[runner] Commits: {info.commits}")
@@ -425,14 +433,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             console.print(f"[runner] Final objective: {final_obj}")
     if info.log_path:
         console.print(f"[runner] Log path: {info.log_path}")
-    if info.debug_log_path:
-        console.print(f"[runner] Debug log path: {info.debug_log_path}")
-    # Print the last 200 lines from the debug log for quick visibility
-    try:
-        dbg_path = Path(info.debug_log_path) if getattr(info, "debug_log_path", None) else debug_logger_path
-        # print_last_debug_lines(dbg_path, 200)
-    except Exception:
-        pass
+    # Debug log is disabled for this run
     # Repeat the Action Counts table again for downstream quality-control parsing
     try:
         console.print(_build_actions_table(last_payload))
@@ -449,6 +450,30 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             console.print(f"[yellow]Failed to validate plan:[/yellow] {exc}")
     except Exception as exc:
         console.print(f"[yellow]Failed to export plan:[/yellow] {exc}")
+
+    # Report Cold Feet stats: per-run max commits and overall max
+    try:
+        summary_dict = info.summary if isinstance(info.summary, dict) else {}
+        mc_list = summary_dict.get("max_commits_per_inner")
+        mc_overall = summary_dict.get("max_commits_overall")
+        cc_list = summary_dict.get("commit_calls_per_inner")
+        cc_total = summary_dict.get("commit_calls_total")
+
+        # Commit evaluations summary (less confusing, both per-run and total)
+        if isinstance(cc_list, list) and cc_list:
+            total_val = int(cc_total) if isinstance(cc_total, (int, float)) else int(sum(int(x) for x in cc_list))
+            console.print(f"[runner] Commit evaluations (per inner run): {cc_list} • total: {total_val}")
+        else:
+            console.print("[runner] Commit evaluations (per inner run): (none recorded)")
+
+        # Max commits achieved within a single simulation path (per inner run)
+        if isinstance(mc_list, list) and mc_list:
+            overall_val = int(mc_overall) if isinstance(mc_overall, (int, float)) else int(max(mc_list))
+            console.print(f"[runner] Max commits in any single path (per inner run): {mc_list} • overall: {overall_val}")
+        else:
+            console.print("[runner] Max commits in any single path (per inner run): (none recorded)")
+    except Exception:
+        pass
     return state, info
 
 if __name__ == '__main__':
