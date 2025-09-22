@@ -214,8 +214,8 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     rf_cfg = RateFinderConfig(use_adaptive_grid=True, max_eval_calls=4)
     disc_cfg = HotspotDiscoveryConfig(
         threshold=0.0,
-        top_hotspots=32,
-        top_flows=6,
+        top_hotspots=64,
+        top_flows=8,
         max_flights_per_flow=64,
         leiden_params={"threshold": 0.64, "resolution": 1.0, "seed": 0},
         direction_opts={"mode": "none"},
