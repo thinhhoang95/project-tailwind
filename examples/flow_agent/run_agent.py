@@ -416,7 +416,13 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     except Exception:
         pass
     if info.summary:
-        console.print(f"[runner] Final objective: {info.summary.get('objective')}")
+        final_obj = info.summary.get("objective")
+        total_delta = info.total_delta_j
+        if isinstance(final_obj, (int, float)):
+            base_obj = final_obj - total_delta
+            console.print(f"[runner] Final objective: {base_obj:,.3f} → {final_obj:,.3f} (ΔJ: {total_delta:,.3f})")
+        else:
+            console.print(f"[runner] Final objective: {final_obj}")
     if info.log_path:
         console.print(f"[runner] Log path: {info.log_path}")
     if info.debug_log_path:
