@@ -445,6 +445,30 @@ class MCTSAgent:
                             cand_spill = int(v)
                     except Exception:
                         pass
+                # Flights-per-selected-flows summary (helps diagnose missed big flows)
+                n_flights_flows: Optional[int] = None
+                n_flights_flows_max: Optional[int] = None
+                max_flow_id: Optional[str] = None
+                try:
+                    ent_map = rf_info.get("entrants_by_flow", {}) if isinstance(rf_info, dict) else {}
+                    if isinstance(ent_map, dict):
+                        total = 0
+                        max_count = -1
+                        max_fid = None
+                        for fid in flow_ids:
+                            c = int(ent_map.get(str(fid), 0))
+                            total += c
+                            if c > max_count:
+                                max_count = c
+                                max_fid = str(fid)
+                        n_flights_flows = int(total)
+                        if max_count >= 0:
+                            n_flights_flows_max = int(max_count)
+                            max_flow_id = max_fid
+                except Exception:
+                    n_flights_flows = None
+                    n_flights_flows_max = None
+                    max_flow_id = None
 
                 self.logger.event("after_commit", {
                     "reg": state.plan[-1].to_canonical_dict(),
@@ -455,6 +479,9 @@ class MCTSAgent:
                     "candidate_spill_T": cand_spill,
                     "candidate_nonzero_delay_count": cand_nonzero_delays,
                     "candidate_max_delay_min": cand_max_delay,
+                    "N_flights_flows": n_flights_flows,
+                    "N_flights_flows_max": n_flights_flows_max,
+                    "max_flow_id": max_flow_id,
                 })
             if self.debug_logger is not None:
                 try:

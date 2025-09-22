@@ -211,7 +211,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Limit to a single regulation to shorten runtime and match the request
     mcts_cfg = MCTSConfig(
         max_sims=512,
-        commit_depth=64,
+        commit_depth=1,
         commit_eval_limit=64,
         max_actions=9216,
         seed=69420,
