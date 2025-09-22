@@ -106,6 +106,37 @@ async def get_tv_count_with_capacity(traffic_volume_id: str, current_user: dict 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
+@app.post("/common_traffic_volumes")
+async def post_common_traffic_volumes(request: Dict[str, Any], current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+    """
+    Given a list of flight identifiers, return the list of unique traffic volumes
+    that all of these flights pass through (intersection across flights).
+
+    Request JSON:
+    - flight_ids: list[str] (required)
+
+    Response JSON:
+    - flight_ids: echoed normalized list
+    - traffic_volumes: list[str] of common TVs (sorted by stable TV row order)
+    - count: integer number of TVs in the intersection
+    - metadata: {time_bin_minutes, num_input_flights}
+    """
+    try:
+        if not isinstance(request, dict):
+            raise HTTPException(status_code=400, detail="JSON body must be an object")
+        flight_ids = request.get("flight_ids")
+        if not isinstance(flight_ids, list):
+            raise HTTPException(status_code=400, detail="'flight_ids' must be a list of strings")
+        result = await airspace_wrapper.get_common_traffic_volumes([str(x) for x in flight_ids])
+        return result
+    except HTTPException:
+        raise
+    except ValueError as e:
+        # Missing/unknown flights, validation issues
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
 @app.get("/slack_distribution")
 async def get_slack_distribution(
     traffic_volume_id: str, ref_time_str: str, sign: str, delta_min: float = 0.0,

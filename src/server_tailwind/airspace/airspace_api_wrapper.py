@@ -258,6 +258,75 @@ class AirspaceAPIWrapper:
 
         return await loop.run_in_executor(self._executor, _compute)
     
+    async def get_common_traffic_volumes(self, flight_ids: List[str]) -> Dict[str, Any]:
+        """
+        Return the intersection of traffic volume IDs visited by all provided flights.
+
+        Args:
+            flight_ids: List of flight identifiers.
+
+        Returns:
+            JSON object with the input flight IDs, the common traffic volume IDs (sorted by
+            stable TV row order), and basic metadata.
+        """
+        self._ensure_evaluator_ready()
+
+        if not isinstance(flight_ids, list) or any(not isinstance(fid, str) for fid in flight_ids):
+            raise ValueError("'flight_ids' must be a list of strings")
+
+        # Normalize and de-duplicate while preserving order for echoing back
+        seen_fids: set = set()
+        normalized_fids: List[str] = []
+        for fid in flight_ids:
+            s = str(fid).strip()
+            if s and s not in seen_fids:
+                seen_fids.add(s)
+                normalized_fids.append(s)
+
+        if len(normalized_fids) == 0:
+            raise ValueError("'flight_ids' must contain at least one flight identifier")
+
+        loop = asyncio.get_event_loop()
+
+        def _compute() -> Dict[str, Any]:
+            # Validate flight existence
+            missing: List[str] = [fid for fid in normalized_fids if fid not in self._flight_list.flight_metadata]
+            if missing:
+                raise ValueError(f"Unknown flight_ids: {', '.join(missing)}")
+
+            # Get unique TV index footprints per flight
+            footprints = self._flight_list.get_footprints_for_flights(normalized_fids)
+
+            # Compute intersection of TV indices across flights
+            common_tv_indices: Optional[set] = None
+            for arr in footprints:
+                s = set(int(x) for x in arr.tolist())
+                if common_tv_indices is None:
+                    common_tv_indices = s
+                else:
+                    common_tv_indices &= s
+                if not common_tv_indices:
+                    break
+
+            if not common_tv_indices:
+                tv_ids_sorted: List[str] = []
+            else:
+                # Sort by stable TV row order (indices are row ids)
+                sorted_indices = sorted(common_tv_indices)
+                tv_ids_sorted = [self._flight_list.idx_to_tv_id.get(int(i), str(int(i))) for i in sorted_indices]
+
+            return {
+                "flight_ids": normalized_fids,
+                "traffic_volumes": tv_ids_sorted,
+                "count": len(tv_ids_sorted),
+                "metadata": {
+                    "time_bin_minutes": int(self._evaluator.time_bin_minutes),
+                    "num_input_flights": len(normalized_fids),
+                },
+            }
+
+        return await loop.run_in_executor(self._executor, _compute)
+    
     async def get_traffic_volume_occupancy(self, traffic_volume_id: str) -> Dict[str, Any]:
         """
         Get occupancy counts for all time windows of a specific traffic volume.

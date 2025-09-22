@@ -38,6 +38,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 - **`/hotspots`** - Get list of hotspots detected via sliding rolling-hour counts (contiguous overloaded segments per TV) with detailed statistics
 - **`/slack_distribution`** - For a source TV and reference time, returns per-TV slack at the query bin shifted by nominal travel time (475 kts), with an optional additional shift `delta_min` (minutes)
 - **`/regulation_plan_simulation`** - Simulate a regulation plan to get per-flight delays, objective metrics, and rolling-hour occupancy for all TVs that changed (pre/post); no server-side ranking
+- **`/common_traffic_volumes`** - Given a list of flight identifiers, returns the list of unique traffic volumes that all these flights pass through (intersection)
 - **Authentication** - OAuth2 password flow with JWT access tokens
 - **`/token`** - Issue access token and user info (`display_name`, `organization`) (demo users: `nm@intuelle.com` / `nm123`, `thinh.hoangdinh@enac.fr` / `Vy011195`)
 - **`/protected`** - Example protected endpoint requiring `Authorization: Bearer <token>`
@@ -621,3 +622,30 @@ For production deployment, consider:
 - Using a production WSGI server like Gunicorn
 - Adding authentication and rate limiting
 - Implementing proper logging
+
+### POST `/common_traffic_volumes`
+
+Given a list of flight identifiers, returns the unique traffic volumes that all provided flights pass through (intersection across flights). The result is sorted by the stable TV row order used internally.
+
+**Request (JSON):**
+```json
+{
+  "flight_ids": ["0200AFRAM650E", "3944E1AFR96RF", "1234XYZZY"]
+}
+```
+
+**Response:**
+```json
+{
+  "flight_ids": ["0200AFRAM650E", "3944E1AFR96RF", "1234XYZZY"],
+  "traffic_volumes": ["MASB5KL", "TV001"],
+  "count": 2,
+  "metadata": {
+    "time_bin_minutes": 15,
+    "num_input_flights": 3
+  }
+}
+```
+
+Errors:
+- 400 if `flight_ids` is missing/invalid or contains unknown flight IDs
