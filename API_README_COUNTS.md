@@ -275,6 +275,134 @@ Example error response
 
 ---
 
+## Original Flight Contribution Counts Endpoint
+
+- Method: POST
+- Path: `/original_flight_contrib_counts`
+- Content-Type: `application/json`
+- Auth: none
+
+---
+
+## Request Body
+
+- `traffic_volume_ids` (list[string], optional):
+  - If provided, they do not change ranking but can be used by clients to focus on specific TVs. All must be known (404 on any unknown ID).
+
+- `from_time_str` (string, optional) and `to_time_str` (string, optional):
+  - Same formats and rules as `/original_counts`.
+
+- `flight_ids` (list[string], required):
+  - The flight list whose contribution is measured. Unknown flights are ignored and reported in `metadata.missing_flight_ids`.
+
+- `rank_by` (string, optional; default `"total_count"`):
+  - Supported values:
+    - `"total_count"`: Ranks TVs by total rolling-hour count over the selected time range using `total_counts`.
+    - `"total_excess"`: Ranks by total rolling-hour overload over the selected time range using `total_counts` and capacity; bins with `capacity=-1` are ignored.
+
+- `rolling_hour` (boolean, optional; default `true`):
+  - When true, both `total_counts` and `flight_list_counts` use forward-looking 60‑minute sums per bin (no wrap).
+
+Notes
+- Ranking is based on `total_counts` over the requested time range; `flight_list_counts` are reported alongside for comparison.
+- Capacity arrays repeat hourly capacity across bins within that hour; `-1` denotes missing capacity.
+
+---
+
+## Response Body
+
+- `time_bin_minutes` (int): Size of each time bin in minutes.
+- `timebins` (object):
+  - `start_bin` (int), `end_bin` (int), `labels` (list[string]) as in `/original_counts`.
+- `total_counts` (object): `{ tv_id: [int, ...] }` total rolling-hour counts across all flights for top‑50 TVs (ranked set).
+- `flight_list_counts` (object): `{ tv_id: [int, ...] }` rolling-hour counts attributed only to the provided `flight_ids` for the same TVs.
+- `capacity` (object): `{ tv_id: [float, ...] }` capacity per bin aligned to the returned bins for the same TVs.
+- `metadata` (object):
+  - `num_tvs` (int): Number of TVs included (typically 50).
+  - `num_bins` (int): Number of bins returned (`end_bin - start_bin + 1`).
+  - `total_flights_considered` (int): Number of recognized flights from `flight_ids` (deduplicated).
+  - `rank_by` (string), `top_k` (int), `rolling_hour` (boolean), `rolling_window_minutes` (int = 60).
+  - `ranked_tv_ids` (list[string]): Ranked order matching keys in `total_counts` and `flight_list_counts`.
+  - `missing_flight_ids` (list[string], optional): Any unknown flight IDs from `flight_ids`.
+
+---
+
+## Examples
+
+### A) Full day, required flight list
+
+Request
+```json
+{
+  "flight_ids": ["F001", "F002", "F003"]
+}
+```
+
+Response (truncated)
+```json
+{
+  "time_bin_minutes": 15,
+  "timebins": { "start_bin": 0, "end_bin": 95, "labels": ["00:00-00:15", "..."] },
+  "total_counts": {
+    "TV_123": [5, 9, 12, "..."],
+    "TV_456": [3, 6, 8, "..."]
+  },
+  "flight_list_counts": {
+    "TV_123": [1, 2, 3, "..."],
+    "TV_456": [0, 1, 2, "..."]
+  },
+  "capacity": {
+    "TV_123": [20, 20, 20, "..."],
+    "TV_456": [18, 18, 18, "..."]
+  },
+  "metadata": {
+    "num_tvs": 50,
+    "num_bins": 96,
+    "total_flights_considered": 3,
+    "rank_by": "total_count",
+    "top_k": 50,
+    "rolling_hour": true,
+    "rolling_window_minutes": 60,
+    "ranked_tv_ids": ["TV_123", "TV_456", "..."]
+  }
+}
+```
+
+### B) Time window and rank by total_excess
+
+Request
+```json
+{
+  "from_time_str": "06:00",
+  "to_time_str": "07:30",
+  "flight_ids": ["F001", "F002", "F999"],
+  "rank_by": "total_excess"
+}
+```
+
+Response (shape, truncated; note `missing_flight_ids`)
+```json
+{
+  "time_bin_minutes": 15,
+  "timebins": { "start_bin": 24, "end_bin": 30, "labels": ["06:00-06:15", "..."] },
+  "total_counts": { "TV_A": [8, 11, 9, 12, 10, 7, 6] },
+  "flight_list_counts": { "TV_A": [2, 3, 2, 2, 1, 1, 1] },
+  "capacity": { "TV_A": [22, 22, 22, 22, 22, 22, 22] },
+  "metadata": {
+    "num_tvs": 50,
+    "num_bins": 7,
+    "total_flights_considered": 2,
+    "rank_by": "total_excess",
+    "top_k": 50,
+    "rolling_hour": true,
+    "rolling_window_minutes": 60,
+    "ranked_tv_ids": ["TV_A", "..."]
+  }
+}
+```
+
+---
+
 ## Implementation Notes
 
 - The server loads `FlightList` once at startup from:

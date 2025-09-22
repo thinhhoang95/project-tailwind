@@ -630,6 +630,178 @@ class CountAPIWrapper:
 
         return resp
 
+    def _compute_flight_contrib_counts(
+        self,
+        *,
+        traffic_volume_ids: Optional[List[str]],
+        from_time_str: Optional[str],
+        to_time_str: Optional[str],
+        flight_ids: List[str],
+        rank_by: str,
+        rolling_hour: bool,
+        top_k: int = 50,
+    ) -> Dict[str, Any]:
+        """
+        Compute, for a given time range, both:
+          - total_counts: rolling-hour occupancy across all flights
+          - flight_list_counts: rolling-hour occupancy contributed by the provided flight_ids
+
+        Returns the top_k TVs ranked by rank_by applied to total_counts over the selected range.
+        """
+        # Validate TVs if provided
+        tv_map = self._flight_list.tv_id_to_idx
+        if traffic_volume_ids is not None:
+            unknown_tvs = [tv for tv in traffic_volume_ids if tv not in tv_map]
+            if unknown_tvs:
+                raise ValueError(f"Unknown traffic_volume_ids: {unknown_tvs}")
+
+        # Validate flight_ids (required)
+        if not isinstance(flight_ids, list) or len(flight_ids) == 0:
+            raise ValueError("'flight_ids' must be a non-empty list of strings")
+
+        # Determine time bin range
+        if (from_time_str and not to_time_str) or (to_time_str and not from_time_str):
+            raise ValueError("Both 'from_time_str' and 'to_time_str' must be provided together")
+
+        if from_time_str and to_time_str:
+            start_seconds = self._parse_time_to_seconds(from_time_str)
+            end_seconds = self._parse_time_to_seconds(to_time_str)
+            if end_seconds < start_seconds:
+                raise ValueError("'to_time_str' must be greater than or equal to 'from_time_str'")
+            seconds_per_bin = self.time_bin_minutes * 60
+            start_bin = start_seconds // seconds_per_bin
+            end_bin = end_seconds // seconds_per_bin
+            # Clamp to valid range
+            start_bin = max(0, min(int(start_bin), self.bins_per_tv - 1))
+            end_bin = max(0, min(int(end_bin), self.bins_per_tv - 1))
+            if start_bin > end_bin:
+                raise ValueError("Computed start bin is after end bin; check time inputs")
+        else:
+            start_bin = 0
+            end_bin = self.bins_per_tv - 1
+
+        # Prepare labels
+        labels = [self._format_time_window(i) for i in range(int(start_bin), int(end_bin) + 1)]
+
+        # Resolve flight rows for the provided list
+        missing_flight_ids: List[str] = []
+        valid_rows: List[int] = []
+        seen_rows: set = set()
+        for fid in flight_ids:
+            idx = self._flight_list.flight_id_to_row.get(str(fid))
+            if idx is None:
+                missing_flight_ids.append(str(fid))
+            else:
+                ii = int(idx)
+                if ii not in seen_rows:
+                    seen_rows.add(ii)
+                    valid_rows.append(ii)
+
+        rows_arr_for_filter = np.asarray(valid_rows, dtype=np.int32) if valid_rows else np.asarray([], dtype=np.int32)
+
+        # Build aggregated vectors
+        num_total_tvs = len(tv_map)
+        # Total across all flights
+        total_vec = self._aggregate_vector_for_rows(None)
+        total_matrix = total_vec.reshape((num_total_tvs, self.bins_per_tv))
+        # Contributions from flight list
+        contrib_vec = self._aggregate_vector_for_rows(rows_arr_for_filter)
+        contrib_matrix = contrib_vec.reshape((num_total_tvs, self.bins_per_tv))
+
+        # Rolling-hour window setup
+        if rolling_hour:
+            window_bins = int(np.ceil(60.0 / float(self.time_bin_minutes)))
+            window_bins = max(1, window_bins)
+            total_matrix = self._apply_rolling_hour(total_matrix, window_bins)
+            contrib_matrix = self._apply_rolling_hour(contrib_matrix, window_bins)
+
+        # Slice to requested range
+        slice_start = int(start_bin)
+        slice_end_inclusive = int(end_bin)
+        total_sliced = total_matrix[:, slice_start : slice_end_inclusive + 1]
+        contrib_sliced = contrib_matrix[:, slice_start : slice_end_inclusive + 1]
+
+        # Rank by selected criterion, using total counts
+        if rank_by == "total_excess":
+            cap_slice = self._get_capacity_slice(slice_start, slice_end_inclusive)
+            diff = total_sliced.astype(np.float32, copy=False) - cap_slice
+            valid = cap_slice >= 0.0
+            diff = np.where(valid, diff, 0.0)
+            excess = np.maximum(diff, 0.0)
+            scores = excess.sum(axis=1)
+        else:
+            if rank_by != "total_count":
+                rank_by = "total_count"
+            scores = total_sliced.sum(axis=1)
+
+        k = min(int(top_k), num_total_tvs)
+        top_indices = np.argsort(-scores, kind="stable")[:k]
+
+        # Reverse map idx -> tv_id
+        idx_to_tv = [None] * num_total_tvs
+        for tv_id, idx in tv_map.items():
+            idx_to_tv[int(idx)] = tv_id
+
+        # Populate outputs for top-k TVs
+        total_counts: Dict[str, List[int]] = {}
+        flight_list_counts: Dict[str, List[int]] = {}
+        for idx in top_indices:
+            tv_id = idx_to_tv[int(idx)]
+            total_vec_k = total_sliced[int(idx), :]
+            contrib_vec_k = contrib_sliced[int(idx), :]
+            total_counts[tv_id] = [int(x) for x in np.asarray(total_vec_k).ravel().tolist()]
+            flight_list_counts[tv_id] = [int(x) for x in np.asarray(contrib_vec_k).ravel().tolist()]
+
+        # Capacity for top-k TVs
+        capacity: Dict[str, List[float]] = {}
+        if self._capacity_per_bin_matrix is not None:
+            cap_slice = self._capacity_per_bin_matrix[:, slice_start : slice_end_inclusive + 1]
+            for idx in top_indices:
+                tv_id = idx_to_tv[int(idx)]
+                cap_vec = cap_slice[int(idx), :]
+                capacity[tv_id] = [float(x) for x in np.asarray(cap_vec).ravel().tolist()]
+        else:
+            neg = [-1.0] * (int(end_bin) - int(start_bin) + 1)
+            for idx in top_indices:
+                tv_id = idx_to_tv[int(idx)]
+                capacity[tv_id] = list(neg)
+
+        ranked_tv_ids = [idx_to_tv[int(i)] for i in top_indices]
+
+        resp: Dict[str, Any] = {
+            "time_bin_minutes": int(self.time_bin_minutes),
+            "timebins": {
+                "start_bin": int(start_bin),
+                "end_bin": int(end_bin),
+                "labels": labels,
+            },
+            "total_counts": total_counts,
+            "flight_list_counts": flight_list_counts,
+            "capacity": capacity,
+            "metadata": {
+                "num_tvs": int(len(ranked_tv_ids)),
+                "num_bins": int(end_bin) - int(start_bin) + 1,
+                "total_flights_considered": int(len(valid_rows)),
+                "rank_by": str(rank_by),
+                "top_k": int(top_k),
+                "rolling_hour": bool(rolling_hour),
+                "rolling_window_minutes": 60,
+                "ranked_tv_ids": ranked_tv_ids,
+            },
+        }
+
+        if missing_flight_ids:
+            # Deduplicate while preserving order
+            seen = set()
+            unique_missing: List[str] = []
+            for fid in missing_flight_ids:
+                if fid not in seen:
+                    seen.add(fid)
+                    unique_missing.append(fid)
+            resp["metadata"]["missing_flight_ids"] = unique_missing
+
+        return resp
+
     # ---------- Async facade ----------
     async def get_original_counts(
         self,
@@ -654,6 +826,31 @@ class CountAPIWrapper:
                 categories=categories,
                 flight_ids=flight_ids,
                 include_overall=include_overall,
+                rank_by=rank_by,
+                rolling_hour=rolling_hour,
+                top_k=top_k,
+            ),
+        )
+
+    async def get_original_flight_contrib_counts(
+        self,
+        *,
+        traffic_volume_ids: Optional[List[str]] = None,
+        from_time_str: Optional[str] = None,
+        to_time_str: Optional[str] = None,
+        flight_ids: Optional[List[str]] = None,
+        rank_by: str = "total_count",
+        rolling_hour: bool = True,
+        top_k: int = 50,
+    ) -> Dict[str, Any]:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: self._compute_flight_contrib_counts(
+                traffic_volume_ids=traffic_volume_ids,
+                from_time_str=from_time_str,
+                to_time_str=to_time_str,
+                flight_ids=list(flight_ids or []),
                 rank_by=rank_by,
                 rolling_hour=rolling_hour,
                 top_k=top_k,

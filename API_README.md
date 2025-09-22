@@ -38,7 +38,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 - **`/hotspots`** - Get list of hotspots detected via sliding rolling-hour counts (contiguous overloaded segments per TV) with detailed statistics
 - **`/slack_distribution`** - For a source TV and reference time, returns per-TV slack at the query bin shifted by nominal travel time (475 kts), with an optional additional shift `delta_min` (minutes)
 - **`/regulation_plan_simulation`** - Simulate a regulation plan to get per-flight delays, objective metrics, and rolling-hour occupancy for all TVs that changed (pre/post); no server-side ranking
-- **`/common_traffic_volumes`** - Given a list of flight identifiers, returns the list of unique traffic volumes that all these flights pass through (intersection)
+- **`/common_traffic_volumes`** - Given a list of flight identifiers, returns the list of unique traffic volumes that any of these flights pass through (union)
 - **Authentication** - OAuth2 password flow with JWT access tokens
 - **`/token`** - Issue access token and user info (`display_name`, `organization`) (demo users: `nm@intuelle.com` / `nm123`, `thinh.hoangdinh@enac.fr` / `Vy011195`)
 - **`/protected`** - Example protected endpoint requiring `Authorization: Bearer <token>`
@@ -625,7 +625,7 @@ For production deployment, consider:
 
 ### POST `/common_traffic_volumes`
 
-Given a list of flight identifiers, returns the unique traffic volumes that all provided flights pass through (intersection across flights). The result is sorted by the stable TV row order used internally.
+Given a list of flight identifiers, returns the unique traffic volumes that any of the provided flights pass through (union across flights). The result is sorted by the stable TV row order used internally.
 
 **Request (JSON):**
 ```json

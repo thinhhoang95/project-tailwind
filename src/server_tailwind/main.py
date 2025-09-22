@@ -110,15 +110,15 @@ async def get_tv_count_with_capacity(traffic_volume_id: str, current_user: dict 
 async def post_common_traffic_volumes(request: Dict[str, Any], current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
     """
     Given a list of flight identifiers, return the list of unique traffic volumes
-    that all of these flights pass through (intersection across flights).
+    that any of these flights pass through (union across flights).
 
     Request JSON:
     - flight_ids: list[str] (required)
 
     Response JSON:
     - flight_ids: echoed normalized list
-    - traffic_volumes: list[str] of common TVs (sorted by stable TV row order)
-    - count: integer number of TVs in the intersection
+    - traffic_volumes: list[str] of TVs in the union (sorted by stable TV row order)
+    - count: integer number of TVs in the union
     - metadata: {time_bin_minutes, num_input_flights}
     """
     try:
@@ -354,6 +354,58 @@ async def original_counts(request: Dict[str, Any], current_user: dict = Depends(
             categories=categories if isinstance(categories, dict) else None,
             flight_ids=[str(x) for x in flight_ids] if isinstance(flight_ids, list) else None,
             include_overall=include_overall,
+            rank_by=rank_by,
+            rolling_hour=rolling_hour,
+        )
+        return result
+    except HTTPException:
+        raise
+    except ValueError as e:
+        msg = str(e)
+        if msg.startswith("Unknown traffic_volume_ids"):
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=400, detail=msg)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/original_flight_contrib_counts")
+async def original_flight_contrib_counts(request: Dict[str, Any], current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+    """
+    Compute per-TV rolling-hour counts over a time range, returning for the ranked top-50 TVs:
+      - total_counts: total occupancy across all flights
+      - flight_list_counts: occupancy attributed to the provided flight_ids
+      - capacity: per-bin capacity arrays
+
+    Request JSON:
+    - traffic_volume_ids: list[str] (optional). If provided, ranking still considers all TVs.
+    - from_time_str: str (optional; HHMM, HHMMSS, HH:MM, or HH:MM:SS)
+    - to_time_str: str (optional; same formats; required if from_time_str provided)
+    - flight_ids: list[str] (required)
+    - rank_by: str (optional; default "total_count"). Supported: "total_count", "total_excess".
+    - rolling_hour: bool (optional; default true)
+    """
+    try:
+        if not isinstance(request, dict):
+            raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+        tvs = request.get("traffic_volume_ids")
+        if tvs is not None and not isinstance(tvs, list):
+            raise HTTPException(status_code=400, detail="'traffic_volume_ids' must be a list when provided")
+
+        from_time_str = request.get("from_time_str")
+        to_time_str = request.get("to_time_str")
+        flight_ids = request.get("flight_ids")
+        if not isinstance(flight_ids, list) or len(flight_ids) == 0:
+            raise HTTPException(status_code=400, detail="'flight_ids' is required and must be a non-empty list")
+
+        rank_by = str(request.get("rank_by", "total_count"))
+        rolling_hour = bool(request.get("rolling_hour", True))
+
+        result = await count_wrapper.get_original_flight_contrib_counts(
+            traffic_volume_ids=[str(x) for x in tvs] if isinstance(tvs, list) else None,
+            from_time_str=str(from_time_str) if from_time_str is not None else None,
+            to_time_str=str(to_time_str) if to_time_str is not None else None,
+            flight_ids=[str(x) for x in flight_ids],
             rank_by=rank_by,
             rolling_hour=rolling_hour,
         )

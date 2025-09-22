@@ -260,13 +260,13 @@ class AirspaceAPIWrapper:
     
     async def get_common_traffic_volumes(self, flight_ids: List[str]) -> Dict[str, Any]:
         """
-        Return the intersection of traffic volume IDs visited by all provided flights.
+        Return the union of traffic volume IDs visited by the provided flights.
 
         Args:
             flight_ids: List of flight identifiers.
 
         Returns:
-            JSON object with the input flight IDs, the common traffic volume IDs (sorted by
+            JSON object with the input flight IDs, the union of traffic volume IDs (sorted by
             stable TV row order), and basic metadata.
         """
         self._ensure_evaluator_ready()
@@ -297,23 +297,14 @@ class AirspaceAPIWrapper:
             # Get unique TV index footprints per flight
             footprints = self._flight_list.get_footprints_for_flights(normalized_fids)
 
-            # Compute intersection of TV indices across flights
-            common_tv_indices: Optional[set] = None
+            # Compute union of TV indices across flights
+            union_tv_indices: set = set()
             for arr in footprints:
-                s = set(int(x) for x in arr.tolist())
-                if common_tv_indices is None:
-                    common_tv_indices = s
-                else:
-                    common_tv_indices &= s
-                if not common_tv_indices:
-                    break
+                union_tv_indices |= set(int(x) for x in arr.tolist())
 
-            if not common_tv_indices:
-                tv_ids_sorted: List[str] = []
-            else:
-                # Sort by stable TV row order (indices are row ids)
-                sorted_indices = sorted(common_tv_indices)
-                tv_ids_sorted = [self._flight_list.idx_to_tv_id.get(int(i), str(int(i))) for i in sorted_indices]
+            # Sort by stable TV row order (indices are row ids)
+            sorted_indices = sorted(union_tv_indices)
+            tv_ids_sorted: List[str] = [self._flight_list.idx_to_tv_id.get(int(i), str(int(i))) for i in sorted_indices]
 
             return {
                 "flight_ids": normalized_fids,
