@@ -153,6 +153,29 @@ class MCTSAgent:
             )
             candidates = self.inventory.to_candidate_payloads(descs)
 
+        # Print out all extracted flows (not logged to file) for manual inspection
+        try:
+            print("[agent] Hotspot flows extracted:")
+            for idx, cand in enumerate(candidates, 1):
+                tv = cand.get("control_volume_id")
+                wb = cand.get("window_bins") or []
+                try:
+                    t0, t1 = (int(wb[0]), int(wb[1]))
+                except Exception:
+                    t0, t1 = 0, 0
+                meta = cand.get("metadata") or {}
+                flow_to_flights = meta.get("flow_to_flights", {}) or {}
+                flows_sorted = sorted(flow_to_flights.items(), key=lambda kv: (-len(kv[1]), str(kv[0])))
+                print(f"  [{idx}] TV {tv} window [{t0},{t1}) • flows: {len(flows_sorted)}")
+                for fid, flights in flows_sorted:
+                    try:
+                        fl_ids = [str(x) for x in (flights or [])]
+                    except Exception:
+                        fl_ids = []
+                    print(f"     - flow {fid}: {len(fl_ids)} flights: {fl_ids}")
+        except Exception:
+            pass
+
         state = PlanState()
         state.metadata["hotspot_candidates"] = candidates
 
@@ -446,29 +469,56 @@ class MCTSAgent:
                     except Exception:
                         pass
                 # Flights-per-selected-flows summary (helps diagnose missed big flows)
+                # Unique flights (by flow_to_flights) vs entrants (per-bin crossings) diagnostics
                 n_flights_flows: Optional[int] = None
                 n_flights_flows_max: Optional[int] = None
                 max_flow_id: Optional[str] = None
+                n_entrants_flows: Optional[int] = None
+                n_entrants_flows_max: Optional[int] = None
+                entrants_max_flow_id: Optional[str] = None
                 try:
-                    ent_map = rf_info.get("entrants_by_flow", {}) if isinstance(rf_info, dict) else {}
-                    if isinstance(ent_map, dict):
-                        total = 0
-                        max_count = -1
-                        max_fid = None
+                    # Unique flights per selected flow from descriptor cache
+                    desc = self.inventory.get(str(ctrl), (int(wb[0]), int(wb[1])))
+                    meta = getattr(desc, "metadata", {}) if desc is not None else {}
+                    flow_to_flights = meta.get("flow_to_flights", {}) if isinstance(meta, dict) else {}
+                    if isinstance(flow_to_flights, dict) and flow_ids:
+                        unique_total_set: set[str] = set()
+                        unique_max = -1
+                        unique_max_fid: Optional[str] = None
                         for fid in flow_ids:
-                            c = int(ent_map.get(str(fid), 0))
-                            total += c
-                            if c > max_count:
-                                max_count = c
-                                max_fid = str(fid)
-                        n_flights_flows = int(total)
-                        if max_count >= 0:
-                            n_flights_flows_max = int(max_count)
-                            max_flow_id = max_fid
+                            fl_list = flow_to_flights.get(str(fid), []) or []
+                            # Deduplicate within a flow defensively
+                            uniq = {str(x) for x in fl_list}
+                            unique_total_set.update(uniq)
+                            size = len(uniq)
+                            if size > unique_max:
+                                unique_max = size
+                                unique_max_fid = str(fid)
+                        n_flights_flows = int(len(unique_total_set))
+                        if unique_max >= 0:
+                            n_flights_flows_max = int(unique_max)
+                            max_flow_id = unique_max_fid
                 except Exception:
-                    n_flights_flows = None
-                    n_flights_flows_max = None
-                    max_flow_id = None
+                    pass
+                try:
+                    # Entrants per-bin counts from rate_finder diagnostics
+                    ent_map = rf_info.get("entrants_by_flow", {}) if isinstance(rf_info, dict) else {}
+                    if isinstance(ent_map, dict) and flow_ids:
+                        entrants_total = 0
+                        entrants_max = -1
+                        entrants_max_fid = None
+                        for fid in flow_ids:
+                            count = int(ent_map.get(str(fid), 0))
+                            entrants_total += count
+                            if count > entrants_max:
+                                entrants_max = count
+                                entrants_max_fid = str(fid)
+                        n_entrants_flows = int(entrants_total)
+                        if entrants_max >= 0:
+                            n_entrants_flows_max = int(entrants_max)
+                            entrants_max_flow_id = entrants_max_fid
+                except Exception:
+                    pass
 
                 self.logger.event("after_commit", {
                     "reg": state.plan[-1].to_canonical_dict(),
@@ -482,6 +532,9 @@ class MCTSAgent:
                     "N_flights_flows": n_flights_flows,
                     "N_flights_flows_max": n_flights_flows_max,
                     "max_flow_id": max_flow_id,
+                    "N_entrants_flows": n_entrants_flows,
+                    "N_entrants_flows_max": n_entrants_flows_max,
+                    "entrants_max_flow_id": entrants_max_flow_id,
                 })
             if self.debug_logger is not None:
                 try:

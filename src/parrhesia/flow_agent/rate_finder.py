@@ -19,6 +19,8 @@ from parrhesia.optim.objective import (
     ObjectiveWeights,
     ScoreContext,
     build_score_context,
+)
+from .safespill_objective import (
     score_with_context,
     score_with_context_precomputed_occ,
 )
