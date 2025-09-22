@@ -80,6 +80,7 @@ def _build_params_table(
     occupancy_path: Path,
     indexer_path: Path,
     caps_path: Path,
+    early_stop_no_improvement: bool,
 ) -> Table:
     tbl = Table(title="MCTS Agent Parameters", box=box.SIMPLE)
     tbl.add_column("Component", style="cyan", no_wrap=True)
@@ -102,6 +103,8 @@ def _build_params_table(
     add_cfg_rows("MCTS", mcts_cfg)
     add_cfg_rows("RateFinder", rf_cfg)
     add_cfg_rows("Discovery", disc_cfg)
+    # Agent flags
+    tbl.add_row("Agent", "early_stop_no_improvement", str(early_stop_no_improvement))
     return tbl
 
 
@@ -207,14 +210,32 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Configure agent budgets small to keep runtime reasonable
     # Limit to a single regulation to shorten runtime and match the request
     mcts_cfg = MCTSConfig(
-        max_sims=128,
-        commit_depth=128,
-        commit_eval_limit=16,
-        max_actions=3072,
+        max_sims=512,
+        commit_depth=64,
+        commit_eval_limit=64,
+        max_actions=9216,
         seed=69420,
         debug_prints=False,
     )
-    rf_cfg = RateFinderConfig(use_adaptive_grid=True, max_eval_calls=4)
+    # Force full scorer for consistency investigation (can be toggled via env)
+    os.environ.setdefault("RATE_FINDER_FAST_SCORER", "0")
+    # Add warning panel about fast scorer being disabled
+    from rich.panel import Panel
+    
+    
+    rf_cfg = RateFinderConfig(use_adaptive_grid=True, max_eval_calls=4, fast_scorer_enabled=False) 
+
+    warning_panel = Panel(
+        "[yellow]⚠️  FAST_SCORER is disabled as it gives faulty results.[/yellow]\n"
+        "[dim]This is the correct behavior. Investigation into FAST_SCORER is required.[/dim]",
+        title="[bold red]WARNING[/bold red]",
+        border_style="red",
+        expand=False
+    )
+    console.print(warning_panel)
+    console.print()
+
+
     disc_cfg = HotspotDiscoveryConfig(
         threshold=0.0,
         top_hotspots=64,
@@ -223,6 +244,9 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         leiden_params={"threshold": 0.64, "resolution": 1.0, "seed": 0},
         direction_opts={"mode": "none"},
     )
+
+    # Agent-level flags
+    early_stop_no_improvement = False
 
     # Prepare Rich progress bar and callback
     prog = Progress(
@@ -378,6 +402,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         max_regulations=128,
         timer=timed,
         progress_cb=_on_progress,
+        early_stop_no_improvement=early_stop_no_improvement,
     )
 
     # Show parameter table once before starting
@@ -390,6 +415,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         occupancy_path=occupancy_path,
         indexer_path=indexer_path,
         caps_path=caps_path,
+        early_stop_no_improvement=early_stop_no_improvement,
     ))
 
     console.print("[runner] Starting agent.run() ...")

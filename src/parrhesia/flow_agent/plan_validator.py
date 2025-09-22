@@ -104,14 +104,40 @@ def validate_plan_payload(payload: Dict[str, Any]) -> List[CheckOutcome]:
     results.append(check_flows_and_rates(items))
     return results
 
-
 def print_validation_report(results: Iterable[CheckOutcome]) -> bool:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich import box
+    
+    console = Console()
     results_list = list(results)
     overall_ok = all(r.ok for r in results_list)
-    print(f"VALIDATION: {'OK' if overall_ok else 'FAILED'}")
+    
+    # Create a table for the validation results
+    table = Table(box=box.SIMPLE)
+    table.add_column("Check", style="cyan", no_wrap=True)
+    table.add_column("Status", justify="center", no_wrap=True)
+    table.add_column("Violations", justify="right", no_wrap=True)
+    table.add_column("Description", style="dim")
+    
     for r in results_list:
-        print(f"- {r.description}")
-        print(f"  Violations: {r.violations}/{r.total}")
+        status = "[green]✓ PASS[/green]" if r.ok else "[red]✗ FAIL[/red]"
+        violations = f"{r.violations}/{r.total}"
+        table.add_row(r.name, status, violations, r.description)
+    
+    # Create the panel
+    title_style = "[bold green]✓ VALIDATION PASSED[/bold green]" if overall_ok else "[bold red]✗ VALIDATION FAILED[/bold red]"
+    border_style = "green" if overall_ok else "red"
+    
+    panel = Panel(
+        table,
+        title=title_style,
+        border_style=border_style,
+        padding=(1, 1)
+    )
+    
+    console.print(panel)
     return overall_ok
 
 

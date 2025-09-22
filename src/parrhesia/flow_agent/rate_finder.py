@@ -411,6 +411,32 @@ class RateFinder:
         final_artifacts = final_result.artifacts
 
         elapsed = time.perf_counter() - start_ts
+        # Derive simple spill metrics from final artifacts
+        try:
+            T_final = int(self._indexer.num_time_bins)
+            nmap_final = final_artifacts.get("n", {}) if isinstance(final_artifacts, dict) else {}
+            final_spill_T = int(sum(int(np.asarray(v)[T_final]) for v in nmap_final.values())) if nmap_final else 0
+        except Exception:
+            final_spill_T = None
+        try:
+            T_final = int(self._indexer.num_time_bins)
+            nmap_final = final_artifacts.get("n", {}) if isinstance(final_artifacts, dict) else {}
+            final_inwin_total = int(sum(int(np.asarray(v)[:T_final].sum()) for v in nmap_final.values())) if nmap_final else 0
+        except Exception:
+            final_inwin_total = None
+
+        # Ensure delay maps are defined before using them in diagnostics
+        baseline_delays = (
+            dict(baseline_artifacts.get("delays_min", {}))
+            if isinstance(baseline_artifacts, dict)
+            else {}
+        )
+        final_delays = (
+            dict(final_artifacts.get("delays_min", {}))
+            if isinstance(final_artifacts, dict)
+            else {}
+        )
+
         diagnostics = {
             "mode": mode,
             "control_volume_id": control_volume_id,
@@ -429,9 +455,13 @@ class RateFinder:
             "per_flow_history": history_out,
             "timing_seconds": elapsed,
             "stopped_early": stopped_early,
+            "fast_scorer_enabled": bool(getattr(self.config, "fast_scorer_enabled", True)),
+            "final_spill_T": final_spill_T,
+            "final_in_window_releases": final_inwin_total,
+            # Small delay summaries
+            "final_nonzero_delay_count": int(sum(1 for v in final_delays.values() if int(v) > 0)) if isinstance(final_delays, dict) else None,
+            "final_max_delay_min": int(max((int(v) for v in final_delays.values()), default=0)) if isinstance(final_delays, dict) else None,
         }
-        baseline_delays = dict(baseline_artifacts.get("delays_min", {}))
-        final_delays = dict(final_artifacts.get("delays_min", {}))
         diagnostics["baseline_delays_size"] = len(baseline_delays)
         diagnostics["final_delays_min"] = final_delays
         diagnostics["aggregate_delays_size"] = len(final_delays)
@@ -670,6 +700,18 @@ class RateFinder:
             base_zero = np.asarray(context.base_occ_sched_zero_by_tv.get(str(tv_id), np.zeros(T, dtype=np.int64)), dtype=np.int64)
             occ_tv = base_all - base_zero + sched_sum
             occ_by_tv = {str(tv_id): occ_tv.astype(np.int64, copy=False)}
+
+            # Lightweight debug values: scheduled in-window vs overflow totals
+            overflow_total = None
+            inwin_total = None
+            try:
+                overflow_total = int(sum(int(np.asarray(v)[-1]) for v in schedule.values() if hasattr(v, "__len__")))
+            except Exception:
+                overflow_total = None
+            try:
+                inwin_total = int(sum(int(np.asarray(v)[:T].sum()) for v in schedule.values() if hasattr(v, "__len__")))
+            except Exception:
+                inwin_total = None
             with self._timed("rate_finder.score_with_context.candidate"):
                 objective, components, artifacts = score_with_context_precomputed_occ(
                     schedule,
@@ -679,6 +721,15 @@ class RateFinder:
                     context=context,
                     occ_by_tv=occ_by_tv,
                 )
+            # Attach fast scorer footprint into artifacts so callers can inspect
+            try:
+                enriched = dict(artifacts)
+                enriched["fast_scorer_used"] = True
+                enriched["fast_in_window_total"] = inwin_total
+                enriched["fast_overflow_total"] = overflow_total
+                artifacts = enriched
+            except Exception:
+                pass
         else:
             with self._timed("rate_finder.score_with_context.candidate"):
                 objective, components, artifacts = score_with_context(

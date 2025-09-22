@@ -58,6 +58,7 @@ class MCTSAgent:
         max_regulations: Optional[int] = None,
         timer: Optional[Callable[[str], ContextManager[Any]]] = None,
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+        early_stop_no_improvement: bool = False,
     ) -> None:
         self.evaluator = evaluator
         self.flight_list = flight_list
@@ -70,6 +71,7 @@ class MCTSAgent:
         self.max_regulations = None if max_regulations is None else int(max(0, max_regulations))
         self._timer_factory = timer
         self._progress_cb = progress_cb
+        self.early_stop_no_improvement = bool(early_stop_no_improvement)
 
         self.rate_finder = RateFinder(
             evaluator=evaluator,
@@ -399,7 +401,61 @@ class MCTSAgent:
             commits += 1
 
             if self.logger is not None:
-                self.logger.event("after_commit", {"reg": state.plan[-1].to_canonical_dict(), "delta_j": delta_j, "commits": commits})
+                # Enrich after_commit with candidate-level diagnostics if present
+                diag: Dict[str, Any] = {}
+                try:
+                    diag = dict(getattr(regulation, "diagnostics", {}) or {})
+                except Exception:
+                    diag = {}
+                rf_info = diag.get("rate_finder", {}) if isinstance(diag, dict) else {}
+                fin_comp = rf_info.get("final_components", {}) if isinstance(rf_info, dict) else {}
+                fin_obj = rf_info.get("final_objective", None)
+                # Candidate delay summary (count and max)
+                cand_nonzero_delays = None
+                cand_max_delay = None
+                try:
+                    fin_delays = rf_info.get("final_delays_min", {}) if isinstance(rf_info, dict) else {}
+                    if isinstance(fin_delays, dict) and fin_delays:
+                        vals = [int(v) for v in fin_delays.values()]
+                        cand_nonzero_delays = int(sum(1 for v in vals if v > 0))
+                        cand_max_delay = int(max(vals)) if vals else 0
+                except Exception:
+                    cand_nonzero_delays = None
+                    cand_max_delay = None
+                # Estimate candidate spill (sum of overflow bin T) if schedule present in artifacts
+                cand_spill: Optional[int] = None
+                try:
+                    arts = rf_info.get("final_artifacts", {}) if isinstance(rf_info, dict) else {}
+                    nmap = arts.get("n", {}) if isinstance(arts, dict) else {}
+                    if nmap:
+                        T_int = int(self.indexer.num_time_bins)
+                        total = 0
+                        for v in nmap.values():
+                            arr = np.asarray(v)
+                            if arr.size > T_int:
+                                total += int(arr[T_int])
+                        cand_spill = int(total)
+                except Exception:
+                    cand_spill = None
+                # Fallback to diagnostic aggregate if artifacts not included
+                if cand_spill is None:
+                    try:
+                        v = rf_info.get("final_spill_T")
+                        if isinstance(v, (int, float)):
+                            cand_spill = int(v)
+                    except Exception:
+                        pass
+
+                self.logger.event("after_commit", {
+                    "reg": state.plan[-1].to_canonical_dict(),
+                    "delta_j": delta_j,
+                    "commits": commits,
+                    "candidate_objective": fin_obj,
+                    "candidate_components": fin_comp,
+                    "candidate_spill_T": cand_spill,
+                    "candidate_nonzero_delay_count": cand_nonzero_delays,
+                    "candidate_max_delay_min": cand_max_delay,
+                })
             if self.debug_logger is not None:
                 try:
                     self.debug_logger.event(
@@ -414,7 +470,7 @@ class MCTSAgent:
                     pass
 
             # Optional early stop if no improvement
-            if delta_j >= 0.0:
+            if self.early_stop_no_improvement and delta_j >= 0.0:
                 if self.debug_logger is not None:
                     try:
                         self.debug_logger.event(
@@ -651,11 +707,25 @@ class MCTSAgent:
 
         objective, components, artifacts = score_with_context(n_f_t, flights_by_flow=flights_by_flow, capacities_by_tv=capacities_by_tv, flight_list=self.flight_list, context=context)
 
+        # Compute final plan spill and in-window release counts
+        try:
+            T_int = int(self.indexer.num_time_bins)
+            spill_T_val = int(sum(int(np.asarray(v)[T_int]) for v in artifacts.get("n", {}).values()))
+        except Exception:
+            spill_T_val = None  # type: ignore[assignment]
+        try:
+            T_int = int(self.indexer.num_time_bins)
+            inwin_total_val = int(sum(int(np.asarray(v)[:T_int].sum()) for v in artifacts.get("n", {}).values()))
+        except Exception:
+            inwin_total_val = None  # type: ignore[assignment]
+
         return {
             "objective": float(objective),
             "components": components,
             "artifacts": artifacts,
             "num_flows": len(flights_by_flow),
+            "spill_T": spill_T_val,
+            "in_window_releases": inwin_total_val,
         }
 
 

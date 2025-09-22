@@ -248,6 +248,12 @@ def score_with_context(
     if DEBUG_TIMING:
         time_end = time.time(); print(f"assign_delays_flowful(pre) time: {time_end - time_start} seconds")
 
+    # Quick audit: number of flights with non-zero delay
+    try:
+        nonzero_delays = sum(1 for v in delays_min.values() if int(v) > 0)
+    except Exception:
+        nonzero_delays = None  # type: ignore[assignment]
+
     # Occupancy only for TVs of interest
     if DEBUG_TIMING:
         time_start = time.time()
@@ -359,6 +365,7 @@ def score_with_context(
         "n": n_by_flow,
         "beta_gamma": context.beta_gamma_by_flow,
         "alpha": context.alpha_by_tv,
+        "nonzero_delay_count": nonzero_delays,
     }
 
     return float(J_total), components, artifacts
