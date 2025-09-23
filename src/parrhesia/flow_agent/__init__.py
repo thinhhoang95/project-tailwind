@@ -18,6 +18,11 @@ from .rate_finder import RateFinder, RateFinderConfig
 from .logging import SearchLogger
 from .hotspot_discovery import HotspotDiscoveryConfig, HotspotDescriptor, HotspotInventory
 from .agent import MCTSAgent
+from .plan_validator import (
+    validate_plan_file,
+    validate_plan_payload,
+    print_validation_report,
+)
 
 __all__ = [
     "PlanState",
@@ -42,4 +47,7 @@ __all__ = [
     "HotspotDescriptor",
     "HotspotInventory",
     "MCTSAgent",
+    "validate_plan_file",
+    "validate_plan_payload",
+    "print_validation_report",
 ]

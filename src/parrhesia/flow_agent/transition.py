@@ -108,15 +108,43 @@ class CheapTransition:
             guard_can_commit(next_state)
             context = next_state.hotspot_context
             assert context is not None
-            regulation = RegulationSpec(
-                control_volume_id=context.control_volume_id,
-                window_bins=context.window_bins,
-                flow_ids=context.selected_flow_ids,
-                mode=context.mode,
-                committed_rates=action.committed_rates,
-                diagnostics=dict(action.diagnostics),
-            )
-            next_state.plan.append(regulation)
+
+            rates = action.committed_rates
+            rates_to_store: Optional[object] = None
+            valid = False
+
+            if isinstance(rates, dict):
+                cleaned: Dict[str, int] = {}
+                for k, v in (rates or {}).items():
+                    try:
+                        iv = int(v)
+                    except Exception:
+                        iv = 0
+                    if iv > 0:
+                        cleaned[str(k)] = iv
+                if cleaned and context.selected_flow_ids:
+                    rates_to_store = cleaned
+                    valid = True
+            elif rates is not None:
+                try:
+                    iv = int(round(float(rates)))
+                except Exception:
+                    iv = 0
+                if iv > 0 and context.selected_flow_ids:
+                    rates_to_store = iv
+                    valid = True
+
+            if valid:
+                regulation = RegulationSpec(
+                    control_volume_id=context.control_volume_id,
+                    window_bins=context.window_bins,
+                    flow_ids=context.selected_flow_ids,
+                    mode=context.mode,
+                    committed_rates=rates_to_store,
+                    diagnostics=dict(action.diagnostics),
+                )
+                next_state.plan.append(regulation)
+
             next_state.reset_hotspot(next_stage="idle")
             next_state.metadata.pop("awaiting_commit", None)
             is_commit = True

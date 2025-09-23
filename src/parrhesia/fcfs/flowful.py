@@ -93,7 +93,7 @@ precision:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union, Literal
 from collections import deque
 import logging
 from math import ceil
@@ -104,6 +104,15 @@ from project_tailwind.optimize.eval.flight_list import _parse_naive_utc
 
 
 _BinIndex = int
+
+
+SpillMode = Literal[
+    "overflow_bin",
+    "one_per_spill_bin",
+    "defined_release_rate_for_spills",
+    "same_release_rate_for_spills",
+    "dump_to_next_bin",
+]
 
 
 def _to_len_T_plus_1_array(n_t: Union[Sequence[int], Mapping[int, int]], T: int) -> List[int]:
@@ -445,4 +454,10 @@ def assign_delays_flowful(
     return assign_delays_flowful_preparsed(flights_sorted, n_f_t, indexer)
 
 
-__all__ = ["assign_delays_flowful", "assign_delays_flowful_preparsed", "preprocess_flights_for_scheduler", "_normalize_flight_spec"]
+__all__ = [
+    "assign_delays_flowful",
+    "assign_delays_flowful_preparsed",
+    "preprocess_flights_for_scheduler",
+    "_normalize_flight_spec",
+    "SpillMode",
+]

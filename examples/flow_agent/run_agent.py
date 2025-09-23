@@ -58,7 +58,9 @@ from parrhesia.flow_agent import (
     RateFinderConfig,
     SearchLogger,
     HotspotDiscoveryConfig,
+    validate_plan_file,
 )
+from parrhesia.flow_agent.plan_export import save_plan_to_file
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.optimize.eval.flight_list import FlightList
 from project_tailwind.optimize.eval.network_evaluator import NetworkEvaluator
@@ -78,6 +80,7 @@ def _build_params_table(
     occupancy_path: Path,
     indexer_path: Path,
     caps_path: Path,
+    early_stop_no_improvement: bool,
 ) -> Table:
     tbl = Table(title="MCTS Agent Parameters", box=box.SIMPLE)
     tbl.add_column("Component", style="cyan", no_wrap=True)
@@ -100,6 +103,8 @@ def _build_params_table(
     add_cfg_rows("MCTS", mcts_cfg)
     add_cfg_rows("RateFinder", rf_cfg)
     add_cfg_rows("Discovery", disc_cfg)
+    # Agent flags
+    tbl.add_row("Agent", "early_stop_no_improvement", str(early_stop_no_improvement))
     return tbl
 
 
@@ -119,6 +124,63 @@ def print_last_debug_lines(log_path: Path | str, num_lines: int = 200) -> None:
             console.print("[dim](debug log is empty)[/dim]")
     except Exception as exc:
         console.print(f"[red]Failed to read debug log:[/red] {exc}")
+
+
+def validate_delay_granularity(log_path: Path | str) -> None:
+    """Validate that not all delay assignments are multiples of 15 minutes.
+
+    Fails the run if every delay in the final run_end.artifacts.delays_min is divisible by 15.
+    """
+    try:
+        p = Path(log_path)
+        if not p.exists():
+            console.print(f"[yellow]Validation skipped:[/yellow] run log not found: {p}")
+            return
+        last_run_end = None
+        with p.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "run_end":
+                    last_run_end = obj
+        if not last_run_end:
+            console.print("[yellow]Validation skipped:[/yellow] no run_end event found in log")
+            return
+        artifacts = last_run_end.get("artifacts") or {}
+        delays = artifacts.get("delays_min")
+        if not isinstance(delays, dict) or not delays:
+            console.print("[yellow]Validation skipped:[/yellow] delays_min artifact missing or empty")
+            return
+        minutes_list = []
+        for val in delays.values():
+            if isinstance(val, (int, float)):
+                m = int(val)
+                if m > 0:  # consider only positive delays as assignments
+                    minutes_list.append(m)
+        if not minutes_list:
+            console.print("[yellow]Validation skipped:[/yellow] no positive delay assignments found")
+            return
+        all_multiples_of_15 = all((m % 15 == 0) for m in minutes_list)
+        if all_multiples_of_15:
+            msg = "There should be at least one delay assignment not divisible by 15 (minutes)."
+            console.print(f"[red]Validation failed:[/red] all {len(minutes_list)} delays are multiples of 15. [dim]{msg}[/dim]")
+            # Fail the run
+            if os.environ.get("PYTEST_CURRENT_TEST"):
+                raise AssertionError(msg)
+            else:
+                raise SystemExit(2)
+        else:
+            non_15 = sum((m % 15 != 0) for m in minutes_list)
+            console.print(f"[green]Validation passed:[/green] found {non_15} delay(s) not divisible by 15.")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        console.print(f"[yellow]Validation error (ignored):[/yellow] {exc}")
 
 
 def initiate_agent(tmp_path: Path) -> Optional[tuple]:
@@ -195,29 +257,53 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Logger to tmp path
     log_dir = tmp_path / "runs"
     logger, loggerpath = SearchLogger.to_timestamped(str(log_dir))
-    debug_logger, debug_logger_path = SearchLogger.to_timestamped(str(log_dir), prefix="debug")
+    cold_logger, cold_logger_path = SearchLogger.to_timestamped(str(log_dir), prefix="cold")
+    # Debug logger intentionally disabled for this run (kept in codebase)
+    debug_logger = None
+    debug_logger_path = None
     console.print(f"[runner] Log path: {loggerpath}")
-    console.print(f"[runner] Debug log path: {debug_logger_path}")
+    console.print(f"[runner] Cold Feet log path: {cold_logger_path}")
 
     # Configure agent budgets small to keep runtime reasonable
     # Limit to a single regulation to shorten runtime and match the request
     mcts_cfg = MCTSConfig(
-        max_sims=128,
-        commit_depth=16,
-        commit_eval_limit=16,
-        max_actions=512,
+        max_sims=768,
+        commit_depth=1,
+        commit_eval_limit=96,
+        max_actions=16384,
         seed=69420,
         debug_prints=False,
     )
-    rf_cfg = RateFinderConfig(use_adaptive_grid=True, max_eval_calls=4)
+    # Force full scorer for consistency investigation (can be toggled via env)
+    os.environ.setdefault("RATE_FINDER_FAST_SCORER", "0")
+    # Add warning panel about fast scorer being disabled
+    from rich.panel import Panel
+    
+    
+    rf_cfg = RateFinderConfig(use_adaptive_grid=True, max_eval_calls=4, fast_scorer_enabled=False) 
+
+    warning_panel = Panel(
+        "[yellow]⚠️  FAST_SCORER is disabled as it gives faulty results.[/yellow]\n"
+        "[dim]This is the correct behavior. Investigation into FAST_SCORER is required.[/dim]",
+        title="[bold red]WARNING[/bold red]",
+        border_style="red",
+        expand=False
+    )
+    console.print(warning_panel)
+    console.print()
+
+
     disc_cfg = HotspotDiscoveryConfig(
         threshold=0.0,
-        top_hotspots=32,
-        top_flows=6,
+        top_hotspots=64,
+        top_flows=12,
         max_flights_per_flow=64,
         leiden_params={"threshold": 0.64, "resolution": 1.0, "seed": 0},
         direction_opts={"mode": "none"},
     )
+
+    # Agent-level flags
+    early_stop_no_improvement = False
 
     # Prepare Rich progress bar and callback
     prog = Progress(
@@ -244,6 +330,18 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Track total simulations attempted across all internal MCTS runs
     sim_counter: Dict[str, Any] = {"total": 0, "last_sd": 0, "init": False}
     live_holder: Dict[str, Any] = {"live": None}
+    # Track outer-loop status (commits/limits/stop monitoring)
+    outer_state: Dict[str, Any] = {
+        "outer_commits": 0,
+        "outer_commit_depth": int(mcts_cfg.commit_depth),
+        "outer_max_regulations": None,
+        "outer_limit": int(mcts_cfg.commit_depth),
+        "outer_early_stop_no_improvement": bool(early_stop_no_improvement),
+        "outer_stop_reason": None,
+        "outer_stop_info": None,
+        "outer_last_delta_j": None,
+        "outer_run_index": 1,
+    }
 
     def _sig_to_label(sig: Any) -> str:
         try:
@@ -298,51 +396,103 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             tbl.add_row("—", "0")
         return tbl
 
+    def _build_delta_table(payload: Dict[str, Any]) -> Table:
+        tbl = Table(title="ΔJ", box=box.SIMPLE_HEAVY)
+        tbl.add_column("Metric", style="green")
+        tbl.add_column("Value", justify="right")
+        best = payload.get("best_delta_j")
+        last = payload.get("last_delta_j")
+        best_s = f"{float(best):.3f}" if isinstance(best, (int, float)) else "—"
+        last_s = f"{float(last):.3f}" if isinstance(last, (int, float)) else "—"
+        tbl.add_row("Best ΔJ", best_s)
+        tbl.add_row("Latest ΔJ", last_s)
+        return tbl
+
+    def _build_outer_table(state: Dict[str, Any]) -> Table:
+        tbl = Table(title="Outer Loop", box=box.SIMPLE_HEAVY)
+        tbl.add_column("Metric", style="yellow")
+        tbl.add_column("Value", justify="right")
+        commits = state.get("outer_commits", 0) or 0
+        limit = state.get("outer_limit")
+        limit_s = (str(int(limit)) if isinstance(limit, (int, float)) else "?")
+        tbl.add_row("Commits", f"{int(commits)}/{limit_s}")
+        cd = state.get("outer_commit_depth")
+        tbl.add_row("Commit depth", (str(int(cd)) if isinstance(cd, (int, float)) else "?"))
+        mr = state.get("outer_max_regulations")
+        tbl.add_row("Max regulations", ("∞" if mr in (None, 0) else str(int(mr))))
+        eno = state.get("outer_early_stop_no_improvement")
+        tbl.add_row("Early stop if ΔJ≥0", ("true" if bool(eno) else "false"))
+        lcdj = state.get("outer_last_delta_j")
+        tbl.add_row("Last committed ΔJ", (f"{float(lcdj):.3f}" if isinstance(lcdj, (int, float)) else "—"))
+        sr = state.get("outer_stop_reason")
+        tbl.add_row("Stop reason", (str(sr) if sr else "—"))
+        si = state.get("outer_stop_info") or {}
+        if isinstance(si, dict) and si:
+            # show a compact one-line view
+            keys = list(si.keys())[:4]
+            compact = {k: si[k] for k in keys}
+            tbl.add_row("Stop info", str(compact))
+        else:
+            tbl.add_row("Stop info", "—")
+        return tbl
+
     def _compose_live() -> Group:
         return Group(
             prog,
+            _build_outer_table(outer_state),
+            _build_delta_table(last_payload),
             _build_root_table(last_payload),
             _build_actions_table(last_payload),
         )
 
     def _on_progress(payload: Dict[str, Any]) -> None:
-        sims_done = int(payload.get("sims_done", 0))
-        sims_total = int(payload.get("sims_total", 0)) or int(mcts_cfg.max_sims)
-        nodes = int(payload.get("nodes", 0))
-        best = payload.get("best_delta_j")
-        last = payload.get("last_delta_j")
-        evals = int(payload.get("commit_evals", 0))
-        actions_done = int(payload.get("actions_done", 0)) if isinstance(payload.get("actions_done", 0), (int, float)) else 0
-        action_budget = payload.get("max_actions")
-        action_budget_s = int(action_budget) if isinstance(action_budget, (int, float)) and action_budget not in (0, None) else (mcts_cfg.max_actions if getattr(mcts_cfg, "max_actions", None) not in (None, 0) else "∞")
-        best_s = f"{best:.3f}" if isinstance(best, (int, float)) else "—"
-        last_s = f"{last:.3f}" if isinstance(last, (int, float)) else "—"
-        # Accumulate simulations across runs. If sims_done resets (new run),
-        # only count the forward progress and ignore negative deltas.
-        if not sim_counter["init"]:
-            sim_counter["init"] = True
-            sim_counter["total"] += max(0, sims_done)
-            sim_counter["last_sd"] = sims_done
-        else:
-            delta = sims_done - int(sim_counter["last_sd"])
-            if delta >= 0:
-                sim_counter["total"] += delta
-            else:
-                # New run likely started (counter reset); add current as progress from 0
+        # Update inner-loop progress only when relevant keys are present
+        if "sims_done" in payload:
+            sims_done = int(payload.get("sims_done", 0))
+            sims_total = int(payload.get("sims_total", 0)) or int(mcts_cfg.max_sims)
+            nodes = int(payload.get("nodes", 0))
+            best = payload.get("best_delta_j")
+            last = payload.get("last_delta_j")
+            evals = int(payload.get("commit_evals", 0))
+            actions_done = int(payload.get("actions_done", 0)) if isinstance(payload.get("actions_done", 0), (int, float)) else 0
+            action_budget = payload.get("max_actions")
+            action_budget_s = int(action_budget) if isinstance(action_budget, (int, float)) and action_budget not in (0, None) else (mcts_cfg.max_actions if getattr(mcts_cfg, "max_actions", None) not in (None, 0) else "∞")
+            best_s = f"{best:.3f}" if isinstance(best, (int, float)) else "—"
+            last_s = f"{last:.3f}" if isinstance(last, (int, float)) else "—"
+            # Accumulate simulations across runs. If sims_done resets (new run),
+            # only count the forward progress and ignore negative deltas.
+            if not sim_counter["init"]:
+                sim_counter["init"] = True
                 sim_counter["total"] += max(0, sims_done)
-            sim_counter["last_sd"] = sims_done
-        prog.update(
-            task_id,
-            completed=sims_done,
-            total=max(sims_total, sims_done),
-            nodes=nodes,
-            best=best_s,
-            last=last_s,
-            evals=evals,
-            actions=actions_done,
-            action_budget=action_budget_s,
-        )
-        last_payload.clear(); last_payload.update(payload)
+                sim_counter["last_sd"] = sims_done
+            else:
+                delta = sims_done - int(sim_counter["last_sd"])
+                if delta >= 0:
+                    sim_counter["total"] += delta
+                else:
+                    # New run likely started (counter reset); add current as progress from 0
+                    sim_counter["total"] += max(0, sims_done)
+                sim_counter["last_sd"] = sims_done
+            prog.update(
+                task_id,
+                completed=sims_done,
+                total=max(sims_total, sims_done),
+                nodes=nodes,
+                best=best_s,
+                last=last_s,
+                evals=evals,
+                actions=actions_done,
+                action_budget=action_budget_s,
+            )
+            # Merge new inner-loop fields while preserving any outer-loop fields
+            last_payload.update(payload)
+
+        # Update outer-loop tracking if payload carries any outer_* fields
+        if any(k.startswith("outer_") for k in payload.keys()):
+            try:
+                outer_state.update({k: v for k, v in payload.items() if k.startswith("outer_")})
+            except Exception:
+                pass
         live = live_holder.get("live")
         if live is not None:
             live.update(_compose_live())
@@ -356,9 +506,11 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         discovery_cfg=disc_cfg,
         logger=logger,
         debug_logger=debug_logger,
-        max_regulations=24,
+        cold_logger=cold_logger,
+        max_regulations=128,
         timer=timed,
         progress_cb=_on_progress,
+        early_stop_no_improvement=early_stop_no_improvement,
     )
 
     # Show parameter table once before starting
@@ -371,6 +523,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         occupancy_path=occupancy_path,
         indexer_path=indexer_path,
         caps_path=caps_path,
+        early_stop_no_improvement=early_stop_no_improvement,
     ))
 
     console.print("[runner] Starting agent.run() ...")
@@ -380,7 +533,11 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             state, info = agent.run()
         live_holder["live"] = None
     logger.close()
-    debug_logger.close()
+    try:
+        if cold_logger is not None:
+            cold_logger.close()
+    except Exception:
+        pass
 
     # Final summary and quick checks (non-fatal)
     console.print(f"[runner] Commits: {info.commits}")
@@ -401,22 +558,65 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     except Exception:
         pass
     if info.summary:
-        console.print(f"[runner] Final objective: {info.summary.get('objective')}")
+        final_obj = info.summary.get("objective")
+        total_delta = info.total_delta_j
+        if isinstance(final_obj, (int, float)):
+            base_obj = final_obj - total_delta
+            console.print(f"[runner] Final objective: {base_obj:,.3f} → {final_obj:,.3f} (ΔJ: {total_delta:,.3f})")
+        else:
+            console.print(f"[runner] Final objective: {final_obj}")
     if info.log_path:
         console.print(f"[runner] Log path: {info.log_path}")
-    if info.debug_log_path:
-        console.print(f"[runner] Debug log path: {info.debug_log_path}")
-    # Print the last 200 lines from the debug log for quick visibility
-    try:
-        dbg_path = Path(info.debug_log_path) if getattr(info, "debug_log_path", None) else debug_logger_path
-        # print_last_debug_lines(dbg_path, 200)
-    except Exception:
-        pass
+    # Debug log is disabled for this run
     # Repeat the Action Counts table again for downstream quality-control parsing
     try:
         console.print(_build_actions_table(last_payload))
     except Exception:
         pass
+
+    # Persist best-found regulation plan (including per-flow rates) next to logs
+    try:
+        out_path = save_plan_to_file(state, info, indexer)
+        console.print(f"[runner] Plan exported: {out_path}")
+        try:
+            validate_plan_file(out_path)
+        except Exception as exc:
+            console.print(f"[yellow]Failed to validate plan:[/yellow] {exc}")
+    except Exception as exc:
+        console.print(f"[yellow]Failed to export plan:[/yellow] {exc}")
+
+    # Report Cold Feet stats: per-run max commits and overall max
+    try:
+        summary_dict = info.summary if isinstance(info.summary, dict) else {}
+        mc_list = summary_dict.get("max_commits_per_inner")
+        mc_overall = summary_dict.get("max_commits_overall")
+        cc_list = summary_dict.get("commit_calls_per_inner")
+        cc_total = summary_dict.get("commit_calls_total")
+
+        # Commit evaluations summary (less confusing, both per-run and total)
+        if isinstance(cc_list, list) and cc_list:
+            total_val = int(cc_total) if isinstance(cc_total, (int, float)) else int(sum(int(x) for x in cc_list))
+            console.print(f"[runner] Commit evaluations (per inner run): {cc_list} • total: {total_val}")
+        else:
+            console.print("[runner] Commit evaluations (per inner run): (none recorded)")
+
+        # Max commits achieved within a single simulation path (per inner run)
+        if isinstance(mc_list, list) and mc_list:
+            overall_val = int(mc_overall) if isinstance(mc_overall, (int, float)) else int(max(mc_list))
+            console.print(f"[runner] Max commits in any single path (per inner run): {mc_list} • overall: {overall_val}")
+        else:
+            console.print("[runner] Max commits in any single path (per inner run): (none recorded)")
+    except Exception:
+        pass
+    # Post-run validation: ensure at least one delay is not a multiple of 15 minutes
+    try:
+        run_log_path = getattr(info, "log_path", None) or loggerpath
+        if run_log_path:
+            validate_delay_granularity(run_log_path)
+    except (SystemExit, AssertionError):
+        raise
+    except Exception as exc:
+        console.print(f"[yellow]Delay granularity validation could not run:[/yellow] {exc}")
     return state, info
 
 if __name__ == '__main__':

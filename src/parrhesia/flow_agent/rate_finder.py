@@ -12,13 +12,52 @@ from typing import Any, Callable, ContextManager, Dict, Iterable, List, Mapping,
 import numpy as np
 
 from project_tailwind.optimize.eval.network_evaluator import NetworkEvaluator
-from project_tailwind.optimize.eval.flight_list import FlightList
+from project_tailwind.optimize.eval.flight_list import FlightList, _parse_naive_utc
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 
 from parrhesia.optim.objective import (
     ObjectiveWeights,
     ScoreContext,
     build_score_context,
+)
+
+
+def _coerce_to_datetime(value: Any) -> Optional[datetime]:
+    """Convert common timestamp representations to naive UTC datetimes."""
+
+    if isinstance(value, datetime):
+        return value
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        try:
+            return _parse_naive_utc(value)
+        except Exception:
+            return None
+
+    to_pydt = getattr(value, "to_pydatetime", None)
+    if callable(to_pydt):
+        try:
+            candidate = to_pydt()
+        except Exception:
+            candidate = None
+        if isinstance(candidate, datetime):
+            return candidate
+
+    try:
+        import numpy as _np  # type: ignore
+
+        if isinstance(value, _np.datetime64):
+            ts = value.astype("datetime64[ns]").astype("int64")
+            seconds, nanos = divmod(int(ts), 1_000_000_000)
+            dt = datetime.utcfromtimestamp(seconds)
+            return dt.replace(microsecond=nanos // 1000)
+    except Exception:
+        pass
+
+    return None
+from .safespill_objective import (
     score_with_context,
     score_with_context_precomputed_occ,
 )
@@ -260,6 +299,36 @@ class RateFinder:
                 tol = self.config.epsilon * max(1.0, abs(baseline_obj))
                 if pass_improvements[-1] <= tol or stopped_early:
                     break
+            tie_tol = max(1e-6, abs(best_delta) * 1e-6)
+            for flow_id in context_flow_ids:
+                current = float(best_rates.get(flow_id, math.inf))
+                if math.isfinite(current) and current > 0:
+                    continue
+                history = (history_out.get(flow_id) or {})
+                candidate_rate = None
+                candidate_delta = None
+                for rate_key, delta_val in history.items():
+                    try:
+                        rate_candidate = float(rate_key)
+                        delta_candidate = float(delta_val)
+                    except Exception:
+                        continue
+                    if not math.isfinite(rate_candidate) or rate_candidate <= 0:
+                        continue
+                    if delta_candidate > best_delta + tie_tol:
+                        continue
+                    if (
+                        candidate_delta is None
+                        or delta_candidate < candidate_delta - tie_tol
+                        or (
+                            abs(delta_candidate - candidate_delta) <= tie_tol
+                            and (candidate_rate is None or rate_candidate < candidate_rate)
+                        )
+                    ):
+                        candidate_delta = delta_candidate
+                        candidate_rate = rate_candidate
+                if candidate_rate is not None:
+                    best_rates[flow_id] = float(candidate_rate)
             rates_out: Union[int, Dict[str, float]] = {fid: float(best_rates[fid]) for fid in context_flow_ids}
             final_rates_map = {fid: float(best_rates[fid]) for fid in context_flow_ids}
         else:
@@ -313,6 +382,33 @@ class RateFinder:
                 tol = self.config.epsilon * max(1.0, abs(baseline_obj))
                 if pass_improvements[-1] <= tol or stopped_early:
                     break
+            tie_tol = max(1e-6, abs(best_delta) * 1e-6)
+            if not (math.isfinite(best_rate) and best_rate > 0):
+                candidate_rate = None
+                candidate_delta = None
+                history = history_out.get("__blanket__") or {}
+                for rate_key, delta_val in history.items():
+                    try:
+                        rate_candidate = float(rate_key)
+                        delta_candidate = float(delta_val)
+                    except Exception:
+                        continue
+                    if not math.isfinite(rate_candidate) or rate_candidate <= 0:
+                        continue
+                    if delta_candidate > best_delta + tie_tol:
+                        continue
+                    if (
+                        candidate_delta is None
+                        or delta_candidate < candidate_delta - tie_tol
+                        or (
+                            abs(delta_candidate - candidate_delta) <= tie_tol
+                            and (candidate_rate is None or rate_candidate < candidate_rate)
+                        )
+                    ):
+                        candidate_delta = delta_candidate
+                        candidate_rate = rate_candidate
+                if candidate_rate is not None:
+                    best_rate = float(candidate_rate)
             rates_out = float(best_rate)
             final_rates_map = {context_flow_ids[0]: float(best_rate)}
 
@@ -354,6 +450,32 @@ class RateFinder:
         final_artifacts = final_result.artifacts
 
         elapsed = time.perf_counter() - start_ts
+        # Derive simple spill metrics from final artifacts
+        try:
+            T_final = int(self._indexer.num_time_bins)
+            nmap_final = final_artifacts.get("n", {}) if isinstance(final_artifacts, dict) else {}
+            final_spill_T = int(sum(int(np.asarray(v)[T_final]) for v in nmap_final.values())) if nmap_final else 0
+        except Exception:
+            final_spill_T = None
+        try:
+            T_final = int(self._indexer.num_time_bins)
+            nmap_final = final_artifacts.get("n", {}) if isinstance(final_artifacts, dict) else {}
+            final_inwin_total = int(sum(int(np.asarray(v)[:T_final].sum()) for v in nmap_final.values())) if nmap_final else 0
+        except Exception:
+            final_inwin_total = None
+
+        # Ensure delay maps are defined before using them in diagnostics
+        baseline_delays = (
+            dict(baseline_artifacts.get("delays_min", {}))
+            if isinstance(baseline_artifacts, dict)
+            else {}
+        )
+        final_delays = (
+            dict(final_artifacts.get("delays_min", {}))
+            if isinstance(final_artifacts, dict)
+            else {}
+        )
+
         diagnostics = {
             "mode": mode,
             "control_volume_id": control_volume_id,
@@ -372,9 +494,13 @@ class RateFinder:
             "per_flow_history": history_out,
             "timing_seconds": elapsed,
             "stopped_early": stopped_early,
+            "fast_scorer_enabled": bool(getattr(self.config, "fast_scorer_enabled", True)),
+            "final_spill_T": final_spill_T,
+            "final_in_window_releases": final_inwin_total,
+            # Small delay summaries
+            "final_nonzero_delay_count": int(sum(1 for v in final_delays.values() if int(v) > 0)) if isinstance(final_delays, dict) else None,
+            "final_max_delay_min": int(max((int(v) for v in final_delays.values()), default=0)) if isinstance(final_delays, dict) else None,
         }
-        baseline_delays = dict(baseline_artifacts.get("delays_min", {}))
-        final_delays = dict(final_artifacts.get("delays_min", {}))
         diagnostics["baseline_delays_size"] = len(baseline_delays)
         diagnostics["final_delays_min"] = final_delays
         diagnostics["aggregate_delays_size"] = len(final_delays)
@@ -613,6 +739,18 @@ class RateFinder:
             base_zero = np.asarray(context.base_occ_sched_zero_by_tv.get(str(tv_id), np.zeros(T, dtype=np.int64)), dtype=np.int64)
             occ_tv = base_all - base_zero + sched_sum
             occ_by_tv = {str(tv_id): occ_tv.astype(np.int64, copy=False)}
+
+            # Lightweight debug values: scheduled in-window vs overflow totals
+            overflow_total = None
+            inwin_total = None
+            try:
+                overflow_total = int(sum(int(np.asarray(v)[-1]) for v in schedule.values() if hasattr(v, "__len__")))
+            except Exception:
+                overflow_total = None
+            try:
+                inwin_total = int(sum(int(np.asarray(v)[:T].sum()) for v in schedule.values() if hasattr(v, "__len__")))
+            except Exception:
+                inwin_total = None
             with self._timed("rate_finder.score_with_context.candidate"):
                 objective, components, artifacts = score_with_context_precomputed_occ(
                     schedule,
@@ -622,6 +760,15 @@ class RateFinder:
                     context=context,
                     occ_by_tv=occ_by_tv,
                 )
+            # Attach fast scorer footprint into artifacts so callers can inspect
+            try:
+                enriched = dict(artifacts)
+                enriched["fast_scorer_used"] = True
+                enriched["fast_in_window_total"] = inwin_total
+                enriched["fast_overflow_total"] = overflow_total
+                artifacts = enriched
+            except Exception:
+                pass
         else:
             with self._timed("rate_finder.score_with_context.candidate"):
                 objective, components, artifacts = score_with_context(
@@ -662,10 +809,7 @@ class RateFinder:
             aw_set = {int(b) for b in active_windows}
             for fid in allowed_fids:
                 meta = fm.get(str(fid)) or {}
-                takeoff = meta.get("takeoff_time")
-                if not isinstance(takeoff, datetime):
-                    # If we don't have a datetime, we still collect the time_idx without entry_dt
-                    takeoff = None
+                takeoff = _coerce_to_datetime(meta.get("takeoff_time"))
                 for iv in (meta.get("occupancy_intervals") or []):
                     try:
                         tvtw_idx = int(iv.get("tvtw_index"))
