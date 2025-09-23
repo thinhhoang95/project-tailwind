@@ -12,7 +12,7 @@ from typing import Any, Callable, ContextManager, Dict, Iterable, List, Mapping,
 import numpy as np
 
 from project_tailwind.optimize.eval.network_evaluator import NetworkEvaluator
-from project_tailwind.optimize.eval.flight_list import FlightList
+from project_tailwind.optimize.eval.flight_list import FlightList, _parse_naive_utc
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 
 from parrhesia.optim.objective import (
@@ -20,6 +20,43 @@ from parrhesia.optim.objective import (
     ScoreContext,
     build_score_context,
 )
+
+
+def _coerce_to_datetime(value: Any) -> Optional[datetime]:
+    """Convert common timestamp representations to naive UTC datetimes."""
+
+    if isinstance(value, datetime):
+        return value
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        try:
+            return _parse_naive_utc(value)
+        except Exception:
+            return None
+
+    to_pydt = getattr(value, "to_pydatetime", None)
+    if callable(to_pydt):
+        try:
+            candidate = to_pydt()
+        except Exception:
+            candidate = None
+        if isinstance(candidate, datetime):
+            return candidate
+
+    try:
+        import numpy as _np  # type: ignore
+
+        if isinstance(value, _np.datetime64):
+            ts = value.astype("datetime64[ns]").astype("int64")
+            seconds, nanos = divmod(int(ts), 1_000_000_000)
+            dt = datetime.utcfromtimestamp(seconds)
+            return dt.replace(microsecond=nanos // 1000)
+    except Exception:
+        pass
+
+    return None
 from .safespill_objective import (
     score_with_context,
     score_with_context_precomputed_occ,
@@ -772,10 +809,7 @@ class RateFinder:
             aw_set = {int(b) for b in active_windows}
             for fid in allowed_fids:
                 meta = fm.get(str(fid)) or {}
-                takeoff = meta.get("takeoff_time")
-                if not isinstance(takeoff, datetime):
-                    # If we don't have a datetime, we still collect the time_idx without entry_dt
-                    takeoff = None
+                takeoff = _coerce_to_datetime(meta.get("takeoff_time"))
                 for iv in (meta.get("occupancy_intervals") or []):
                     try:
                         tvtw_idx = int(iv.get("tvtw_index"))

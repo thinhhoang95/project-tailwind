@@ -126,6 +126,63 @@ def print_last_debug_lines(log_path: Path | str, num_lines: int = 200) -> None:
         console.print(f"[red]Failed to read debug log:[/red] {exc}")
 
 
+def validate_delay_granularity(log_path: Path | str) -> None:
+    """Validate that not all delay assignments are multiples of 15 minutes.
+
+    Fails the run if every delay in the final run_end.artifacts.delays_min is divisible by 15.
+    """
+    try:
+        p = Path(log_path)
+        if not p.exists():
+            console.print(f"[yellow]Validation skipped:[/yellow] run log not found: {p}")
+            return
+        last_run_end = None
+        with p.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "run_end":
+                    last_run_end = obj
+        if not last_run_end:
+            console.print("[yellow]Validation skipped:[/yellow] no run_end event found in log")
+            return
+        artifacts = last_run_end.get("artifacts") or {}
+        delays = artifacts.get("delays_min")
+        if not isinstance(delays, dict) or not delays:
+            console.print("[yellow]Validation skipped:[/yellow] delays_min artifact missing or empty")
+            return
+        minutes_list = []
+        for val in delays.values():
+            if isinstance(val, (int, float)):
+                m = int(val)
+                if m > 0:  # consider only positive delays as assignments
+                    minutes_list.append(m)
+        if not minutes_list:
+            console.print("[yellow]Validation skipped:[/yellow] no positive delay assignments found")
+            return
+        all_multiples_of_15 = all((m % 15 == 0) for m in minutes_list)
+        if all_multiples_of_15:
+            msg = "There should be at least one delay assignment not divisible by 15 (minutes)."
+            console.print(f"[red]Validation failed:[/red] all {len(minutes_list)} delays are multiples of 15. [dim]{msg}[/dim]")
+            # Fail the run
+            if os.environ.get("PYTEST_CURRENT_TEST"):
+                raise AssertionError(msg)
+            else:
+                raise SystemExit(2)
+        else:
+            non_15 = sum((m % 15 != 0) for m in minutes_list)
+            console.print(f"[green]Validation passed:[/green] found {non_15} delay(s) not divisible by 15.")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        console.print(f"[yellow]Validation error (ignored):[/yellow] {exc}")
+
+
 def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Locate required artifacts
     project_root = Path(__file__).resolve().parents[2]
@@ -210,10 +267,10 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Configure agent budgets small to keep runtime reasonable
     # Limit to a single regulation to shorten runtime and match the request
     mcts_cfg = MCTSConfig(
-        max_sims=512,
+        max_sims=768,
         commit_depth=1,
-        commit_eval_limit=64,
-        max_actions=9216,
+        commit_eval_limit=96,
+        max_actions=16384,
         seed=69420,
         debug_prints=False,
     )
@@ -239,7 +296,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     disc_cfg = HotspotDiscoveryConfig(
         threshold=0.0,
         top_hotspots=64,
-        top_flows=8,
+        top_flows=12,
         max_flights_per_flow=64,
         leiden_params={"threshold": 0.64, "resolution": 1.0, "seed": 0},
         direction_opts={"mode": "none"},
@@ -273,6 +330,18 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Track total simulations attempted across all internal MCTS runs
     sim_counter: Dict[str, Any] = {"total": 0, "last_sd": 0, "init": False}
     live_holder: Dict[str, Any] = {"live": None}
+    # Track outer-loop status (commits/limits/stop monitoring)
+    outer_state: Dict[str, Any] = {
+        "outer_commits": 0,
+        "outer_commit_depth": int(mcts_cfg.commit_depth),
+        "outer_max_regulations": None,
+        "outer_limit": int(mcts_cfg.commit_depth),
+        "outer_early_stop_no_improvement": bool(early_stop_no_improvement),
+        "outer_stop_reason": None,
+        "outer_stop_info": None,
+        "outer_last_delta_j": None,
+        "outer_run_index": 1,
+    }
 
     def _sig_to_label(sig: Any) -> str:
         try:
@@ -339,52 +408,91 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         tbl.add_row("Latest ΔJ", last_s)
         return tbl
 
+    def _build_outer_table(state: Dict[str, Any]) -> Table:
+        tbl = Table(title="Outer Loop", box=box.SIMPLE_HEAVY)
+        tbl.add_column("Metric", style="yellow")
+        tbl.add_column("Value", justify="right")
+        commits = state.get("outer_commits", 0) or 0
+        limit = state.get("outer_limit")
+        limit_s = (str(int(limit)) if isinstance(limit, (int, float)) else "?")
+        tbl.add_row("Commits", f"{int(commits)}/{limit_s}")
+        cd = state.get("outer_commit_depth")
+        tbl.add_row("Commit depth", (str(int(cd)) if isinstance(cd, (int, float)) else "?"))
+        mr = state.get("outer_max_regulations")
+        tbl.add_row("Max regulations", ("∞" if mr in (None, 0) else str(int(mr))))
+        eno = state.get("outer_early_stop_no_improvement")
+        tbl.add_row("Early stop if ΔJ≥0", ("true" if bool(eno) else "false"))
+        lcdj = state.get("outer_last_delta_j")
+        tbl.add_row("Last committed ΔJ", (f"{float(lcdj):.3f}" if isinstance(lcdj, (int, float)) else "—"))
+        sr = state.get("outer_stop_reason")
+        tbl.add_row("Stop reason", (str(sr) if sr else "—"))
+        si = state.get("outer_stop_info") or {}
+        if isinstance(si, dict) and si:
+            # show a compact one-line view
+            keys = list(si.keys())[:4]
+            compact = {k: si[k] for k in keys}
+            tbl.add_row("Stop info", str(compact))
+        else:
+            tbl.add_row("Stop info", "—")
+        return tbl
+
     def _compose_live() -> Group:
         return Group(
             prog,
+            _build_outer_table(outer_state),
             _build_delta_table(last_payload),
             _build_root_table(last_payload),
             _build_actions_table(last_payload),
         )
 
     def _on_progress(payload: Dict[str, Any]) -> None:
-        sims_done = int(payload.get("sims_done", 0))
-        sims_total = int(payload.get("sims_total", 0)) or int(mcts_cfg.max_sims)
-        nodes = int(payload.get("nodes", 0))
-        best = payload.get("best_delta_j")
-        last = payload.get("last_delta_j")
-        evals = int(payload.get("commit_evals", 0))
-        actions_done = int(payload.get("actions_done", 0)) if isinstance(payload.get("actions_done", 0), (int, float)) else 0
-        action_budget = payload.get("max_actions")
-        action_budget_s = int(action_budget) if isinstance(action_budget, (int, float)) and action_budget not in (0, None) else (mcts_cfg.max_actions if getattr(mcts_cfg, "max_actions", None) not in (None, 0) else "∞")
-        best_s = f"{best:.3f}" if isinstance(best, (int, float)) else "—"
-        last_s = f"{last:.3f}" if isinstance(last, (int, float)) else "—"
-        # Accumulate simulations across runs. If sims_done resets (new run),
-        # only count the forward progress and ignore negative deltas.
-        if not sim_counter["init"]:
-            sim_counter["init"] = True
-            sim_counter["total"] += max(0, sims_done)
-            sim_counter["last_sd"] = sims_done
-        else:
-            delta = sims_done - int(sim_counter["last_sd"])
-            if delta >= 0:
-                sim_counter["total"] += delta
-            else:
-                # New run likely started (counter reset); add current as progress from 0
+        # Update inner-loop progress only when relevant keys are present
+        if "sims_done" in payload:
+            sims_done = int(payload.get("sims_done", 0))
+            sims_total = int(payload.get("sims_total", 0)) or int(mcts_cfg.max_sims)
+            nodes = int(payload.get("nodes", 0))
+            best = payload.get("best_delta_j")
+            last = payload.get("last_delta_j")
+            evals = int(payload.get("commit_evals", 0))
+            actions_done = int(payload.get("actions_done", 0)) if isinstance(payload.get("actions_done", 0), (int, float)) else 0
+            action_budget = payload.get("max_actions")
+            action_budget_s = int(action_budget) if isinstance(action_budget, (int, float)) and action_budget not in (0, None) else (mcts_cfg.max_actions if getattr(mcts_cfg, "max_actions", None) not in (None, 0) else "∞")
+            best_s = f"{best:.3f}" if isinstance(best, (int, float)) else "—"
+            last_s = f"{last:.3f}" if isinstance(last, (int, float)) else "—"
+            # Accumulate simulations across runs. If sims_done resets (new run),
+            # only count the forward progress and ignore negative deltas.
+            if not sim_counter["init"]:
+                sim_counter["init"] = True
                 sim_counter["total"] += max(0, sims_done)
-            sim_counter["last_sd"] = sims_done
-        prog.update(
-            task_id,
-            completed=sims_done,
-            total=max(sims_total, sims_done),
-            nodes=nodes,
-            best=best_s,
-            last=last_s,
-            evals=evals,
-            actions=actions_done,
-            action_budget=action_budget_s,
-        )
-        last_payload.clear(); last_payload.update(payload)
+                sim_counter["last_sd"] = sims_done
+            else:
+                delta = sims_done - int(sim_counter["last_sd"])
+                if delta >= 0:
+                    sim_counter["total"] += delta
+                else:
+                    # New run likely started (counter reset); add current as progress from 0
+                    sim_counter["total"] += max(0, sims_done)
+                sim_counter["last_sd"] = sims_done
+            prog.update(
+                task_id,
+                completed=sims_done,
+                total=max(sims_total, sims_done),
+                nodes=nodes,
+                best=best_s,
+                last=last_s,
+                evals=evals,
+                actions=actions_done,
+                action_budget=action_budget_s,
+            )
+            # Merge new inner-loop fields while preserving any outer-loop fields
+            last_payload.update(payload)
+
+        # Update outer-loop tracking if payload carries any outer_* fields
+        if any(k.startswith("outer_") for k in payload.keys()):
+            try:
+                outer_state.update({k: v for k, v in payload.items() if k.startswith("outer_")})
+            except Exception:
+                pass
         live = live_holder.get("live")
         if live is not None:
             live.update(_compose_live())
@@ -500,6 +608,15 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             console.print("[runner] Max commits in any single path (per inner run): (none recorded)")
     except Exception:
         pass
+    # Post-run validation: ensure at least one delay is not a multiple of 15 minutes
+    try:
+        run_log_path = getattr(info, "log_path", None) or loggerpath
+        if run_log_path:
+            validate_delay_granularity(run_log_path)
+    except (SystemExit, AssertionError):
+        raise
+    except Exception as exc:
+        console.print(f"[yellow]Delay granularity validation could not run:[/yellow] {exc}")
     return state, info
 
 if __name__ == '__main__':

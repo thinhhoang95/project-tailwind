@@ -160,6 +160,7 @@ def main() -> int:
         ripple_cells=ripple_cells,
         flight_list=fl,
         weights=w,
+        spill_mode="dump_to_next_bin",
     )
 
     # Run 150 iterations to validate improvement
@@ -174,6 +175,7 @@ def main() -> int:
         target_cells=target_cells,
         ripple_cells=ripple_cells,
         weights=w,
+        spill_mode="dump_to_next_bin",
     )
 
     improvement = float(J0 - J)

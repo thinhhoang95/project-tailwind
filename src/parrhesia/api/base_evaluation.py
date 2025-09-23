@@ -377,6 +377,8 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
 
     # 6) Score baseline
     weights = ObjectiveWeights(**(payload.get("weights") or {}))
+    spill_mode = str(payload.get("spill_mode", "dump_to_next_bin") or "dump_to_next_bin")
+    release_rate_for_spills = payload.get("release_rate_for_spills")
     # Restrict scoring to TVs of interest (targets ∪ ripples) to align with /automatic_rate_adjustment
     tv_filter = set(target_tv_ids) | set(ripple_tv_ids)
     J, components, _arts = score(
@@ -389,6 +391,8 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
         flight_list=fl,
         weights=weights,
         tv_filter=tv_filter,
+        spill_mode=spill_mode,
+        release_rate_for_spills=release_rate_for_spills,
     )
 
     # 7) Assemble response

@@ -86,7 +86,19 @@ from datetime import datetime
 import numpy as np
 
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
-from ..fcfs.flowful import assign_delays_flowful, _normalize_flight_spec, preprocess_flights_for_scheduler, assign_delays_flowful_preparsed
+from ..fcfs.flowful import (
+    SpillMode,
+    assign_delays_flowful,
+    _normalize_flight_spec,
+    preprocess_flights_for_scheduler,
+    assign_delays_flowful_preparsed,
+)
+try:
+    import inspect as _inspect  # type: ignore
+
+    _ASSIGN_HAS_SPILL_ARGS = "spill_mode" in _inspect.signature(assign_delays_flowful_preparsed).parameters
+except Exception:  # pragma: no cover - defensive
+    _ASSIGN_HAS_SPILL_ARGS = False
 from .occupancy import compute_occupancy
 from .capacity import rolling_hour_sum
 # --------------------------------- Public API --------------------------------
@@ -231,6 +243,8 @@ def score_with_context(
     flight_list: Optional[object],
     context: ScoreContext,
     audit_exceedances: bool = False,
+    spill_mode: SpillMode = "overflow_bin",
+    release_rate_for_spills: Optional[Union[float, Mapping[Any, float]]] = None,
 ) -> Tuple[float, Dict[str, float], Dict[str, Any]]:
     # Use module-level DEBUG_TIMING; do not override here
     weights = context.weights
@@ -244,7 +258,22 @@ def score_with_context(
     import time
     if DEBUG_TIMING:
         time_start = time.time()
-    delays_min, realised_start = assign_delays_flowful_preparsed(context.flights_sorted_by_flow, n_by_flow, indexer)
+    if _ASSIGN_HAS_SPILL_ARGS:
+        delays_min, realised_start = assign_delays_flowful_preparsed(
+            context.flights_sorted_by_flow,
+            n_by_flow,
+            indexer,
+            spill_mode=spill_mode,
+            release_rate_for_spills=release_rate_for_spills,
+        )
+    else:
+        if spill_mode not in ("overflow_bin", "dump_to_next_bin") and release_rate_for_spills is not None:
+            raise NotImplementedError("Spill handling parameters are not supported by this assign_delays implementation")
+        delays_min, realised_start = assign_delays_flowful_preparsed(
+            context.flights_sorted_by_flow,
+            n_by_flow,
+            indexer,
+        )
     if DEBUG_TIMING:
         time_end = time.time(); print(f"assign_delays_flowful(pre) time: {time_end - time_start} seconds")
 
@@ -380,6 +409,8 @@ def score_with_context_precomputed_occ(
     context: ScoreContext,
     occ_by_tv: Mapping[str, np.ndarray],
     audit_exceedances: bool = False,
+    spill_mode: SpillMode = "overflow_bin",
+    release_rate_for_spills: Optional[Union[float, Mapping[Any, float]]] = None,
 ) -> Tuple[float, Dict[str, float], Dict[str, Any]]:
     """
     Fast scoring variant that skips occupancy recomputation and uses provided
@@ -400,7 +431,22 @@ def score_with_context_precomputed_occ(
     import time
     if DEBUG_TIMING:
         time_start = time.time()
-    delays_min, realised_start = assign_delays_flowful_preparsed(context.flights_sorted_by_flow, n_by_flow, indexer)
+    if _ASSIGN_HAS_SPILL_ARGS:
+        delays_min, realised_start = assign_delays_flowful_preparsed(
+            context.flights_sorted_by_flow,
+            n_by_flow,
+            indexer,
+            spill_mode=spill_mode,
+            release_rate_for_spills=release_rate_for_spills,
+        )
+    else:
+        if spill_mode not in ("overflow_bin", "dump_to_next_bin") and release_rate_for_spills is not None:
+            raise NotImplementedError("Spill handling parameters are not supported by this assign_delays implementation")
+        delays_min, realised_start = assign_delays_flowful_preparsed(
+            context.flights_sorted_by_flow,
+            n_by_flow,
+            indexer,
+        )
     if DEBUG_TIMING:
         time_end = time.time(); print(f"assign_delays_flowful(pre) time: {time_end - time_start} seconds")
 
@@ -1095,6 +1141,8 @@ def score(
     weights: Optional[ObjectiveWeights] = None,
     tv_filter: Optional[Iterable[str]] = None,
     audit_exceedances: bool = True,  # if true, print audit lines for each exceedance cell
+    spill_mode: SpillMode = "overflow_bin",
+    release_rate_for_spills: Optional[Union[float, Mapping[Any, float]]] = None,
 ) -> Tuple[float, Dict[str, float], Dict[str, Any]]:
     """
     Evaluate the objective J for a given per-flow schedule matrix n_f_t.
@@ -1124,6 +1172,13 @@ def score(
     tv_filter : Optional[Iterable[str]]
         Restrict occupancy and alpha weighting to these TVs. When None, uses
         TVs present in capacities_by_tv or in the cell sets.
+    spill_mode : SpillMode, optional
+        Strategy for distributing overflow beyond the active window. Defaults
+        to ``"overflow_bin"`` for backward compatibility.
+    release_rate_for_spills : float | Mapping[Any, float], optional
+        Flights-per-hour rate for spill releases. Required when
+        ``spill_mode="defined_release_rate_for_spills"``. Scalar applies to all
+        flows; a mapping may provide per-flow rates (with optional ``"default"``).
 
     Returns
     -------
@@ -1189,7 +1244,13 @@ def score(
     import time
     if DEBUG_TIMING:
         time_start = time.time()
-    delays_min, realised_start = assign_delays_flowful(flights_by_flow, n_by_flow, indexer)
+    delays_min, realised_start = assign_delays_flowful(
+        flights_by_flow,
+        n_by_flow,
+        indexer,
+        spill_mode=spill_mode,
+        release_rate_for_spills=release_rate_for_spills,
+    )
     if DEBUG_TIMING:
         time_end = time.time(); print(f"assign_delays_flowful time: {time_end - time_start} seconds")
 

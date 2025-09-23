@@ -330,6 +330,8 @@ def compute_automatic_rate_adjustment(payload: Mapping[str, Any]) -> Dict[str, A
 
     # 6) Baseline objective (n0)
     weights = ObjectiveWeights(**(payload.get("weights") or {}))
+    spill_mode = str(payload.get("spill_mode", "dump_to_next_bin") or "dump_to_next_bin")
+    release_rate_for_spills = payload.get("release_rate_for_spills")
     J0, comps0, _arts0 = score(
         n0,
         flights_by_flow=flights_by_flow,
@@ -340,6 +342,8 @@ def compute_automatic_rate_adjustment(payload: Mapping[str, Any]) -> Dict[str, A
         flight_list=fl,
         weights=weights,
         tv_filter=tv_filter,
+        spill_mode=spill_mode,
+        release_rate_for_spills=release_rate_for_spills,
     )
 
     # 7) Run simulated annealing to optimize
@@ -356,6 +360,8 @@ def compute_automatic_rate_adjustment(payload: Mapping[str, Any]) -> Dict[str, A
         weights=weights,
         params=params,
         tv_filter=tv_filter,
+        spill_mode=spill_mode,
+        release_rate_for_spills=release_rate_for_spills,
     )
 
     # 8) Post-optimization per-flow occupancy on target/ripple TVs

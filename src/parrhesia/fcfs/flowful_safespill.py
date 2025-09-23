@@ -23,9 +23,23 @@ The overflow bin t = T releases any remaining flights with
 so that flights whose r_i lies beyond the horizon (r_i ≥ t_end) incur zero
 delay and are carried as spill.
 
+Spill handling beyond the active window can be customised via ``spill_mode``:
+
+``"one_per_spill_bin"`` (default)
+    Place each remaining flight into consecutive bins starting at
+    ``last_active_bin + 1``.
+``"defined_release_rate_for_spills"``
+    Token-bucket release at a configured flights-per-hour rate.
+``"same_release_rate_for_spills"``
+    Token-bucket release at the mean per-bin capacity observed within the
+    active window.
+``"dump_to_next_bin"``
+    Release every remaining flight in the single bin immediately after the
+    active window.
+
 Inputs are intentionally flexible: each flight in `flights_by_flow` may carry
-either a concrete datetime for r_i, or a time‑bin index. Datetimes are
-preferred to compute within‑bin delays precisely; when only bin indices are
+either a concrete datetime for r_i, or a time-bin index. Datetimes are
+preferred to compute within-bin delays precisely; when only bin indices are
 available, delays are computed as multiples of the bin length (conservative).
 
 Expected shapes
@@ -93,7 +107,7 @@ precision:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, Union
 from collections import deque
 import logging
 from math import ceil
@@ -104,6 +118,55 @@ from project_tailwind.optimize.eval.flight_list import _parse_naive_utc
 
 
 _BinIndex = int
+
+
+def _coerce_to_datetime(value: Any) -> Optional[datetime]:
+    """Attempt to convert *value* into a timezone-naive ``datetime``.
+
+    Supports native ``datetime`` instances, ISO strings, objects exposing a
+    ``to_pydatetime`` method (e.g. pandas.Timestamp), and ``numpy.datetime64``
+    values. Returns ``None`` when conversion is not possible.
+    """
+
+    if isinstance(value, datetime):
+        return value
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        try:
+            return _parse_naive_utc(value)
+        except Exception:
+            return None
+
+    to_pydt = getattr(value, "to_pydatetime", None)
+    if callable(to_pydt):
+        try:
+            candidate = to_pydt()
+        except Exception:
+            candidate = None
+        if isinstance(candidate, datetime):
+            return candidate
+
+    try:  # Optional dependency: numpy
+        import numpy as _np  # type: ignore  # local import to avoid hard dependency
+
+        if isinstance(value, _np.datetime64):
+            ts_ns = value.astype("datetime64[ns]").astype("int64")
+            seconds, nanos = divmod(int(ts_ns), 1_000_000_000)
+            result = datetime.utcfromtimestamp(seconds)
+            return result.replace(microsecond=nanos // 1000)
+    except Exception:
+        # Either numpy is unavailable or conversion failed; fall through.
+        pass
+
+    return None
+SpillMode = Literal[
+    "one_per_spill_bin",
+    "defined_release_rate_for_spills",
+    "same_release_rate_for_spills",
+    "dump_to_next_bin",
+]
 
 
 def _to_len_T_plus_1_array(n_t: Union[Sequence[int], Mapping[int, int]], T: int) -> List[int]:
@@ -143,6 +206,176 @@ def _start_of_bin_for_date(dt: datetime, t: int, bin_minutes: int) -> datetime:
     return base + timedelta(minutes=t * bin_minutes)
 
 
+def _apply_assignment(
+    fid: str,
+    r_dt: Optional[datetime],
+    r_bin: int,
+    assigned_bin: int,
+    bin_minutes: int,
+    realised_start: Dict[str, object],
+    delays_min: Dict[str, int],
+) -> None:
+    r_dt_converted = _coerce_to_datetime(r_dt)
+    if isinstance(r_dt_converted, datetime):
+        start_of_bin_dt = _start_of_bin_for_date(r_dt_converted, assigned_bin, bin_minutes)
+        s_dt = r_dt_converted if r_dt_converted >= start_of_bin_dt else start_of_bin_dt
+        delay_seconds = max(0.0, (s_dt - r_dt_converted).total_seconds())
+        delay_minutes = int(ceil(delay_seconds / 60.0)) if delay_seconds > 0 else 0
+        realised_start[fid] = s_dt
+        delays_min[fid] = delay_minutes
+    else:
+        delay_minutes = max(0, (int(assigned_bin) - int(r_bin)) * bin_minutes)
+        realised_start[fid] = {"bin": int(assigned_bin)}
+        delays_min[fid] = int(delay_minutes)
+
+
+def _resolve_release_rate(
+    release_rate_for_spills: Optional[Union[float, Mapping[Any, float]]],
+    flow_id: Any,
+) -> Optional[float]:
+    if release_rate_for_spills is None:
+        return None
+    if isinstance(release_rate_for_spills, Mapping):
+        for key in (flow_id, str(flow_id)):
+            if key in release_rate_for_spills:
+                value = release_rate_for_spills[key]
+                if value is None:
+                    return None
+                try:
+                    return float(value)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Invalid release_rate_for_spills value for flow {flow_id!r}: {value!r}"
+                    ) from exc
+        for key in ("default", "DEFAULT"):
+            if key in release_rate_for_spills:
+                value = release_rate_for_spills[key]
+                if value is None:
+                    return None
+                try:
+                    return float(value)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Invalid default release_rate_for_spills value: {value!r}"
+                    ) from exc
+        return None
+    try:
+        return float(release_rate_for_spills)
+    except Exception as exc:
+        raise ValueError(
+            f"Invalid release_rate_for_spills scalar value: {release_rate_for_spills!r}"
+        ) from exc
+
+
+def _compute_mean_active_rate(schedule: Sequence[int]) -> Optional[float]:
+    if not schedule:
+        return None
+    T = len(schedule) - 1
+    first: Optional[int] = None
+    last: Optional[int] = None
+    for idx in range(T):
+        if float(schedule[idx]) > 0:
+            if first is None:
+                first = idx
+            last = idx
+    if first is None or last is None:
+        return None
+    total = 0.0
+    for idx in range(first, last + 1):
+        total += float(schedule[idx])
+    bins = (last - first + 1)
+    if bins <= 0:
+        return None
+    return total / bins
+
+
+def _token_bucket_assignments(
+    count: int,
+    spill_start: int,
+    tokens_per_bin: float,
+) -> List[int]:
+    if tokens_per_bin <= 0:
+        raise ValueError("tokens_per_bin must be positive")
+    assignments: List[int] = []
+    tokens = 0.0
+    bin_idx = int(spill_start)
+    while len(assignments) < count:
+        tokens += tokens_per_bin
+        release = int(tokens)
+        if release > 0:
+            release = min(release, count - len(assignments))
+            assignments.extend([bin_idx] * release)
+            tokens -= release
+        bin_idx += 1
+    return assignments
+
+
+def _assign_spill_flights(
+    flow_id: Any,
+    remaining: Sequence[Tuple[str, Optional[datetime], int]],
+    spill_start: int,
+    schedule: Sequence[int],
+    bin_minutes: int,
+    indexer: TVTWIndexer,
+    delays_min: Dict[str, int],
+    realised_start: Dict[str, object],
+    spill_mode: SpillMode,
+    release_rate_for_spills: Optional[Union[float, Mapping[Any, float]]],
+) -> None:
+    if not remaining:
+        return
+
+    del indexer  # unused but kept for signature compatibility
+
+    spill_start = int(spill_start)
+    if spill_start < 0:
+        spill_start = 0
+
+    mode: SpillMode = spill_mode or "one_per_spill_bin"
+    assigned_bins: List[int]
+
+    if mode == "dump_to_next_bin":
+        assigned_bins = [spill_start] * len(remaining)
+    elif mode == "one_per_spill_bin":
+        assigned_bins = [spill_start + i for i in range(len(remaining))]
+    elif mode == "defined_release_rate_for_spills":
+        rate = _resolve_release_rate(release_rate_for_spills, flow_id)
+        if rate is None:
+            raise ValueError(
+                f"spill_mode 'defined_release_rate_for_spills' requires release_rate_for_spills for flow {flow_id!r}"
+            )
+        if rate <= 0:
+            raise ValueError(
+                f"release_rate_for_spills must be positive for flow {flow_id!r}; got {rate}"
+            )
+        tokens_per_bin = rate * (bin_minutes / 60.0)
+        if tokens_per_bin <= 0:
+            raise ValueError(
+                f"Computed tokens_per_bin <= 0 for flow {flow_id!r}; check bin minutes {bin_minutes}"
+            )
+        assigned_bins = _token_bucket_assignments(len(remaining), spill_start, tokens_per_bin)
+    elif mode == "same_release_rate_for_spills":
+        tokens_per_bin_opt = _compute_mean_active_rate(schedule)
+        if tokens_per_bin_opt is None or tokens_per_bin_opt <= 0:
+            logging.warning(
+                "Flow %s: same_release_rate_for_spills requested but no active bins; falling back to one_per_spill_bin",
+                str(flow_id),
+            )
+            assigned_bins = [spill_start + i for i in range(len(remaining))]
+        else:
+            assigned_bins = _token_bucket_assignments(len(remaining), spill_start, tokens_per_bin_opt)
+    else:
+        logging.warning(
+            "Flow %s: unknown spill_mode %r; defaulting to one_per_spill_bin",
+            str(flow_id),
+            mode,
+        )
+        assigned_bins = [spill_start + i for i in range(len(remaining))]
+
+    for (fid, r_dt, r_bin), assigned_bin in zip(remaining, assigned_bins):
+        _apply_assignment(fid, r_dt, r_bin, int(assigned_bin), bin_minutes, realised_start, delays_min)
+
+
 def _normalize_flight_spec(
     spec: Any,
     indexer: TVTWIndexer,
@@ -177,13 +410,7 @@ def _normalize_flight_spec(
         fid = spec.get("flight_id") or spec.get("id") or spec.get("fid")
         # Try direct datetime
         r_dt_raw = spec.get("requested_dt") or spec.get("r_dt") or spec.get("scheduled_dt")
-        if isinstance(r_dt_raw, str):
-            try:
-                r_dt = _parse_naive_utc(r_dt_raw)
-            except Exception:
-                r_dt = None
-        elif isinstance(r_dt_raw, datetime):
-            r_dt = r_dt_raw
+        r_dt = _coerce_to_datetime(r_dt_raw)
         # Try bin index
         if r_dt is None:
             try:
@@ -194,7 +421,7 @@ def _normalize_flight_spec(
         if r_dt is None and ("takeoff_time" in spec and "entry_time_s" in spec):
             tko_raw = spec.get("takeoff_time")
             try:
-                tko = _parse_naive_utc(tko_raw) if isinstance(tko_raw, str) else tko_raw
+                tko = _coerce_to_datetime(tko_raw)
                 entry_s = float(spec.get("entry_time_s", 0.0))
                 if isinstance(tko, datetime):
                     r_dt = tko + timedelta(seconds=entry_s)
@@ -206,9 +433,10 @@ def _normalize_flight_spec(
     elif isinstance(spec, tuple) and len(spec) >= 2:
         fid = str(spec[0])
         second = spec[1]
-        if isinstance(second, datetime):
-            r_dt = second
-            r_bin = int(indexer.bin_of_datetime(second))
+        second_dt = _coerce_to_datetime(second)
+        if isinstance(second_dt, datetime):
+            r_dt = second_dt
+            r_bin = int(indexer.bin_of_datetime(second_dt))
         else:
             try:
                 # Could be bin index
@@ -216,7 +444,7 @@ def _normalize_flight_spec(
             except Exception:
                 # Or a takeoff time followed by entry_time_s
                 try:
-                    tko = second if isinstance(second, datetime) else _parse_naive_utc(str(second))
+                    tko = _coerce_to_datetime(second)
                     entry_s = float(spec[2]) if len(spec) >= 3 else 0.0
                     if isinstance(tko, datetime):
                         r_dt = tko + timedelta(seconds=entry_s)
@@ -271,9 +499,38 @@ def assign_delays_flowful_preparsed(
     flights_sorted_by_flow: Mapping[Any, Sequence[Tuple[str, Optional[datetime], int]]],
     n_f_t: Mapping[Any, Union[Sequence[int], Mapping[int, int]]],
     indexer: TVTWIndexer,
+    *,
+    spill_mode: SpillMode = "one_per_spill_bin",
+    release_rate_for_spills: Optional[Union[float, Mapping[Any, float]]] = None,
 ) -> Tuple[Dict[str, int], Dict[str, object]]:
     """
-    Variant of assign_delays_flowful that assumes flights are pre-normalized and sorted.
+    Variant of ``assign_delays_flowful`` for pre-normalized and sorted flights.
+
+    Parameters
+    ----------
+    flights_sorted_by_flow : Mapping[Any, Sequence[Tuple[str, Optional[datetime], int]]]
+        Flights per flow, already normalized via ``preprocess_flights_for_scheduler``.
+    n_f_t : Mapping[Any, Sequence[int] | Mapping[int, int]]
+        Per-flow integer schedule of length T+1 (overflow at index T).
+    indexer : TVTWIndexer
+        Provides bin configuration.
+    spill_mode : SpillMode, optional
+        Policy for allocating spill beyond the last scheduled bin. Defaults to
+        ``"one_per_spill_bin"`` for the legacy behaviour.
+    release_rate_for_spills : float | Mapping[Any, float], optional
+        Required when ``spill_mode="defined_release_rate_for_spills"``. Expressed
+        in flights per hour, may be scalar (all flows) or a per-flow mapping.
+
+    Spill Modes
+    -----------
+    ``"one_per_spill_bin"``
+        Assign flights to successive bins starting with ``spill_start``.
+    ``"defined_release_rate_for_spills"``
+        Token-bucket release outside the active window at the provided rate.
+    ``"same_release_rate_for_spills"``
+        Token-bucket release using the mean active-window capacity.
+    ``"dump_to_next_bin"``
+        Queue all remaining flights into ``spill_start`` while preserving FIFO.
     """
     T = int(indexer.num_time_bins)
     bin_minutes = _bin_len_minutes(indexer)
@@ -322,19 +579,7 @@ def assign_delays_flowful_preparsed(
 
             for _ in range(capacity):
                 fid, r_dt, r_bin = ready.popleft()
-                # Compute realised start and delay
-                if isinstance(r_dt, datetime):
-                    start_of_bin_dt = _start_of_bin_for_date(r_dt, t, bin_minutes)
-                    s_dt = r_dt if r_dt >= start_of_bin_dt else start_of_bin_dt
-                    delay_seconds = max(0.0, (s_dt - r_dt).total_seconds())
-                    delay_minutes = int(ceil(delay_seconds / 60.0)) if delay_seconds > 0 else 0
-                    realised_start[fid] = s_dt
-                    delays_min[fid] = delay_minutes
-                else:
-                    # Bin‑only information: delay in whole bins
-                    delay_minutes = max(0, (t - int(r_bin)) * bin_minutes)
-                    realised_start[fid] = {"bin": int(t)}
-                    delays_min[fid] = int(delay_minutes)
+                _apply_assignment(fid, r_dt, r_bin, t, bin_minutes, realised_start, delays_min)
 
         # Safe-spill: distribute remaining flights across successive bins
         # immediately after the last active in-window bin, instead of
@@ -368,21 +613,18 @@ def assign_delays_flowful_preparsed(
         # (last_active_bin + 1), allowing indices beyond T to represent
         # bins after the planning horizon.
         spill_start = int(last_active_bin + 1)
-        k = 0
-        for fid, r_dt, r_bin in remaining:
-            assigned_bin = spill_start + k
-            if isinstance(r_dt, datetime):
-                start_of_spill_bin = _start_of_bin_for_date(r_dt, assigned_bin, bin_minutes)
-                s_dt = r_dt if r_dt >= start_of_spill_bin else start_of_spill_bin
-                delay_seconds = max(0.0, (s_dt - r_dt).total_seconds())
-                delay_minutes = int(ceil(delay_seconds / 60.0)) if delay_seconds > 0 else 0
-                realised_start[fid] = s_dt
-                delays_min[fid] = delay_minutes
-            else:
-                delay_minutes = max(0, (int(assigned_bin) - int(r_bin)) * bin_minutes)
-                realised_start[fid] = {"bin": int(assigned_bin)}
-                delays_min[fid] = int(delay_minutes)
-            k += 1
+        _assign_spill_flights(
+            flow_id,
+            remaining,
+            spill_start,
+            schedule,
+            bin_minutes,
+            indexer,
+            delays_min,
+            realised_start,
+            spill_mode,
+            release_rate_for_spills,
+        )
 
         # Sanity: ensure we produced outputs for all flights in this flow
         produced = sum(1 for fid, _, _ in flights_norm if fid in delays_min)
@@ -399,6 +641,9 @@ def assign_delays_flowful(
     flights_by_flow: Mapping[Any, Sequence[Any]],
     n_f_t: Mapping[Any, Union[Sequence[int], Mapping[int, int]]],
     indexer: TVTWIndexer,
+    *,
+    spill_mode: SpillMode = "one_per_spill_bin",
+    release_rate_for_spills: Optional[Union[float, Mapping[Any, float]]] = None,
 ) -> Tuple[Dict[str, int], Dict[str, object]]:
     """
     Assign per‑flight delays and realised start times under per‑flow integer
@@ -416,6 +661,24 @@ def assign_delays_flowful(
         T = indexer.num_time_bins and index T denotes the overflow bin.
     indexer : TVTWIndexer
         Provider of time bin parameters (bin length and T).
+    spill_mode : SpillMode, optional
+        Strategy for releasing spill after the last active bin. Defaults to the
+        legacy behaviour ``"one_per_spill_bin"``.
+    release_rate_for_spills : float | Mapping[Any, float], optional
+        Flights-per-hour rate for spill releases. Required when
+        ``spill_mode="defined_release_rate_for_spills"``. Scalar applies to all
+        flows; a mapping may specify per-flow rates (with optional ``"default"``).
+
+    Spill Modes
+    -----------
+    ``"one_per_spill_bin"``
+        Assign flights to successive bins starting with ``spill_start``.
+    ``"defined_release_rate_for_spills"``
+        Token-bucket release outside the active window at the provided rate.
+    ``"same_release_rate_for_spills"``
+        Token-bucket release using the mean active-window capacity.
+    ``"dump_to_next_bin"``
+        Queue all remaining flights into ``spill_start`` while preserving FIFO.
 
     Returns
     -------
@@ -458,7 +721,13 @@ def assign_delays_flowful(
 
     # Normalize and sort once, then delegate to fast path
     flights_sorted = preprocess_flights_for_scheduler(flights_by_flow, indexer)
-    return assign_delays_flowful_preparsed(flights_sorted, n_f_t, indexer)
+    return assign_delays_flowful_preparsed(
+        flights_sorted,
+        n_f_t,
+        indexer,
+        spill_mode=spill_mode,
+        release_rate_for_spills=release_rate_for_spills,
+    )
 
 
 __all__ = ["assign_delays_flowful", "assign_delays_flowful_preparsed", "preprocess_flights_for_scheduler", "_normalize_flight_spec"]

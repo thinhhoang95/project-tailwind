@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Callable, ContextManager, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -20,8 +21,9 @@ from .hotspot_discovery import (
     HotspotDiscoveryConfig,
     HotspotInventory,
 )
-from parrhesia.optim.objective import ObjectiveWeights, build_score_context, score_with_context
 
+from parrhesia.optim.objective import ObjectiveWeights, build_score_context
+from parrhesia.flow_agent.safespill_objective import score_with_context
 
 @dataclass
 class RunInfo:
@@ -155,7 +157,7 @@ class MCTSAgent:
 
         # Print out all extracted flows (not logged to file) for manual inspection
         try:
-            print("[agent] Hotspot flows extracted:")
+            # print("[agent] Hotspot flows extracted:")
             for idx, cand in enumerate(candidates, 1):
                 tv = cand.get("control_volume_id")
                 wb = cand.get("window_bins") or []
@@ -166,13 +168,13 @@ class MCTSAgent:
                 meta = cand.get("metadata") or {}
                 flow_to_flights = meta.get("flow_to_flights", {}) or {}
                 flows_sorted = sorted(flow_to_flights.items(), key=lambda kv: (-len(kv[1]), str(kv[0])))
-                print(f"  [{idx}] TV {tv} window [{t0},{t1}) • flows: {len(flows_sorted)}")
+                # print(f"  [{idx}] TV {tv} window [{t0},{t1}) • flows: {len(flows_sorted)}")
                 for fid, flights in flows_sorted:
                     try:
                         fl_ids = [str(x) for x in (flights or [])]
                     except Exception:
                         fl_ids = []
-                    print(f"     - flow {fid}: {len(fl_ids)} flights: {fl_ids}")
+                    # print(f"     - flow {fid}: {len(fl_ids)} flights: {fl_ids}")
         except Exception:
             pass
 
@@ -221,6 +223,20 @@ class MCTSAgent:
         run_idx = 1
         max_commits_per_inner: List[int] = []
         commit_calls_per_inner: List[int] = []
+
+        # Publish initial outer-loop status to progress callback (if provided)
+        if self._progress_cb is not None:
+            try:
+                self._progress_cb({
+                    "outer_commits": int(commits),
+                    "outer_commit_depth": int(self.mcts_cfg.commit_depth),
+                    "outer_max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
+                    "outer_limit": int(limit),
+                    "outer_early_stop_no_improvement": bool(self.early_stop_no_improvement),
+                    "outer_run_index": int(run_idx),
+                })
+            except Exception:
+                pass
         for _ in range(max(1, limit)):
             # Ensure we are in idle to start a new regulation
             state.stage = "idle"
@@ -244,6 +260,19 @@ class MCTSAgent:
                             pass
                     outer_stop_reason = "no_commit_available"
                     outer_stop_info = {"status": "no_commit_evaluated", "exc_type": type(exc).__name__}
+                    if self._progress_cb is not None:
+                        try:
+                            self._progress_cb({
+                                "outer_stop_reason": "no_commit_available",
+                                "outer_stop_info": {"status": "no_commit_evaluated", "exc_type": type(exc).__name__},
+                                "outer_commits": int(commits),
+                                "outer_commit_depth": int(self.mcts_cfg.commit_depth),
+                                "outer_max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
+                                "outer_limit": int(limit),
+                                "outer_run_index": int(run_idx),
+                            })
+                        except Exception:
+                            pass
                     break
                 if self.logger is not None:
                     self.logger.event("mcts_error", {"error": message})
@@ -254,6 +283,19 @@ class MCTSAgent:
                         pass
                 outer_stop_reason = "mcts_error"
                 outer_stop_info = {"error": message, "exc_type": type(exc).__name__}
+                if self._progress_cb is not None:
+                    try:
+                        self._progress_cb({
+                            "outer_stop_reason": "mcts_error",
+                            "outer_stop_info": {"error": message, "exc_type": type(exc).__name__},
+                            "outer_commits": int(commits),
+                            "outer_commit_depth": int(self.mcts_cfg.commit_depth),
+                            "outer_max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
+                            "outer_limit": int(limit),
+                            "outer_run_index": int(run_idx),
+                        })
+                    except Exception:
+                        pass
                 break
 
             for k, v in mcts.action_counts.items():
@@ -303,6 +345,30 @@ class MCTSAgent:
             except Exception:
                 wb = (0, 1)
             mode = str(diag.get("mode", "per_flow"))
+            # Enrich diagnostics payload with rate menu bounds (lower/upper)
+            try:
+                orig_diag_payload: Dict[str, Any] = dict(commit_action.diagnostics or {})
+                rf_info_for_bounds: Dict[str, Any] = dict(orig_diag_payload.get("rate_finder", {}) or {})
+                grid_vals = rf_info_for_bounds.get("rate_grid", []) or []
+                finite_rates: List[float] = []
+                for val in grid_vals:
+                    try:
+                        fv = float(val)
+                    except Exception:
+                        continue
+                    if np.isinf(fv) or np.isnan(fv):
+                        continue
+                    if fv <= 0.0:
+                        continue
+                    finite_rates.append(fv)
+                rate_menu_lower = int(round(min(finite_rates))) if finite_rates else None
+                rate_menu_upper = int(round(max(finite_rates))) if finite_rates else None
+                rf_info_for_bounds["rate_menu_lower"] = rate_menu_lower
+                rf_info_for_bounds["rate_menu_upper"] = rate_menu_upper
+                diag_enriched_payload: Dict[str, Any] = dict(orig_diag_payload)
+                diag_enriched_payload["rate_finder"] = rf_info_for_bounds
+            except Exception:
+                diag_enriched_payload = dict(commit_action.diagnostics or {})
             # Flow ids for the regulation
             flow_ids: Tuple[str, ...]
             if isinstance(commit_action.committed_rates, dict):
@@ -372,7 +438,7 @@ class MCTSAgent:
                 flow_ids=flow_ids,
                 mode="per_flow" if mode == "per_flow" else "blanket",
                 committed_rates=rates_to_store,
-                diagnostics=dict(commit_action.diagnostics or {}),
+                diagnostics=diag_enriched_payload,
             )
 
             if any(
@@ -423,6 +489,21 @@ class MCTSAgent:
             total_delta_j += delta_j
             commits += 1
 
+            # After committing a regulation, publish updated outer-loop status
+            if self._progress_cb is not None:
+                try:
+                    self._progress_cb({
+                        "outer_commits": int(commits),
+                        "outer_commit_depth": int(self.mcts_cfg.commit_depth),
+                        "outer_max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
+                        "outer_limit": int(limit),
+                        "outer_last_delta_j": float(delta_j),
+                        "outer_early_stop_no_improvement": bool(self.early_stop_no_improvement),
+                        "outer_run_index": int(run_idx),
+                    })
+                except Exception:
+                    pass
+
             if self.logger is not None:
                 # Enrich after_commit with candidate-level diagnostics if present
                 diag: Dict[str, Any] = {}
@@ -433,6 +514,9 @@ class MCTSAgent:
                 rf_info = diag.get("rate_finder", {}) if isinstance(diag, dict) else {}
                 fin_comp = rf_info.get("final_components", {}) if isinstance(rf_info, dict) else {}
                 fin_obj = rf_info.get("final_objective", None)
+                # Rate menu bounds (lower/upper) captured from diagnostics for quick inspection
+                rate_menu_lower = rf_info.get("rate_menu_lower") if isinstance(rf_info, dict) else None
+                rate_menu_upper = rf_info.get("rate_menu_upper") if isinstance(rf_info, dict) else None
                 # Candidate delay summary (count and max)
                 cand_nonzero_delays = None
                 cand_max_delay = None
@@ -526,6 +610,8 @@ class MCTSAgent:
                     "commits": commits,
                     "candidate_objective": fin_obj,
                     "candidate_components": fin_comp,
+                    "candidate_rate_menu_lower": rate_menu_lower,
+                    "candidate_rate_menu_upper": rate_menu_upper,
                     "candidate_spill_T": cand_spill,
                     "candidate_nonzero_delay_count": cand_nonzero_delays,
                     "candidate_max_delay_min": cand_max_delay,
@@ -561,6 +647,21 @@ class MCTSAgent:
                         pass
                 outer_stop_reason = "no_improvement"
                 outer_stop_info = {"delta_j": float(delta_j), "commits": int(commits), "limit": int(limit)}
+                if self._progress_cb is not None:
+                    try:
+                        self._progress_cb({
+                            "outer_stop_reason": "no_improvement",
+                            "outer_stop_info": {"delta_j": float(delta_j), "commits": int(commits), "limit": int(limit)},
+                            "outer_commits": int(commits),
+                            "outer_commit_depth": int(self.mcts_cfg.commit_depth),
+                            "outer_max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
+                            "outer_limit": int(limit),
+                            "outer_last_delta_j": float(delta_j),
+                            "outer_early_stop_no_improvement": bool(self.early_stop_no_improvement),
+                            "outer_run_index": int(run_idx),
+                        })
+                    except Exception:
+                        pass
                 break
 
             run_idx += 1
@@ -591,6 +692,20 @@ class MCTSAgent:
             else:
                 final_stop_reason = "completed"
         final_stop_info = outer_stop_info or {}
+
+        # Publish final outer-loop termination status
+        if self._progress_cb is not None:
+            try:
+                self._progress_cb({
+                    "outer_stop_reason": final_stop_reason,
+                    "outer_stop_info": final_stop_info,
+                    "outer_commits": int(commits),
+                    "outer_commit_depth": int(self.mcts_cfg.commit_depth),
+                    "outer_max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
+                    "outer_limit": int(limit),
+                })
+            except Exception:
+                pass
 
         # Emit a consolidated outer-run termination record to the debug log
         if self.debug_logger is not None:
@@ -665,7 +780,7 @@ class MCTSAgent:
             out: Dict[str, List[Dict[str, Any]]] = {}
             iter_fn = getattr(self.flight_list, "iter_hotspot_crossings", None)
             if callable(iter_fn):
-                for fid, tv, _dt, t in iter_fn([comm_tv], active_windows={comm_tv: active}):  # type: ignore[misc]
+                for fid, tv, entry_dt, t in iter_fn([comm_tv], active_windows={comm_tv: active}):  # type: ignore[misc]
                     flow = reverse.get(str(fid))
                     if flow is None:
                         continue
@@ -673,7 +788,33 @@ class MCTSAgent:
                     # clamp and remap to [0, T]
                     rbin = max(0, min(T, rbin))
                     key = f"{flow_key_prefix}:{flow}"
-                    out.setdefault(key, []).append({"flight_id": str(fid), "requested_bin": rbin})
+                    spec = {"flight_id": str(fid), "requested_bin": rbin}
+                    if isinstance(entry_dt, datetime):
+                        spec["requested_dt"] = entry_dt
+                    else:
+                        meta = getattr(self.flight_list, "flight_metadata", {}).get(str(fid), {}) or {}
+                        takeoff = meta.get("takeoff_time")
+                        intervals = meta.get("occupancy_intervals") or []
+                        for iv in intervals:
+                            try:
+                                tvtw_idx = int(iv.get("tvtw_index"))
+                            except Exception:
+                                continue
+                            decoded = self.indexer.get_tvtw_from_index(tvtw_idx)
+                            if not decoded:
+                                continue
+                            tv_decoded, bin_idx = decoded
+                            if str(tv_decoded) != str(comm_tv) or int(bin_idx) != rbin:
+                                continue
+                            entry_s = iv.get("entry_time_s", 0)
+                            try:
+                                entry_s = float(entry_s)
+                            except Exception:
+                                entry_s = 0.0
+                            if isinstance(takeoff, datetime):
+                                spec["requested_dt"] = takeoff + timedelta(seconds=entry_s)
+                            break
+                    out.setdefault(key, []).append(spec)
             # Ensure keys exist even if no entrants (edge-case)
             for f in flow_to_flights.keys():
                 key = f"{flow_key_prefix}:{f}"
