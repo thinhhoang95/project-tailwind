@@ -46,7 +46,7 @@ from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from ..flows.flow_pipeline import collect_hotspot_flights
 from project_tailwind.optimize.eval.flight_list import FlightList
 from .objective import score, ObjectiveWeights, build_score_context, score_with_context
-from ..fcfs.flowful import _normalize_flight_spec, preprocess_flights_for_scheduler
+from ..fcfs.flowful import SpillMode, _normalize_flight_spec, preprocess_flights_for_scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -612,6 +612,8 @@ def run_sa(
     weights: Optional[ObjectiveWeights] = None,
     params: Optional[SAParams] = None,
     tv_filter: Optional[Iterable[str]] = None,
+    spill_mode: SpillMode = "overflow_bin",
+    release_rate_for_spills: Optional[Union[float, Mapping[Any, float]]] = None,
 ) -> Tuple[Dict[Any, np.ndarray], float, Dict[str, float], Dict[str, Any]]:
     """
     Execute a simulated annealing loop starting from n=d and return the best.
@@ -698,6 +700,8 @@ def run_sa(
         capacities_by_tv=capacities_by_tv,
         flight_list=flight_list,
         context=context,
+        spill_mode=spill_mode,
+        release_rate_for_spills=release_rate_for_spills,
     )
     n_best = {f: np.array(v, dtype=np.int64, copy=True) for f, v in n_by_flow.items()}
     if is_verbose:
@@ -754,6 +758,8 @@ def run_sa(
             capacities_by_tv=capacities_by_tv,
             flight_list=flight_list,
             context=context,
+            spill_mode=spill_mode,
+            release_rate_for_spills=release_rate_for_spills,
         )
         score_end = time.time()
         
@@ -797,6 +803,8 @@ def run_sa(
             capacities_by_tv=capacities_by_tv,
             flight_list=flight_list,
             context=context,
+            spill_mode=spill_mode,
+            release_rate_for_spills=release_rate_for_spills,
         )
         dJ = float(J_new - J_best)
         accept = dJ <= 0.0 or rng.random() < math.exp(-(max(dJ, 0.0)) / max(Tcur, 1e-9))

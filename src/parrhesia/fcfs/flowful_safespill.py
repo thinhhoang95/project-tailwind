@@ -118,6 +118,49 @@ from project_tailwind.optimize.eval.flight_list import _parse_naive_utc
 
 
 _BinIndex = int
+
+
+def _coerce_to_datetime(value: Any) -> Optional[datetime]:
+    """Attempt to convert *value* into a timezone-naive ``datetime``.
+
+    Supports native ``datetime`` instances, ISO strings, objects exposing a
+    ``to_pydatetime`` method (e.g. pandas.Timestamp), and ``numpy.datetime64``
+    values. Returns ``None`` when conversion is not possible.
+    """
+
+    if isinstance(value, datetime):
+        return value
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        try:
+            return _parse_naive_utc(value)
+        except Exception:
+            return None
+
+    to_pydt = getattr(value, "to_pydatetime", None)
+    if callable(to_pydt):
+        try:
+            candidate = to_pydt()
+        except Exception:
+            candidate = None
+        if isinstance(candidate, datetime):
+            return candidate
+
+    try:  # Optional dependency: numpy
+        import numpy as _np  # type: ignore  # local import to avoid hard dependency
+
+        if isinstance(value, _np.datetime64):
+            ts_ns = value.astype("datetime64[ns]").astype("int64")
+            seconds, nanos = divmod(int(ts_ns), 1_000_000_000)
+            result = datetime.utcfromtimestamp(seconds)
+            return result.replace(microsecond=nanos // 1000)
+    except Exception:
+        # Either numpy is unavailable or conversion failed; fall through.
+        pass
+
+    return None
 SpillMode = Literal[
     "one_per_spill_bin",
     "defined_release_rate_for_spills",
@@ -172,10 +215,11 @@ def _apply_assignment(
     realised_start: Dict[str, object],
     delays_min: Dict[str, int],
 ) -> None:
-    if isinstance(r_dt, datetime):
-        start_of_bin_dt = _start_of_bin_for_date(r_dt, assigned_bin, bin_minutes)
-        s_dt = r_dt if r_dt >= start_of_bin_dt else start_of_bin_dt
-        delay_seconds = max(0.0, (s_dt - r_dt).total_seconds())
+    r_dt_converted = _coerce_to_datetime(r_dt)
+    if isinstance(r_dt_converted, datetime):
+        start_of_bin_dt = _start_of_bin_for_date(r_dt_converted, assigned_bin, bin_minutes)
+        s_dt = r_dt_converted if r_dt_converted >= start_of_bin_dt else start_of_bin_dt
+        delay_seconds = max(0.0, (s_dt - r_dt_converted).total_seconds())
         delay_minutes = int(ceil(delay_seconds / 60.0)) if delay_seconds > 0 else 0
         realised_start[fid] = s_dt
         delays_min[fid] = delay_minutes
@@ -366,13 +410,7 @@ def _normalize_flight_spec(
         fid = spec.get("flight_id") or spec.get("id") or spec.get("fid")
         # Try direct datetime
         r_dt_raw = spec.get("requested_dt") or spec.get("r_dt") or spec.get("scheduled_dt")
-        if isinstance(r_dt_raw, str):
-            try:
-                r_dt = _parse_naive_utc(r_dt_raw)
-            except Exception:
-                r_dt = None
-        elif isinstance(r_dt_raw, datetime):
-            r_dt = r_dt_raw
+        r_dt = _coerce_to_datetime(r_dt_raw)
         # Try bin index
         if r_dt is None:
             try:
@@ -383,7 +421,7 @@ def _normalize_flight_spec(
         if r_dt is None and ("takeoff_time" in spec and "entry_time_s" in spec):
             tko_raw = spec.get("takeoff_time")
             try:
-                tko = _parse_naive_utc(tko_raw) if isinstance(tko_raw, str) else tko_raw
+                tko = _coerce_to_datetime(tko_raw)
                 entry_s = float(spec.get("entry_time_s", 0.0))
                 if isinstance(tko, datetime):
                     r_dt = tko + timedelta(seconds=entry_s)
@@ -395,9 +433,10 @@ def _normalize_flight_spec(
     elif isinstance(spec, tuple) and len(spec) >= 2:
         fid = str(spec[0])
         second = spec[1]
-        if isinstance(second, datetime):
-            r_dt = second
-            r_bin = int(indexer.bin_of_datetime(second))
+        second_dt = _coerce_to_datetime(second)
+        if isinstance(second_dt, datetime):
+            r_dt = second_dt
+            r_bin = int(indexer.bin_of_datetime(second_dt))
         else:
             try:
                 # Could be bin index
@@ -405,7 +444,7 @@ def _normalize_flight_spec(
             except Exception:
                 # Or a takeoff time followed by entry_time_s
                 try:
-                    tko = second if isinstance(second, datetime) else _parse_naive_utc(str(second))
+                    tko = _coerce_to_datetime(second)
                     entry_s = float(spec[2]) if len(spec) >= 3 else 0.0
                     if isinstance(tko, datetime):
                         r_dt = tko + timedelta(seconds=entry_s)

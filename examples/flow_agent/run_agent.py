@@ -126,6 +126,63 @@ def print_last_debug_lines(log_path: Path | str, num_lines: int = 200) -> None:
         console.print(f"[red]Failed to read debug log:[/red] {exc}")
 
 
+def validate_delay_granularity(log_path: Path | str) -> None:
+    """Validate that not all delay assignments are multiples of 15 minutes.
+
+    Fails the run if every delay in the final run_end.artifacts.delays_min is divisible by 15.
+    """
+    try:
+        p = Path(log_path)
+        if not p.exists():
+            console.print(f"[yellow]Validation skipped:[/yellow] run log not found: {p}")
+            return
+        last_run_end = None
+        with p.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "run_end":
+                    last_run_end = obj
+        if not last_run_end:
+            console.print("[yellow]Validation skipped:[/yellow] no run_end event found in log")
+            return
+        artifacts = last_run_end.get("artifacts") or {}
+        delays = artifacts.get("delays_min")
+        if not isinstance(delays, dict) or not delays:
+            console.print("[yellow]Validation skipped:[/yellow] delays_min artifact missing or empty")
+            return
+        minutes_list = []
+        for val in delays.values():
+            if isinstance(val, (int, float)):
+                m = int(val)
+                if m > 0:  # consider only positive delays as assignments
+                    minutes_list.append(m)
+        if not minutes_list:
+            console.print("[yellow]Validation skipped:[/yellow] no positive delay assignments found")
+            return
+        all_multiples_of_15 = all((m % 15 == 0) for m in minutes_list)
+        if all_multiples_of_15:
+            msg = "There should be at least one delay assignment not divisible by 15 (minutes)."
+            console.print(f"[red]Validation failed:[/red] all {len(minutes_list)} delays are multiples of 15. [dim]{msg}[/dim]")
+            # Fail the run
+            if os.environ.get("PYTEST_CURRENT_TEST"):
+                raise AssertionError(msg)
+            else:
+                raise SystemExit(2)
+        else:
+            non_15 = sum((m % 15 != 0) for m in minutes_list)
+            console.print(f"[green]Validation passed:[/green] found {non_15} delay(s) not divisible by 15.")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        console.print(f"[yellow]Validation error (ignored):[/yellow] {exc}")
+
+
 def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Locate required artifacts
     project_root = Path(__file__).resolve().parents[2]
@@ -551,6 +608,15 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             console.print("[runner] Max commits in any single path (per inner run): (none recorded)")
     except Exception:
         pass
+    # Post-run validation: ensure at least one delay is not a multiple of 15 minutes
+    try:
+        run_log_path = getattr(info, "log_path", None) or loggerpath
+        if run_log_path:
+            validate_delay_granularity(run_log_path)
+    except (SystemExit, AssertionError):
+        raise
+    except Exception as exc:
+        console.print(f"[yellow]Delay granularity validation could not run:[/yellow] {exc}")
     return state, info
 
 if __name__ == '__main__':

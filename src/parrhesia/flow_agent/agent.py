@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any, Callable, ContextManager, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -345,6 +344,30 @@ class MCTSAgent:
             except Exception:
                 wb = (0, 1)
             mode = str(diag.get("mode", "per_flow"))
+            # Enrich diagnostics payload with rate menu bounds (lower/upper)
+            try:
+                orig_diag_payload: Dict[str, Any] = dict(commit_action.diagnostics or {})
+                rf_info_for_bounds: Dict[str, Any] = dict(orig_diag_payload.get("rate_finder", {}) or {})
+                grid_vals = rf_info_for_bounds.get("rate_grid", []) or []
+                finite_rates: List[float] = []
+                for val in grid_vals:
+                    try:
+                        fv = float(val)
+                    except Exception:
+                        continue
+                    if np.isinf(fv) or np.isnan(fv):
+                        continue
+                    if fv <= 0.0:
+                        continue
+                    finite_rates.append(fv)
+                rate_menu_lower = int(round(min(finite_rates))) if finite_rates else None
+                rate_menu_upper = int(round(max(finite_rates))) if finite_rates else None
+                rf_info_for_bounds["rate_menu_lower"] = rate_menu_lower
+                rf_info_for_bounds["rate_menu_upper"] = rate_menu_upper
+                diag_enriched_payload: Dict[str, Any] = dict(orig_diag_payload)
+                diag_enriched_payload["rate_finder"] = rf_info_for_bounds
+            except Exception:
+                diag_enriched_payload = dict(commit_action.diagnostics or {})
             # Flow ids for the regulation
             flow_ids: Tuple[str, ...]
             if isinstance(commit_action.committed_rates, dict):
@@ -414,7 +437,7 @@ class MCTSAgent:
                 flow_ids=flow_ids,
                 mode="per_flow" if mode == "per_flow" else "blanket",
                 committed_rates=rates_to_store,
-                diagnostics=dict(commit_action.diagnostics or {}),
+                diagnostics=diag_enriched_payload,
             )
 
             if any(
@@ -490,6 +513,9 @@ class MCTSAgent:
                 rf_info = diag.get("rate_finder", {}) if isinstance(diag, dict) else {}
                 fin_comp = rf_info.get("final_components", {}) if isinstance(rf_info, dict) else {}
                 fin_obj = rf_info.get("final_objective", None)
+                # Rate menu bounds (lower/upper) captured from diagnostics for quick inspection
+                rate_menu_lower = rf_info.get("rate_menu_lower") if isinstance(rf_info, dict) else None
+                rate_menu_upper = rf_info.get("rate_menu_upper") if isinstance(rf_info, dict) else None
                 # Candidate delay summary (count and max)
                 cand_nonzero_delays = None
                 cand_max_delay = None
@@ -583,6 +609,8 @@ class MCTSAgent:
                     "commits": commits,
                     "candidate_objective": fin_obj,
                     "candidate_components": fin_comp,
+                    "candidate_rate_menu_lower": rate_menu_lower,
+                    "candidate_rate_menu_upper": rate_menu_upper,
                     "candidate_spill_T": cand_spill,
                     "candidate_nonzero_delay_count": cand_nonzero_delays,
                     "candidate_max_delay_min": cand_max_delay,
@@ -751,7 +779,7 @@ class MCTSAgent:
             out: Dict[str, List[Dict[str, Any]]] = {}
             iter_fn = getattr(self.flight_list, "iter_hotspot_crossings", None)
             if callable(iter_fn):
-                for fid, tv, entry_dt, t in iter_fn([comm_tv], active_windows={comm_tv: active}):  # type: ignore[misc]
+                for fid, tv, _dt, t in iter_fn([comm_tv], active_windows={comm_tv: active}):  # type: ignore[misc]
                     flow = reverse.get(str(fid))
                     if flow is None:
                         continue
@@ -759,10 +787,7 @@ class MCTSAgent:
                     # clamp and remap to [0, T]
                     rbin = max(0, min(T, rbin))
                     key = f"{flow_key_prefix}:{flow}"
-                    spec = {"flight_id": str(fid), "requested_bin": rbin}
-                    if isinstance(entry_dt, datetime):
-                        spec["requested_dt"] = entry_dt
-                    out.setdefault(key, []).append(spec)
+                    out.setdefault(key, []).append({"flight_id": str(fid), "requested_bin": rbin})
             # Ensure keys exist even if no entrants (edge-case)
             for f in flow_to_flights.keys():
                 key = f"{flow_key_prefix}:{f}"
