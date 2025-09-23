@@ -44,6 +44,40 @@ def _reg_key(item: Dict[str, Any]) -> Tuple[str, Tuple[int, int]]:
     return cv_id, (t0, t1)
 
 
+def check_unique_evals_from_plan(payload: Dict[str, Any]) -> CheckOutcome:
+    """Validate that enough unique RateFinder evaluations were performed.
+
+    Expects the plan JSON to include a top-level integer field `unique_evals`,
+    which should reflect the number of real RateFinder calls (not cached).
+    The check fails when unique_evals < 5.
+    """
+    try:
+        val = payload.get("unique_evals", None)
+        unique_evals = int(val) if isinstance(val, (int, float)) else None
+    except Exception:
+        unique_evals = None
+
+    if unique_evals is None:
+        return CheckOutcome(
+            name="unique_evals",
+            description=(
+                "Validation skipped: `unique_evals` not present in plan file."
+            ),
+            violations=0,
+            total=0,
+        )
+
+    violations = 1 if int(unique_evals) < 5 else 0
+    return CheckOutcome(
+        name="unique_evals",
+        description=(
+            "At least 5 unique RateFinder evaluations must occur. Low counts may indicate a bug preventing differentiation between regulations or other issues."
+        ),
+        violations=violations,
+        total=1,
+    )
+
+
 def check_no_duplicate_regulations(items: List[Dict[str, Any]]) -> CheckOutcome:
     seen: set[Tuple[str, Tuple[int, int]]] = set()
     violations = 0
@@ -102,7 +136,118 @@ def validate_plan_payload(payload: Dict[str, Any]) -> List[CheckOutcome]:
     results: List[CheckOutcome] = []
     results.append(check_no_duplicate_regulations(items))
     results.append(check_flows_and_rates(items))
+    # Include unique evals check if the plan payload carries this information
+    try:
+        results.append(check_unique_evals_from_plan(payload))
+    except Exception:
+        # Be resilient: if any unexpected structure, do not block other checks
+        pass
     return results
+
+
+def check_delay_granularity_from_run_log(log_path: str | Path) -> CheckOutcome:
+    """Ensure at least one positive delay assignment is not divisible by 15 minutes.
+
+    Reads the run JSONL log, finds the last run_end event, and inspects
+    artifacts.delays_min. The check passes if there exists at least one
+    positive delay value not divisible by 15.
+    """
+    minutes_list: List[int] = []
+    try:
+        p = Path(log_path)
+        if not p.exists():
+            return CheckOutcome(
+                name="delay_granularity",
+                description=(
+                    "Validation skipped: run log not found; expected at least one delay not divisible by 15 minutes."
+                ),
+                violations=0,
+                total=0,
+            )
+        last_run_end: Optional[Dict[str, Any]] = None
+        with p.open("r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if obj.get("type") == "run_end":
+                    last_run_end = obj
+        if not last_run_end:
+            return CheckOutcome(
+                name="delay_granularity",
+                description=(
+                    "Validation skipped: no run_end event found in log."
+                ),
+                violations=0,
+                total=0,
+            )
+        artifacts = last_run_end.get("artifacts") or {}
+        delays = artifacts.get("delays_min")
+        if not isinstance(delays, dict) or not delays:
+            return CheckOutcome(
+                name="delay_granularity",
+                description=(
+                    "Validation skipped: delays_min artifact missing or empty."
+                ),
+                violations=0,
+                total=0,
+            )
+        for val in delays.values():
+            if isinstance(val, (int, float)):
+                m = int(val)
+                if m > 0:
+                    minutes_list.append(m)
+        if not minutes_list:
+            return CheckOutcome(
+                name="delay_granularity",
+                description=(
+                    "Validation skipped: no positive delay assignments found."
+                ),
+                violations=0,
+                total=0,
+            )
+        all_multiples_of_15 = all((m % 15 == 0) for m in minutes_list)
+        # Single-violation aggregate check: 1/1 when all are multiples of 15, 0/1 otherwise
+        return CheckOutcome(
+            name="delay_granularity",
+            description=(
+                "At least one positive delay assignment must not be divisible by 15 minutes."
+            ),
+            violations=1 if all_multiples_of_15 else 0,
+            total=1,
+        )
+    except Exception:
+        # Do not hard-fail panel rendering; surface as skipped
+        return CheckOutcome(
+            name="delay_granularity",
+            description=(
+                "Validation error: unable to read or parse run log for delay checks."
+            ),
+            violations=0,
+            total=0,
+        )
+
+
+def validate_plan_with_run_payload(
+    payload: Dict[str, Any], *, run_log_path: str | Path | None = None
+) -> List[CheckOutcome]:
+    results = validate_plan_payload(payload)
+    if run_log_path is not None:
+        results.append(check_delay_granularity_from_run_log(run_log_path))
+    return results
+
+
+def validate_plan_and_run_file(
+    plan_path: str | Path, run_log_path: str | Path
+) -> tuple[bool, List[CheckOutcome]]:
+    payload = load_plan_json(plan_path)
+    results = validate_plan_with_run_payload(payload, run_log_path=run_log_path)
+    ok = print_validation_report(results)
+    return ok, results
 
 def print_validation_report(results: Iterable[CheckOutcome]) -> bool:
     from rich.console import Console
@@ -174,6 +319,10 @@ __all__ = [
     "validate_plan_payload",
     "print_validation_report",
     "validate_plan_file",
+    "check_delay_granularity_from_run_log",
+    "check_unique_evals_from_plan",
+    "validate_plan_with_run_payload",
+    "validate_plan_and_run_file",
 ]
 
 

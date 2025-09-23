@@ -22,6 +22,10 @@ from .plan_validator import (
     validate_plan_file,
     validate_plan_payload,
     print_validation_report,
+    check_delay_granularity_from_run_log,
+    check_unique_evals_from_plan,
+    validate_plan_with_run_payload,
+    validate_plan_and_run_file,
 )
 
 __all__ = [
@@ -50,4 +54,8 @@ __all__ = [
     "validate_plan_file",
     "validate_plan_payload",
     "print_validation_report",
+    "check_delay_granularity_from_run_log",
+    "check_unique_evals_from_plan",
+    "validate_plan_with_run_payload",
+    "validate_plan_and_run_file",
 ]

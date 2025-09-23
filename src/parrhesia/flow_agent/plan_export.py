@@ -129,6 +129,27 @@ def save_plan_to_file(
         seen_specs.add(spec_key)
         plan_items.append(item)
 
+    # Derive unique evals from the agent summary if available (commit_calls_total)
+    unique_evals_val = 0
+    try:
+        summary = getattr(info, "summary", {}) or {}
+        # Prefer explicit total when present
+        if isinstance(summary.get("commit_calls_total"), (int, float)):
+            unique_evals_val = int(summary.get("commit_calls_total"))
+        else:
+            # Fallback: sum per-inner list if provided
+            per_inner = summary.get("commit_calls_per_inner", []) or []
+            if isinstance(per_inner, list) and per_inner:
+                s = 0
+                for v in per_inner:
+                    try:
+                        s += int(v)
+                    except Exception:
+                        continue
+                unique_evals_val = int(s)
+    except Exception:
+        unique_evals_val = 0
+
     payload: Dict[str, Any] = {
         "objective": float((getattr(info, "summary", {}) or {}).get("objective", 0.0)),
         "commits": _safe_int(getattr(info, "commits", 0)),
@@ -138,6 +159,8 @@ def save_plan_to_file(
         "time_bin_minutes": _safe_int(getattr(indexer, "time_bin_minutes", 60)),
         "plan": plan_items,
     }
+
+    payload["unique_evals"] = int(unique_evals_val)
 
     with out_path.open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
