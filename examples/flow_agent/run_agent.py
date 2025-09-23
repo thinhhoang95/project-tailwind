@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -249,10 +250,10 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Configure agent budgets small to keep runtime reasonable
     # Limit to a single regulation to shorten runtime and match the request
     mcts_cfg = MCTSConfig(
-        max_sims=768,
-        commit_depth=1,
-        commit_eval_limit=96,
-        max_actions=16384,
+        max_sims=7680,
+        commit_depth=64,
+        commit_eval_limit=152,
+        max_actions=1e32,
         seed=69420,
         debug_prints=False,
     )
@@ -297,6 +298,12 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         TextColumn(" • nodes {task.fields[nodes]} • best ΔJ {task.fields[best]} • last ΔJ {task.fields[last]} • evals {task.fields[evals]} • acts {task.fields[actions]}/{task.fields[action_budget]}")
     )
 
+    initial_budget = getattr(mcts_cfg, "max_actions", None)
+    if isinstance(initial_budget, (int, float)) and initial_budget not in (None, 0):
+        initial_budget_field = str(int(initial_budget))
+    else:
+        initial_budget_field = "∞"
+
     task_id = prog.add_task(
         "search",
         total=int(mcts_cfg.max_sims),
@@ -305,7 +312,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         last="—",
         evals=0,
         actions=0,
-        action_budget=(mcts_cfg.max_actions if getattr(mcts_cfg, "max_actions", None) not in (None, 0) else "∞"),
+        action_budget=initial_budget_field,
     )
 
     last_payload: Dict[str, Any] = {}
@@ -316,7 +323,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     outer_state: Dict[str, Any] = {
         "outer_commits": 0,
         "outer_commit_depth": int(mcts_cfg.commit_depth),
-        "outer_max_regulations": None,
+        "outer_max_regulation_count": None,
         "outer_limit": int(mcts_cfg.commit_depth),
         "outer_early_stop_no_improvement": bool(early_stop_no_improvement),
         "outer_stop_reason": None,
@@ -351,20 +358,44 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             return str(sig)
 
     def _build_root_table(payload: Dict[str, Any]) -> Table:
-        tbl = Table(title="Root: Top Visits", box=box.SIMPLE_HEAVY)
+        tbl = Table(title="Root: Action Summary", box=box.SIMPLE_HEAVY)
         tbl.add_column("Action", style="cyan")
+        tbl.add_column("Stage", style="yellow")
+        tbl.add_column("Plan State", style="white")
         tbl.add_column("N", justify="right")
-        tbl.add_column("Q", justify="right")
-        tbl.add_column("P", justify="right")
-        rows = payload.get("root_top", []) or []
-        for item in rows:
-            try:
-                sig, n, q, p = item
-            except Exception:
-                continue
-            tbl.add_row(_sig_to_label(sig), str(int(n)), f"{float(q):.3f}", f"{float(p):.3f}")
-        if not rows:
-            tbl.add_row("—", "0", "0.000", "0.000")
+        tbl.add_column("avg Q", justify="right")
+        tbl.add_column("avg P", justify="right")
+        tbl.add_column("avg Reward", justify="right")
+        aggregated = payload.get("all_action_stats") or {}
+        rows = []
+        for stage, stage_data in aggregated.items():
+            for label, stats in stage_data.items():
+                rows.append(
+                    (
+                        label,
+                        str(stage),
+                        str(stats.get("plan_state", "—")),
+                        int(stats.get("N", 0)),
+                        float(stats.get("avg_q", 0.0)),
+                        float(stats.get("avg_prior", 0.0)),
+                        float(stats.get("avg_reward", 0.0)),
+                    )
+                )
+        rows.sort(key=lambda row: (-row[3], row[0]))
+        if rows:
+            for label, stage, plan_state, n, avg_q, avg_prior, avg_reward in rows:
+                tbl.add_row(
+                    label,
+                    stage,
+                    plan_state,
+                    str(n),
+                    f"{avg_q:.3f}",
+                    f"{avg_prior:.3f}",
+                    f"{avg_reward:.3f}",
+                )
+        else:
+            plan_state = str(payload.get("root_plan_state", "—"))
+            tbl.add_row("—", "?", plan_state, "0", "0.000", "0.000", "0.000")
         return tbl
 
     def _build_actions_table(payload: Dict[str, Any]) -> Table:
@@ -400,7 +431,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         tbl.add_row("Commits", f"{int(commits)}/{limit_s}")
         cd = state.get("outer_commit_depth")
         tbl.add_row("Commit depth", (str(int(cd)) if isinstance(cd, (int, float)) else "?"))
-        mr = state.get("outer_max_regulations")
+        mr = state.get("outer_max_regulation_count")
         tbl.add_row("Max regulations", ("∞" if mr in (None, 0) else str(int(mr))))
         eno = state.get("outer_early_stop_no_improvement")
         tbl.add_row("Early stop if ΔJ≥0", ("true" if bool(eno) else "false"))
@@ -421,7 +452,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     def _compose_live() -> Group:
         return Group(
             prog,
-            _build_outer_table(outer_state),
+            # _build_outer_table(outer_state),  # Temporarily hidden per request
             _build_delta_table(last_payload),
             _build_root_table(last_payload),
             _build_actions_table(last_payload),
@@ -436,9 +467,16 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             best = payload.get("best_delta_j")
             last = payload.get("last_delta_j")
             evals = int(payload.get("commit_evals", 0))
-            actions_done = int(payload.get("actions_done", 0)) if isinstance(payload.get("actions_done", 0), (int, float)) else 0
-            action_budget = payload.get("max_actions")
-            action_budget_s = int(action_budget) if isinstance(action_budget, (int, float)) and action_budget not in (0, None) else (mcts_cfg.max_actions if getattr(mcts_cfg, "max_actions", None) not in (None, 0) else "∞")
+            actions_raw = payload.get("actions_done", 0)
+            actions_done = int(actions_raw) if isinstance(actions_raw, (int, float)) else 0
+            budget_raw = payload.get("max_actions")
+            cfg_budget = getattr(mcts_cfg, "max_actions", None)
+            if isinstance(budget_raw, (int, float)) and budget_raw not in (0, None):
+                action_budget_s = str(int(budget_raw))
+            elif isinstance(cfg_budget, (int, float)) and cfg_budget not in (0, None):
+                action_budget_s = str(int(cfg_budget))
+            else:
+                action_budget_s = "∞"
             best_s = f"{best:.3f}" if isinstance(best, (int, float)) else "—"
             last_s = f"{last:.3f}" if isinstance(last, (int, float)) else "—"
             # Accumulate simulations across runs. If sims_done resets (new run),
@@ -489,7 +527,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         logger=logger,
         debug_logger=debug_logger,
         cold_logger=cold_logger,
-        max_regulations=128,
+        max_regulation_count=1,
         timer=timed,
         progress_cb=_on_progress,
         early_stop_no_improvement=early_stop_no_improvement,

@@ -38,23 +38,23 @@ class MCTSConfig:
     k1: float = 1.0
     widen_batch_size: int = 2
     # Budgets
-    commit_depth: int = 1
-    max_sims: int = 24
-    max_time_s: float = 20.0
-    commit_eval_limit: int = 3
+    commit_depth: int = 1 # controlled externally
+    max_sims: int = 36 # controlled externally
+    max_time_s: float = 300.0
+    commit_eval_limit: int = 3 # controlled externally
     # Global action budget across the search run. When set, the search stops
     # once this many low-level actions (selection, expansion, step, backup) are performed.
     # None or 0 disables this budget.
-    max_actions: Optional[int] = None
+    max_actions: Optional[int] = None # controlled externally
     # Priors
-    priors_temperature: float = 4.0
+    priors_temperature: float = 8.0 # higher = more uniform over the actions such as RemoveFlow, AddFlow, etc.
     root_dirichlet_epsilon: float = 0.25
     root_dirichlet_alpha: float = 0.3
     hotspot_dirichlet_epsilon: float = 0.3
-    hotspot_dirichlet_alpha: float = 0.5
+    hotspot_dirichlet_alpha: float = 0.4
     flow_dirichlet_epsilon: float = 0.3
     flow_dirichlet_alpha: float = 0.4
-    min_unique_commit_evals: int = 6
+    min_unique_commit_evals: int = 0
     # Shaping
     phi_scale: float = 1.0
     # RNG
@@ -119,6 +119,7 @@ class MCTS:
         self._best_commit: Optional[Tuple[CommitRegulation, float]] = None  # (action, deltaJ)
         self._timer_factory = timer
         self._action_counts: Dict[str, int] = {}
+        self._action_counts_by_stage: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._progress_cb = progress_cb
         self._last_delta_j: Optional[float] = None
         self._debug_logger = debug_logger
@@ -263,9 +264,58 @@ class MCTS:
     def action_counts(self) -> Dict[str, int]:
         return dict(self._action_counts)
 
-    def _record_action(self, action: Action) -> None:
-        key = type(action).__name__
+    def _record_action(
+        self,
+        state: PlanState,
+        action: Action,
+        *,
+        reward: float = 0.0,
+        q_value: float = 0.0,
+        prior: float = 0.0,
+        stage_key: Optional[str] = None,
+    ) -> None:
+        sig = self._signature_for_action(state, action)
+        label = self._sig_to_label(sig)
+        key = label
         self._action_counts[key] = self._action_counts.get(key, 0) + 1
+        stage = stage_key if stage_key is not None else getattr(state, "stage", "?")
+        stage_map = self._action_counts_by_stage.setdefault(stage, {})
+        entry = stage_map.setdefault(
+            key,
+            {
+                "label": key,
+                "signature": sig,
+                "action_type": type(action).__name__,
+                "stage": stage,
+                "plan_state": self._state_brief(state),
+                "N": 0,
+                "total_reward": 0.0,
+                "avg_reward": 0.0,
+                "total_q": 0.0,
+                "avg_q": 0.0,
+                "total_prior": 0.0,
+                "avg_prior": 0.0,
+                "min_q": float("inf"),
+                "max_q": float("-inf"),
+                "min_prior": float("inf"),
+                "max_prior": float("-inf"),
+                "min_reward": float("inf"),
+                "max_reward": float("-inf"),
+            },
+        )
+        entry["N"] += 1
+        entry["total_reward"] += float(reward)
+        entry["avg_reward"] = entry["total_reward"] / max(entry["N"], 1)
+        entry["total_q"] += float(q_value)
+        entry["avg_q"] = entry["total_q"] / max(entry["N"], 1)
+        entry["total_prior"] += float(prior)
+        entry["avg_prior"] = entry["total_prior"] / max(entry["N"], 1)
+        entry["min_q"] = min(entry["min_q"], float(q_value)) if math.isfinite(entry["min_q"]) else float(q_value)
+        entry["max_q"] = max(entry["max_q"], float(q_value)) if math.isfinite(entry["max_q"]) else float(q_value)
+        entry["min_prior"] = min(entry["min_prior"], float(prior)) if math.isfinite(entry["min_prior"]) else float(prior)
+        entry["max_prior"] = max(entry["max_prior"], float(prior)) if math.isfinite(entry["max_prior"]) else float(prior)
+        entry["min_reward"] = min(entry["min_reward"], float(reward)) if math.isfinite(entry["min_reward"]) else float(reward)
+        entry["max_reward"] = max(entry["max_reward"], float(reward)) if math.isfinite(entry["max_reward"]) else float(reward)
 
     def _inc_action(self, kind: str, *, sim_index: Optional[int] = None, step_index: Optional[int] = None) -> None:
         # Increment global low-level action counter and enforce budget if configured
@@ -286,6 +336,7 @@ class MCTS:
         self._commit_calls = 0
         self._best_commit = None
         self._action_counts.clear()
+        self._action_counts_by_stage.clear()
         self._last_delta_j = None
         self._max_commits_path = 0
         self._last_run_stats = {}
@@ -396,7 +447,7 @@ class MCTS:
                                 p = float(root_node.P.get(sig, 0.0))
                                 tmp.append((sig, int(est.N), float(est.Q), p))
                             tmp.sort(key=lambda x: (-x[1], -x[2]))
-                            root_top = tmp[:5]
+                            root_top = tmp
                         payload = {
                             "sims_done": i,
                             "sims_total": sims,
@@ -406,6 +457,8 @@ class MCTS:
                             "root_visits": (root_node.N if root_node is not None else 0),
                             "root_children": root_children,
                             "root_top": root_top,
+                            "root_plan_state": self._state_brief(root),
+                            "all_action_stats": self.get_action_stats(),
                             "commit_evals": self._commit_calls,
                             "best_delta_j": (self._best_commit[1] if self._best_commit is not None else None),
                             "last_delta_j": self._last_delta_j,
@@ -438,36 +491,38 @@ class MCTS:
             # Progress callback (best-effort, non-fatal)
             if self._progress_cb is not None:
                 try:
-                    root_key = root.canonical_key()
-                    root_node = self.nodes.get(root_key)
-                    root_children = 0
-                    root_top: List[Tuple] = []
-                    if root_node is not None:
-                        root_children = len(root_node.children)
-                        tmp: List[Tuple] = []
-                        for sig, est in root_node.edges.items():
-                            p = float(root_node.P.get(sig, 0.0))
-                            tmp.append((sig, int(est.N), float(est.Q), p))
-                        tmp.sort(key=lambda x: (-x[1], -x[2]))
-                        root_top = tmp[:5]
-                    payload = {
-                        "sims_done": i + 1,
-                        "sims_total": sims,
-                        "elapsed_s": now - t_start,
-                        "eta_s": max(0.0, t_end - now),
-                        "nodes": len(self.nodes),
-                        "root_visits": (root_node.N if root_node is not None else 0),
-                        "root_children": root_children,
-                        "root_top": root_top,
-                        "commit_evals": self._commit_calls,
-                        "best_delta_j": (self._best_commit[1] if self._best_commit is not None else None),
-                        "last_delta_j": self._last_delta_j,
-                        "last_return": float(last_ret),
-                        "action_counts": dict(self._action_counts),
-                        "actions_done": int(self._actions_done),
-                        "max_actions": int(self._action_budget) if self._action_budget is not None else None,
-                    }
-                    self._progress_cb(payload)
+                        root_key = root.canonical_key()
+                        root_node = self.nodes.get(root_key)
+                        root_children = 0
+                        root_top: List[Tuple] = []
+                        if root_node is not None:
+                            root_children = len(root_node.children)
+                            tmp: List[Tuple] = []
+                            for sig, est in root_node.edges.items():
+                                p = float(root_node.P.get(sig, 0.0))
+                                tmp.append((sig, int(est.N), float(est.Q), p))
+                            tmp.sort(key=lambda x: (-x[1], -x[2]))
+                            root_top = tmp
+                        payload = {
+                            "sims_done": i + 1,
+                            "sims_total": sims,
+                            "elapsed_s": now - t_start,
+                            "eta_s": max(0.0, t_end - now),
+                            "nodes": len(self.nodes),
+                            "root_visits": (root_node.N if root_node is not None else 0),
+                            "root_children": root_children,
+                            "root_top": root_top,
+                            "root_plan_state": self._state_brief(root),
+                            "all_action_stats": self.get_action_stats(),
+                            "commit_evals": self._commit_calls,
+                            "best_delta_j": (self._best_commit[1] if self._best_commit is not None else None),
+                            "last_delta_j": self._last_delta_j,
+                            "last_return": float(last_ret),
+                            "action_counts": dict(self._action_counts),
+                            "actions_done": int(self._actions_done),
+                            "max_actions": int(self._action_budget) if self._action_budget is not None else None,
+                        }
+                        self._progress_cb(payload)
                 except Exception:
                     pass
 
@@ -1083,7 +1138,7 @@ class MCTS:
                 if (not banned_commit) and (self._best_commit is None or delta_j < self._best_commit[1]):
                     self._best_commit = (commit_action, float(delta_j))
 
-            self._record_action(action)
+            state_before = state
 
             # Count environment/state transition as one action
             self._inc_action("step", sim_index=sim_index, step_index=step_index)
@@ -1096,6 +1151,14 @@ class MCTS:
             delta_phi = phi_sp - phi_s
             r_shaped = r_base + delta_phi
             total_return += r_shaped
+
+            self._record_action(
+                state_before,
+                action,
+                reward=float(r_shaped),
+                q_value=float(est_sel.Q),
+                prior=float(node.P.get(best_sig, 0.0)),
+            )
             self._dbg(
                 f"[MCTS/step] {type(action).__name__} commit={bool(is_commit)} term={bool(is_terminal)} r_base={float(r_base):.3f} Δphi={float(delta_phi):.3f} r={float(r_shaped):.3f} G={float(total_return):.3f} {self._state_brief(next_state)}"
             )
@@ -1870,6 +1933,19 @@ class MCTS:
                     print(f"[MCTS/backprop] value={v:.3f} path_len={len(path)} (no_root)")
             except Exception:
                 pass
+
+    def _build_action_stats(self) -> Dict[str, Dict[str, Any]]:
+        aggregated: Dict[str, Dict[str, Any]] = {}
+        for stage, actions in self._action_counts_by_stage.items():
+            for label, stats in actions.items():
+                key = f"{stage}:{label}"
+                record = dict(stats)
+                record["stage"] = stage
+                aggregated[key] = record
+        return aggregated
+
+    def get_action_stats(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        return {stage: {label: dict(stats) for label, stats in action_map.items()} for stage, action_map in self._action_counts_by_stage.items()}
 
 
 __all__ = ["MCTS", "MCTSConfig", "TreeNode", "EdgeStats"]
