@@ -133,20 +133,34 @@ def save_plan_to_file(
     unique_evals_val = 0
     try:
         summary = getattr(info, "summary", {}) or {}
-        # Prefer explicit total when present
-        if isinstance(summary.get("commit_calls_total"), (int, float)):
-            unique_evals_val = int(summary.get("commit_calls_total"))
+        # Prefer total rate-evaluation count when available (baseline + candidates)
+        rate_eval_total = summary.get("rate_eval_calls_total")
+        if isinstance(rate_eval_total, (int, float)):
+            unique_evals_val = int(rate_eval_total)
         else:
-            # Fallback: sum per-inner list if provided
-            per_inner = summary.get("commit_calls_per_inner", []) or []
-            if isinstance(per_inner, list) and per_inner:
-                s = 0
-                for v in per_inner:
+            per_inner_rate = summary.get("rate_eval_calls_per_inner", []) or []
+            if isinstance(per_inner_rate, list) and per_inner_rate:
+                s_rate = 0
+                for v in per_inner_rate:
                     try:
-                        s += int(v)
+                        s_rate += int(v)
                     except Exception:
                         continue
-                unique_evals_val = int(s)
+                if s_rate > 0:
+                    unique_evals_val = int(s_rate)
+        if unique_evals_val == 0:
+            if isinstance(summary.get("commit_calls_total"), (int, float)):
+                unique_evals_val = int(summary.get("commit_calls_total"))
+            else:
+                per_inner = summary.get("commit_calls_per_inner", []) or []
+                if isinstance(per_inner, list) and per_inner:
+                    s = 0
+                    for v in per_inner:
+                        try:
+                            s += int(v)
+                        except Exception:
+                            continue
+                    unique_evals_val = int(s)
     except Exception:
         unique_evals_val = 0
 

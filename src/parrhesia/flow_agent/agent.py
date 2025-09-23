@@ -223,6 +223,7 @@ class MCTSAgent:
         run_idx = 1
         max_commits_per_inner: List[int] = []
         commit_calls_per_inner: List[int] = []
+        rate_eval_calls_per_inner: List[int] = []
 
         # Publish initial outer-loop status to progress callback (if provided)
         if self._progress_cb is not None:
@@ -334,6 +335,19 @@ class MCTSAgent:
             # Extract improvement for bookkeeping
             info = (commit_action.diagnostics or {}).get("rate_finder", {})
             delta_j = float(info.get("delta_j", 0.0))
+            eval_total_for_run = 0
+            if isinstance(info, Mapping) and info:
+                if "rate_grid" in info or "baseline_objective" in info:
+                    eval_calls_val = info.get("eval_calls", 0)
+                    try:
+                        eval_total_for_run = int(eval_calls_val)
+                    except Exception:
+                        eval_total_for_run = 0
+                    if eval_total_for_run < 0:
+                        eval_total_for_run = 0
+                    # Count the baseline evaluation when RateFinder runs.
+                    eval_total_for_run += 1
+            rate_eval_calls_per_inner.append(eval_total_for_run)
 
             # Materialize regulation and append to plan without relying on stage guards
             # Extract details from diagnostics
@@ -737,6 +751,12 @@ class MCTSAgent:
             try:
                 final_summary["commit_calls_per_inner"] = list(commit_calls_per_inner)
                 final_summary["commit_calls_total"] = int(sum(commit_calls_per_inner))
+            except Exception:
+                pass
+        if rate_eval_calls_per_inner:
+            try:
+                final_summary["rate_eval_calls_per_inner"] = list(rate_eval_calls_per_inner)
+                final_summary["rate_eval_calls_total"] = int(sum(rate_eval_calls_per_inner))
             except Exception:
                 pass
 

@@ -241,9 +241,26 @@ class RateFinder:
         flow_count = len(context_flow_ids)
         eval_call_limit = min(int(self.config.max_eval_calls), int(flow_count) * (int(rate_grid_len) + 3))
 
+        best_result: _CandidateResult = _CandidateResult(
+            delta_j=0.0,
+            objective=float(baseline_obj),
+            components=baseline_components,
+            artifacts=baseline_artifacts,
+        )
+        best_signature: Optional[Tuple] = None
+        best_rates_snapshot: Optional[Dict[str, float]] = None
+
         if mode == "per_flow":
             best_rates: Dict[str, float] = {fid: math.inf for fid in context_flow_ids}
             history_out: Dict[str, Dict[str, float]] = {fid: {} for fid in context_flow_ids}
+            best_result = _CandidateResult(
+                delta_j=0.0,
+                objective=float(baseline_obj),
+                components=baseline_components,
+                artifacts=baseline_artifacts,
+            )
+            best_signature = None
+            best_rates_snapshot = None
 
             for _ in range(int(passes_to_use)):
                 prev_delta = best_delta
@@ -252,7 +269,9 @@ class RateFinder:
                         break
                     for rate in rate_grid:
                         rate_val = float(rate)
-                        rates_tuple = self._as_rate_tuple(best_rates, context_flow_ids, override=(flow_id, rate_val))
+                        candidate_rates = dict(best_rates)
+                        candidate_rates[flow_id] = rate_val
+                        rates_tuple = self._as_rate_tuple(candidate_rates, context_flow_ids)
                         signature = self._candidate_signature(
                             plan_key,
                             control_volume_id,
@@ -266,8 +285,6 @@ class RateFinder:
                             result = cached_result
                             cache_hits += 1
                         else:
-                            candidate_rates = dict(best_rates)
-                            candidate_rates[flow_id] = rate_val
                             with self._timed("rate_finder.build_schedule"):
                                 schedule = self._build_schedule_from_rates(
                                     rates_map=candidate_rates,
@@ -293,6 +310,13 @@ class RateFinder:
                             best_delta = result.delta_j
                             best_objective = result.objective
                             best_rates[flow_id] = rate_val
+                            best_result = result
+                            best_signature = signature
+                            best_rates_snapshot = {
+                                fid: float(candidate_rates.get(fid, math.inf)) for fid in context_flow_ids
+                            }
+                        if stopped_early:
+                            break
                     if stopped_early:
                         break
                 pass_improvements.append(prev_delta - best_delta)
@@ -329,15 +353,17 @@ class RateFinder:
                         candidate_rate = rate_candidate
                 if candidate_rate is not None:
                     best_rates[flow_id] = float(candidate_rate)
-            rates_out: Union[int, Dict[str, float]] = {fid: float(best_rates[fid]) for fid in context_flow_ids}
             final_rates_map = {fid: float(best_rates[fid]) for fid in context_flow_ids}
         else:
             history_out = {"__blanket__": {}}
             best_rate = math.inf
+            best_rates_snapshot = None
+
             for _ in range(int(passes_to_use)):
                 prev_delta = best_delta
                 for rate in rate_grid:
                     rate_val = float(rate)
+                    candidate_rates = {context_flow_ids[0]: rate_val}
                     rates_tuple = (rate_val,)
                     signature = self._candidate_signature(
                         plan_key,
@@ -352,7 +378,6 @@ class RateFinder:
                         result = cached_result
                         cache_hits += 1
                     else:
-                        candidate_rates = {context_flow_ids[0]: rate_val}
                         with self._timed("rate_finder.build_schedule"):
                             schedule = self._build_schedule_from_rates(
                                 rates_map=candidate_rates,
@@ -378,6 +403,13 @@ class RateFinder:
                         best_delta = result.delta_j
                         best_objective = result.objective
                         best_rate = rate_val
+                        best_result = result
+                        best_signature = signature
+                        best_rates_snapshot = {context_flow_ids[0]: float(rate_val)}
+                    if stopped_early:
+                        break
+                if stopped_early:
+                    break
                 pass_improvements.append(prev_delta - best_delta)
                 tol = self.config.epsilon * max(1.0, abs(baseline_obj))
                 if pass_improvements[-1] <= tol or stopped_early:
@@ -409,7 +441,6 @@ class RateFinder:
                         candidate_rate = rate_candidate
                 if candidate_rate is not None:
                     best_rate = float(candidate_rate)
-            rates_out = float(best_rate)
             final_rates_map = {context_flow_ids[0]: float(best_rate)}
 
         final_rates_tuple = self._as_rate_tuple(final_rates_map, context_flow_ids)
@@ -425,24 +456,52 @@ class RateFinder:
         if final_result is not None:
             cache_hits += 1
         else:
-            with self._timed("rate_finder.build_schedule"):
-                final_schedule = self._build_schedule_from_rates(
-                    rates_map=final_rates_map,
-                    context=context,
-                    active_bins=active_bins_sorted,
-                    bin_minutes=bin_minutes,
-                )
-            with self._timed("rate_finder.evaluate_candidate"):
-                final_result = self._evaluate_candidate(
-                    signature=final_signature,
-                    schedule=final_schedule,
-                    flights_by_flow=flights_by_flow,
-                    capacities_by_tv=capacities_by_tv,
-                    flight_list=self._base_flight_list,
-                    context=context,
-                    baseline_obj=baseline_obj,
-                )
-            eval_calls += 1
+            if eval_calls >= eval_call_limit:
+                stopped_early = True
+                if best_signature is not None and best_rates_snapshot is not None:
+                    final_signature = best_signature
+                    final_result = best_result
+                    final_rates_map = dict(best_rates_snapshot)
+                    final_rates_tuple = self._as_rate_tuple(final_rates_map, context_flow_ids)
+                else:
+                    final_result = best_result
+                    if best_rates_snapshot is not None:
+                        final_rates_map = dict(best_rates_snapshot)
+                    else:
+                        if mode == "per_flow":
+                            final_rates_map = {fid: math.inf for fid in context_flow_ids}
+                        else:
+                            final_rates_map = {context_flow_ids[0]: math.inf}
+                    final_rates_tuple = self._as_rate_tuple(final_rates_map, context_flow_ids)
+            else:
+                with self._timed("rate_finder.build_schedule"):
+                    final_schedule = self._build_schedule_from_rates(
+                        rates_map=final_rates_map,
+                        context=context,
+                        active_bins=active_bins_sorted,
+                        bin_minutes=bin_minutes,
+                    )
+                with self._timed("rate_finder.evaluate_candidate"):
+                    final_result = self._evaluate_candidate(
+                        signature=final_signature,
+                        schedule=final_schedule,
+                        flights_by_flow=flights_by_flow,
+                        capacities_by_tv=capacities_by_tv,
+                        flight_list=self._base_flight_list,
+                        context=context,
+                        baseline_obj=baseline_obj,
+                    )
+                eval_calls += 1
+                best_result = final_result
+                best_signature = final_signature
+                best_rates_snapshot = {
+                    fid: float(final_rates_map.get(fid, math.inf)) for fid in context_flow_ids
+                }
+
+        if mode == "per_flow":
+            rates_out = {fid: float(final_rates_map.get(fid, math.inf)) for fid in context_flow_ids}
+        else:
+            rates_out = float(final_rates_map.get(context_flow_ids[0], math.inf))
 
         best_delta = final_result.delta_j
         best_objective = final_result.objective
