@@ -96,6 +96,11 @@ Parameters for the MCTS search itself.
 -   `max_time_s: float`: Maximum time in seconds for a search.
 -   `commit_eval_limit: int`: A budget for how many times the expensive `RateFinder` can be called per search.
 -   `priors_temperature: float`: Controls the sharpness of the softmax for priors.
+    Higher default values (≈4.0) flatten the action distribution before applying exploration noise.
+-   `root_dirichlet_epsilon: float`, `root_dirichlet_alpha: float`: Amount of Dirichlet noise blended into root priors each search (defaults ≈0.25 and 0.3).
+-   `hotspot_dirichlet_epsilon: float`, `hotspot_dirichlet_alpha: float`: Similar noise applied to the first hotspot-selection node (defaults ≈0.3 and 0.5).
+-   `flow_dirichlet_epsilon: float`, `flow_dirichlet_alpha: float`: Optional noise for the first flow-selection node to diversify early choices (defaults ≈0.3 and 0.4).
+-   `min_unique_commit_evals: int`: Forces extra RateFinder probes until this many unique commit signatures have been evaluated, reducing premature convergence.
 -   `phi_scale: float`: Scaling factor for the potential shaping reward.
 -   `seed: int`: RNG seed for reproducibility.
 
