@@ -37,6 +37,7 @@ def score_with_context(
         context.flights_sorted_by_flow,
         n_by_flow,
         indexer,
+        spill_mode="dump_to_next_bin",
     )
 
     # Occupancy only for TVs of interest
@@ -163,6 +164,7 @@ def score_with_context_precomputed_occ(
         context.flights_sorted_by_flow,
         n_by_flow,
         indexer,
+        spill_mode="dump_to_next_bin",
     )
 
     # Use provided occupancy for J_cap
@@ -223,5 +225,4 @@ __all__ = [
     "score_with_context",
     "score_with_context_precomputed_occ",
 ]
-
 
