@@ -211,6 +211,41 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     console.print(f"[runner] Log path: {loggerpath}")
     console.print(f"[runner] Cold Feet log path: {cold_logger_path}")
 
+    # Additional commit-attempts logger (separate JSONL file)
+    commit_logger, commit_logger_path = SearchLogger.to_timestamped(str(log_dir), prefix="commit_attempts")
+    console.print(f"[runner] Commit attempts log path: {commit_logger_path}")
+
+    # Instrument CheapTransition inside the agent to record every CommitRegulation step
+    try:
+        import parrhesia.flow_agent.agent as _agent_mod
+        from parrhesia.flow_agent.actions import CommitRegulation as _CommitRegulation
+        from parrhesia.flow_agent.transition import CheapTransition as _BaseCheapTransition
+
+        class _LoggingCheapTransition(_BaseCheapTransition):
+            def step(self, state, action):  # type: ignore[override]
+                if isinstance(action, _CommitRegulation):
+                    try:
+                        ctx = getattr(state, "hotspot_context", None)
+                        if ctx is not None:
+                            t0 = int(getattr(ctx, "window_bins", (0, 0))[0])
+                            t1 = int(getattr(ctx, "window_bins", (0, 0))[1])
+                            payload = {
+                                "control_volume_id": str(getattr(ctx, "control_volume_id", "")),
+                                "window_bins": [t0, t1],
+                                "mode": str(getattr(ctx, "mode", "per_flow")),
+                                "flow_ids": [str(fid) for fid in getattr(ctx, "selected_flow_ids", [])],
+                                "committed_rates": getattr(action, "committed_rates", None),
+                                "diagnostics": dict(getattr(action, "diagnostics", {})),
+                            }
+                            commit_logger.event("commit_attempt", payload)
+                    except Exception:
+                        pass
+                return super().step(state, action)
+
+        _agent_mod.CheapTransition = _LoggingCheapTransition
+    except Exception as _exc:
+        console.print(f"[yellow]Failed to instrument commit attempts:[/yellow] {_exc}")
+
     # Configure agent budgets small to keep runtime reasonable
     # Limit to a single regulation to shorten runtime and match the request
     mcts_cfg = MCTSConfig(
@@ -227,7 +262,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     from rich.panel import Panel
     
     
-    rf_cfg = RateFinderConfig(use_adaptive_grid=True, max_eval_calls=4, fast_scorer_enabled=False) 
+    rf_cfg = RateFinderConfig(use_adaptive_grid=True, max_eval_calls=192, fast_scorer_enabled=False) 
 
     warning_panel = Panel(
         "[yellow]⚠️  FAST_SCORER is disabled as it gives faulty results.[/yellow]\n"
@@ -483,6 +518,11 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     try:
         if cold_logger is not None:
             cold_logger.close()
+    except Exception:
+        pass
+    try:
+        if commit_logger is not None:
+            commit_logger.close()
     except Exception:
         pass
 
