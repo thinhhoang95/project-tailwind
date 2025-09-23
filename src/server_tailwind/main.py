@@ -326,7 +326,8 @@ async def original_counts(request: Dict[str, Any], current_user: dict = Depends(
     - to_time_str: str (optional; same formats; required if from_time_str provided)
     - categories: dict[str -> list[str]] (optional category -> flight_ids)
     - flight_ids: list[str] (optional; ignored if categories present). When present and categories are absent, only these flights are counted.
-    - rank_by: str (optional; default "total_count"). Supported: "total_count", "total_excess".
+    - rank_by: str (optional; default "total_count"). Supported: "total_count", "total_excess",
+      "flight_list_count", "flight_list_relative".
     - rolling_hour: bool (optional; default true). When true, each bin's count is the sum over the next hour.
     - include_overall: bool (accepted for backward-compatibility; counts are always included for the top 50 TVs)
 
@@ -381,7 +382,8 @@ async def original_flight_contrib_counts(request: Dict[str, Any], current_user: 
     - from_time_str: str (optional; HHMM, HHMMSS, HH:MM, or HH:MM:SS)
     - to_time_str: str (optional; same formats; required if from_time_str provided)
     - flight_ids: list[str] (required)
-    - rank_by: str (optional; default "total_count"). Supported: "total_count", "total_excess".
+    - rank_by: str (optional; default "total_count"). Supported: "total_count", "total_excess",
+      "flight_list_count", "flight_list_relative".
     - rolling_hour: bool (optional; default true)
     """
     try:

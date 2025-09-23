@@ -299,12 +299,14 @@ Example error response
   - Supported values:
     - `"total_count"`: Ranks TVs by total rolling-hour count over the selected time range using `total_counts`.
     - `"total_excess"`: Ranks by total rolling-hour overload over the selected time range using `total_counts` and capacity; bins with `capacity=-1` are ignored.
+    - `"flight_list_count"`: Ranks by the total rolling-hour count contributed by the provided `flight_ids` over the selected time range using `flight_list_counts`.
+    - `"flight_list_relative"`: Ranks by the share of rolling-hour counts contributed by the provided `flight_ids` relative to the total (`flight_list_counts / total_counts`). TVs with zero total counts receive a ratio of 0.
 
 - `rolling_hour` (boolean, optional; default `true`):
   - When true, both `total_counts` and `flight_list_counts` use forward-looking 60‑minute sums per bin (no wrap).
 
 Notes
-- Ranking is based on `total_counts` over the requested time range; `flight_list_counts` are reported alongside for comparison.
+- Ranking uses the metric specified by `rank_by` (default `total_counts`) over the requested time range.
 - Capacity arrays repeat hourly capacity across bins within that hour; `-1` denotes missing capacity.
 
 ---

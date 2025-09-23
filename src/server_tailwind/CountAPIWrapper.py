@@ -721,6 +721,9 @@ class CountAPIWrapper:
         total_sliced = total_matrix[:, slice_start : slice_end_inclusive + 1]
         contrib_sliced = contrib_matrix[:, slice_start : slice_end_inclusive + 1]
 
+        total_sums = total_sliced.sum(axis=1)
+        contrib_sums = contrib_sliced.sum(axis=1)
+
         # Rank by selected criterion, using total counts
         if rank_by == "total_excess":
             cap_slice = self._get_capacity_slice(slice_start, slice_end_inclusive)
@@ -729,10 +732,21 @@ class CountAPIWrapper:
             diff = np.where(valid, diff, 0.0)
             excess = np.maximum(diff, 0.0)
             scores = excess.sum(axis=1)
+        elif rank_by == "flight_list_count":
+            scores = contrib_sums
+        elif rank_by == "flight_list_relative":
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratios = np.divide(
+                    contrib_sums,
+                    total_sums,
+                    out=np.zeros_like(contrib_sums, dtype=np.float32),
+                    where=total_sums > 0,
+                )
+            scores = ratios
         else:
             if rank_by != "total_count":
                 rank_by = "total_count"
-            scores = total_sliced.sum(axis=1)
+            scores = total_sums
 
         k = min(int(top_k), num_total_tvs)
         top_indices = np.argsort(-scores, kind="stable")[:k]
