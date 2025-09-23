@@ -93,6 +93,12 @@ from ..fcfs.flowful import (
     preprocess_flights_for_scheduler,
     assign_delays_flowful_preparsed,
 )
+try:
+    import inspect as _inspect  # type: ignore
+
+    _ASSIGN_HAS_SPILL_ARGS = "spill_mode" in _inspect.signature(assign_delays_flowful_preparsed).parameters
+except Exception:  # pragma: no cover - defensive
+    _ASSIGN_HAS_SPILL_ARGS = False
 from .occupancy import compute_occupancy
 from .capacity import rolling_hour_sum
 # --------------------------------- Public API --------------------------------
@@ -252,13 +258,22 @@ def score_with_context(
     import time
     if DEBUG_TIMING:
         time_start = time.time()
-    delays_min, realised_start = assign_delays_flowful_preparsed(
-        context.flights_sorted_by_flow,
-        n_by_flow,
-        indexer,
-        spill_mode=spill_mode,
-        release_rate_for_spills=release_rate_for_spills,
-    )
+    if _ASSIGN_HAS_SPILL_ARGS:
+        delays_min, realised_start = assign_delays_flowful_preparsed(
+            context.flights_sorted_by_flow,
+            n_by_flow,
+            indexer,
+            spill_mode=spill_mode,
+            release_rate_for_spills=release_rate_for_spills,
+        )
+    else:
+        if spill_mode not in ("overflow_bin", "dump_to_next_bin") and release_rate_for_spills is not None:
+            raise NotImplementedError("Spill handling parameters are not supported by this assign_delays implementation")
+        delays_min, realised_start = assign_delays_flowful_preparsed(
+            context.flights_sorted_by_flow,
+            n_by_flow,
+            indexer,
+        )
     if DEBUG_TIMING:
         time_end = time.time(); print(f"assign_delays_flowful(pre) time: {time_end - time_start} seconds")
 
@@ -416,13 +431,22 @@ def score_with_context_precomputed_occ(
     import time
     if DEBUG_TIMING:
         time_start = time.time()
-    delays_min, realised_start = assign_delays_flowful_preparsed(
-        context.flights_sorted_by_flow,
-        n_by_flow,
-        indexer,
-        spill_mode=spill_mode,
-        release_rate_for_spills=release_rate_for_spills,
-    )
+    if _ASSIGN_HAS_SPILL_ARGS:
+        delays_min, realised_start = assign_delays_flowful_preparsed(
+            context.flights_sorted_by_flow,
+            n_by_flow,
+            indexer,
+            spill_mode=spill_mode,
+            release_rate_for_spills=release_rate_for_spills,
+        )
+    else:
+        if spill_mode not in ("overflow_bin", "dump_to_next_bin") and release_rate_for_spills is not None:
+            raise NotImplementedError("Spill handling parameters are not supported by this assign_delays implementation")
+        delays_min, realised_start = assign_delays_flowful_preparsed(
+            context.flights_sorted_by_flow,
+            n_by_flow,
+            indexer,
+        )
     if DEBUG_TIMING:
         time_end = time.time(); print(f"assign_delays_flowful(pre) time: {time_end - time_start} seconds")
 

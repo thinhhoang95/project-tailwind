@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Callable, ContextManager, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -779,7 +780,7 @@ class MCTSAgent:
             out: Dict[str, List[Dict[str, Any]]] = {}
             iter_fn = getattr(self.flight_list, "iter_hotspot_crossings", None)
             if callable(iter_fn):
-                for fid, tv, _dt, t in iter_fn([comm_tv], active_windows={comm_tv: active}):  # type: ignore[misc]
+                for fid, tv, entry_dt, t in iter_fn([comm_tv], active_windows={comm_tv: active}):  # type: ignore[misc]
                     flow = reverse.get(str(fid))
                     if flow is None:
                         continue
@@ -787,7 +788,33 @@ class MCTSAgent:
                     # clamp and remap to [0, T]
                     rbin = max(0, min(T, rbin))
                     key = f"{flow_key_prefix}:{flow}"
-                    out.setdefault(key, []).append({"flight_id": str(fid), "requested_bin": rbin})
+                    spec = {"flight_id": str(fid), "requested_bin": rbin}
+                    if isinstance(entry_dt, datetime):
+                        spec["requested_dt"] = entry_dt
+                    else:
+                        meta = getattr(self.flight_list, "flight_metadata", {}).get(str(fid), {}) or {}
+                        takeoff = meta.get("takeoff_time")
+                        intervals = meta.get("occupancy_intervals") or []
+                        for iv in intervals:
+                            try:
+                                tvtw_idx = int(iv.get("tvtw_index"))
+                            except Exception:
+                                continue
+                            decoded = self.indexer.get_tvtw_from_index(tvtw_idx)
+                            if not decoded:
+                                continue
+                            tv_decoded, bin_idx = decoded
+                            if str(tv_decoded) != str(comm_tv) or int(bin_idx) != rbin:
+                                continue
+                            entry_s = iv.get("entry_time_s", 0)
+                            try:
+                                entry_s = float(entry_s)
+                            except Exception:
+                                entry_s = 0.0
+                            if isinstance(takeoff, datetime):
+                                spec["requested_dt"] = takeoff + timedelta(seconds=entry_s)
+                            break
+                    out.setdefault(key, []).append(spec)
             # Ensure keys exist even if no entrants (edge-case)
             for f in flow_to_flights.keys():
                 key = f"{flow_key_prefix}:{f}"
