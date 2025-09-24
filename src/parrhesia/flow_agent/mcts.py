@@ -32,22 +32,29 @@ from .rate_finder import RateFinder
 @dataclass
 class MCTSConfig:
     # PUCT + widening
-    c_puct: float = 2.0
+    c_puct: float = 64.0 # prev. 4.0
     alpha: float = 0.7
     k0: int = 4
     k1: float = 1.0
     widen_batch_size: int = 2
     # Budgets
-    commit_depth: int = 1
-    max_sims: int = 24
-    max_time_s: float = 20.0
-    commit_eval_limit: int = 3
+    commit_depth: int = 1 # controlled externally
+    max_sims: int = 36 # controlled externally
+    max_time_s: float = 300.0
+    commit_eval_limit: int = 3 # controlled externally
     # Global action budget across the search run. When set, the search stops
     # once this many low-level actions (selection, expansion, step, backup) are performed.
     # None or 0 disables this budget.
-    max_actions: Optional[int] = None
+    max_actions: Optional[int] = None # controlled externally
     # Priors
-    priors_temperature: float = 1.0
+    priors_temperature: float = 8.0 # higher = more uniform over the actions such as RemoveFlow, AddFlow, etc.
+    root_dirichlet_epsilon: float = 0.25
+    root_dirichlet_alpha: float = 0.3
+    hotspot_dirichlet_epsilon: float = 0.3
+    hotspot_dirichlet_alpha: float = 0.4
+    flow_dirichlet_epsilon: float = 0.3
+    flow_dirichlet_alpha: float = 0.4
+    min_unique_commit_evals: int = 0
     # Shaping
     phi_scale: float = 1.0
     # RNG
@@ -112,6 +119,7 @@ class MCTS:
         self._best_commit: Optional[Tuple[CommitRegulation, float]] = None  # (action, deltaJ)
         self._timer_factory = timer
         self._action_counts: Dict[str, int] = {}
+        self._action_counts_by_stage: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._progress_cb = progress_cb
         self._last_delta_j: Optional[float] = None
         self._debug_logger = debug_logger
@@ -124,6 +132,9 @@ class MCTS:
         self._actions_done: int = 0
         self._action_budget: Optional[int] = (None if getattr(self.cfg, "max_actions", None) in (None, 0)
                                               else int(self.cfg.max_actions))
+        self._root_noise_applied_run: bool = False
+        self._flow_noise_nodes_run: Set[str] = set()
+        self._hotspot_noise_nodes_run: Set[str] = set()
 
     class _ActionBudgetExhausted(Exception):
         pass
@@ -253,9 +264,58 @@ class MCTS:
     def action_counts(self) -> Dict[str, int]:
         return dict(self._action_counts)
 
-    def _record_action(self, action: Action) -> None:
-        key = type(action).__name__
+    def _record_action(
+        self,
+        state: PlanState,
+        action: Action,
+        *,
+        reward: float = 0.0,
+        q_value: float = 0.0,
+        prior: float = 0.0,
+        stage_key: Optional[str] = None,
+    ) -> None:
+        sig = self._signature_for_action(state, action)
+        label = self._sig_to_label(sig)
+        key = label
         self._action_counts[key] = self._action_counts.get(key, 0) + 1
+        stage = stage_key if stage_key is not None else getattr(state, "stage", "?")
+        stage_map = self._action_counts_by_stage.setdefault(stage, {})
+        entry = stage_map.setdefault(
+            key,
+            {
+                "label": key,
+                "signature": sig,
+                "action_type": type(action).__name__,
+                "stage": stage,
+                "plan_state": self._state_brief(state),
+                "N": 0,
+                "total_reward": 0.0,
+                "avg_reward": 0.0,
+                "total_q": 0.0,
+                "avg_q": 0.0,
+                "total_prior": 0.0,
+                "avg_prior": 0.0,
+                "min_q": float("inf"),
+                "max_q": float("-inf"),
+                "min_prior": float("inf"),
+                "max_prior": float("-inf"),
+                "min_reward": float("inf"),
+                "max_reward": float("-inf"),
+            },
+        )
+        entry["N"] += 1
+        entry["total_reward"] += float(reward)
+        entry["avg_reward"] = entry["total_reward"] / max(entry["N"], 1)
+        entry["total_q"] += float(q_value)
+        entry["avg_q"] = entry["total_q"] / max(entry["N"], 1)
+        entry["total_prior"] += float(prior)
+        entry["avg_prior"] = entry["total_prior"] / max(entry["N"], 1)
+        entry["min_q"] = min(entry["min_q"], float(q_value)) if math.isfinite(entry["min_q"]) else float(q_value)
+        entry["max_q"] = max(entry["max_q"], float(q_value)) if math.isfinite(entry["max_q"]) else float(q_value)
+        entry["min_prior"] = min(entry["min_prior"], float(prior)) if math.isfinite(entry["min_prior"]) else float(prior)
+        entry["max_prior"] = max(entry["max_prior"], float(prior)) if math.isfinite(entry["max_prior"]) else float(prior)
+        entry["min_reward"] = min(entry["min_reward"], float(reward)) if math.isfinite(entry["min_reward"]) else float(reward)
+        entry["max_reward"] = max(entry["max_reward"], float(reward)) if math.isfinite(entry["max_reward"]) else float(reward)
 
     def _inc_action(self, kind: str, *, sim_index: Optional[int] = None, step_index: Optional[int] = None) -> None:
         # Increment global low-level action counter and enforce budget if configured
@@ -276,10 +336,14 @@ class MCTS:
         self._commit_calls = 0
         self._best_commit = None
         self._action_counts.clear()
+        self._action_counts_by_stage.clear()
         self._last_delta_j = None
         self._max_commits_path = 0
         self._last_run_stats = {}
         self._run_index = run_index
+        self._root_noise_applied_run = False
+        self._flow_noise_nodes_run = set()
+        self._hotspot_noise_nodes_run = set()
         # Reset global action counter and budget view for this run
         self._actions_done = 0
         self._action_budget = (None if getattr(self.cfg, "max_actions", None) in (None, 0)
@@ -383,7 +447,7 @@ class MCTS:
                                 p = float(root_node.P.get(sig, 0.0))
                                 tmp.append((sig, int(est.N), float(est.Q), p))
                             tmp.sort(key=lambda x: (-x[1], -x[2]))
-                            root_top = tmp[:5]
+                            root_top = tmp
                         payload = {
                             "sims_done": i,
                             "sims_total": sims,
@@ -393,6 +457,8 @@ class MCTS:
                             "root_visits": (root_node.N if root_node is not None else 0),
                             "root_children": root_children,
                             "root_top": root_top,
+                            "root_plan_state": self._state_brief(root),
+                            "all_action_stats": self.get_action_stats(),
                             "commit_evals": self._commit_calls,
                             "best_delta_j": (self._best_commit[1] if self._best_commit is not None else None),
                             "last_delta_j": self._last_delta_j,
@@ -425,36 +491,38 @@ class MCTS:
             # Progress callback (best-effort, non-fatal)
             if self._progress_cb is not None:
                 try:
-                    root_key = root.canonical_key()
-                    root_node = self.nodes.get(root_key)
-                    root_children = 0
-                    root_top: List[Tuple] = []
-                    if root_node is not None:
-                        root_children = len(root_node.children)
-                        tmp: List[Tuple] = []
-                        for sig, est in root_node.edges.items():
-                            p = float(root_node.P.get(sig, 0.0))
-                            tmp.append((sig, int(est.N), float(est.Q), p))
-                        tmp.sort(key=lambda x: (-x[1], -x[2]))
-                        root_top = tmp[:5]
-                    payload = {
-                        "sims_done": i + 1,
-                        "sims_total": sims,
-                        "elapsed_s": now - t_start,
-                        "eta_s": max(0.0, t_end - now),
-                        "nodes": len(self.nodes),
-                        "root_visits": (root_node.N if root_node is not None else 0),
-                        "root_children": root_children,
-                        "root_top": root_top,
-                        "commit_evals": self._commit_calls,
-                        "best_delta_j": (self._best_commit[1] if self._best_commit is not None else None),
-                        "last_delta_j": self._last_delta_j,
-                        "last_return": float(last_ret),
-                        "action_counts": dict(self._action_counts),
-                        "actions_done": int(self._actions_done),
-                        "max_actions": int(self._action_budget) if self._action_budget is not None else None,
-                    }
-                    self._progress_cb(payload)
+                        root_key = root.canonical_key()
+                        root_node = self.nodes.get(root_key)
+                        root_children = 0
+                        root_top: List[Tuple] = []
+                        if root_node is not None:
+                            root_children = len(root_node.children)
+                            tmp: List[Tuple] = []
+                            for sig, est in root_node.edges.items():
+                                p = float(root_node.P.get(sig, 0.0))
+                                tmp.append((sig, int(est.N), float(est.Q), p))
+                            tmp.sort(key=lambda x: (-x[1], -x[2]))
+                            root_top = tmp
+                        payload = {
+                            "sims_done": i + 1,
+                            "sims_total": sims,
+                            "elapsed_s": now - t_start,
+                            "eta_s": max(0.0, t_end - now),
+                            "nodes": len(self.nodes),
+                            "root_visits": (root_node.N if root_node is not None else 0),
+                            "root_children": root_children,
+                            "root_top": root_top,
+                            "root_plan_state": self._state_brief(root),
+                            "all_action_stats": self.get_action_stats(),
+                            "commit_evals": self._commit_calls,
+                            "best_delta_j": (self._best_commit[1] if self._best_commit is not None else None),
+                            "last_delta_j": self._last_delta_j,
+                            "last_return": float(last_ret),
+                            "action_counts": dict(self._action_counts),
+                            "actions_done": int(self._actions_done),
+                            "max_actions": int(self._action_budget) if self._action_budget is not None else None,
+                        }
+                        self._progress_cb(payload)
                 except Exception:
                     pass
 
@@ -509,6 +577,7 @@ class MCTS:
             "actions_done": int(self._actions_done),
             "max_actions": int(self._action_budget) if self._action_budget is not None else None,
             "max_commits_path": int(getattr(self, "_max_commits_path", 0)),
+            "commit_cache_size": int(len(self._commit_eval_cache)),
         }
 
         if self._best_commit is None:
@@ -528,6 +597,8 @@ class MCTS:
         step_index = 0
         created_nodes: Set[str] = set()
         visited_keys: Dict[str, int] = {root.canonical_key(): 0}
+        flow_noise_applied = False
+        hotspot_noise_applied = False
 
         while True:
             step_index += 1
@@ -618,7 +689,65 @@ class MCTS:
                 return v
 
             candidates = self._enumerate_actions(state)
+            has_addflow = any(isinstance(a, AddFlow) for a in candidates)
+            has_hotspot_pick = any(isinstance(a, PickHotspot) for a in candidates)
             priors = self._compute_priors(state, candidates)
+            override_priors = False
+            noise_info: Optional[Tuple[str, float, float]] = None
+            if (
+                not path
+                and not self._root_noise_applied_run
+                and float(self.cfg.root_dirichlet_epsilon) > 0.0
+                and len(priors) > 0
+            ):
+                eps = float(self.cfg.root_dirichlet_epsilon)
+                alpha = float(self.cfg.root_dirichlet_alpha)
+                priors = self._apply_dirichlet_noise(priors, epsilon=eps, alpha=alpha)
+                self._root_noise_applied_run = True
+                override_priors = True
+                noise_info = ("root", eps, alpha)
+            elif (
+                state.stage == "select_hotspot"
+                and has_hotspot_pick
+                and (not hotspot_noise_applied or key not in self._hotspot_noise_nodes_run)
+                and float(self.cfg.hotspot_dirichlet_epsilon) > 0.0
+                and len(priors) > 0
+            ):
+                eps = float(self.cfg.hotspot_dirichlet_epsilon)
+                alpha = float(self.cfg.hotspot_dirichlet_alpha)
+                priors = self._apply_dirichlet_noise(priors, epsilon=eps, alpha=alpha)
+                self._hotspot_noise_nodes_run.add(key)
+                override_priors = True
+                noise_info = ("hotspot", eps, alpha)
+                hotspot_noise_applied = True
+            elif (
+                state.stage == "select_flows"
+                and has_addflow
+                and (not flow_noise_applied or key not in self._flow_noise_nodes_run)
+                and float(self.cfg.flow_dirichlet_epsilon) > 0.0
+                and len(priors) > 0
+            ):
+                eps = float(self.cfg.flow_dirichlet_epsilon)
+                alpha = float(self.cfg.flow_dirichlet_alpha)
+                priors = self._apply_dirichlet_noise(priors, epsilon=eps, alpha=alpha)
+                self._flow_noise_nodes_run.add(key)
+                override_priors = True
+                noise_info = ("flow", eps, alpha)
+                flow_noise_applied = True
+            if noise_info is not None:
+                kind, eps, alpha = noise_info
+                self._log_debug_event(
+                    "dirichlet_noise",
+                    {
+                        "node_hash": node_hash,
+                        "kind": kind,
+                        "epsilon": float(eps),
+                        "alpha": float(alpha),
+                        "actions": len(priors),
+                    },
+                    sim_index=sim_index,
+                    step_index=step_index,
+                )
             invalid_priors = {
                 self._sig_to_label(sig): float(p)
                 for sig, p in priors.items()
@@ -631,8 +760,12 @@ class MCTS:
                     sim_index=sim_index,
                     step_index=step_index,
                 )
+            if override_priors:
+                for stale in list(node.P.keys()):
+                    if stale not in priors:
+                        node.P.pop(stale, None)
             for sig, p in priors.items():
-                if sig not in node.P:
+                if override_priors or sig not in node.P:
                     node.P[sig] = float(p)
             m_allow = int(self.cfg.k0 + self.cfg.k1 * (node.N ** self.cfg.alpha))
             m_allow = max(1, m_allow)
@@ -714,6 +847,7 @@ class MCTS:
                 if sig[0] == "commit" and commits_used >= commit_depth:
                     continue
                 viable.append((sig, est))
+            viable_map = {sig: est for sig, est in viable}
             if not viable:
                 v = -node.phi
                 self._dbg(
@@ -757,6 +891,7 @@ class MCTS:
                 selection_records.append(
                     {
                         "sig": self._sig_to_json(sig),
+                        "sig_tuple": sig,
                         "label": self._sig_to_label(sig),
                         "Q": float(est.Q),
                         "P": P,
@@ -769,7 +904,62 @@ class MCTS:
                 if score > best_score or (score == best_score and (best_sig is None or sig < best_sig)):
                     best_score = score
                     best_sig = sig
+            if selection_records and len(self._commit_eval_cache) < int(self.cfg.min_unique_commit_evals):
+                weights = np.array([max(float(rec.get("P", 0.0)), 0.0) for rec in selection_records], dtype=float)
+                if not np.all(np.isfinite(weights)) or float(weights.sum()) <= 0.0:
+                    weights = np.ones(len(selection_records), dtype=float)
+                total_w = float(weights.sum())
+                if total_w > 0.0:
+                    weights /= total_w
+                idx = int(self.rng.choice(len(selection_records), p=weights))
+                chosen = selection_records[idx]
+                chosen_sig = chosen.get("sig_tuple")
+                if isinstance(chosen_sig, tuple):
+                    best_sig = chosen_sig
+                else:
+                    best_sig = viable[idx][0]
+                best_score = float(chosen.get("score", best_score))
+                self._log_debug_event(
+                    "forced_explore_action",
+                    {
+                        "node_hash": node_hash,
+                        "stage": state.stage,
+                        "selected": self._sig_to_label(best_sig),
+                        "reason": "min_unique_commit_evals",
+                        "min_target": int(self.cfg.min_unique_commit_evals),
+                        "cache_size": len(self._commit_eval_cache),
+                    },
+                    sim_index=sim_index,
+                    step_index=step_index,
+                )
             assert best_sig is not None
+            forced_back = False
+            if (
+                best_sig is not None
+                and best_sig[0] == "commit"
+                and len(self._commit_eval_cache) < int(self.cfg.min_unique_commit_evals)
+            ):
+                ctx_commit = state.hotspot_context
+                if ctx_commit is not None:
+                    signature = tuple(sorted(str(fid) for fid in ctx_commit.selected_flow_ids))
+                    if signature in self._commit_eval_cache:
+                        back_sig = self._signature_for_action(state, Back())
+                        if back_sig in viable_map:
+                            best_sig = back_sig
+                            best_score = float(viable_map[back_sig].Q if hasattr(viable_map[back_sig], "Q") else 0.0)
+                            forced_back = True
+                            self._log_debug_event(
+                                "forced_backtrack_for_unique_commit",
+                                {
+                                    "node_hash": node_hash,
+                                    "stage": state.stage,
+                                    "cache_size": len(self._commit_eval_cache),
+                                    "min_target": int(self.cfg.min_unique_commit_evals),
+                                    "signature": list(signature),
+                                },
+                                sim_index=sim_index,
+                                step_index=step_index,
+                            )
             est_sel = node.edges.get(best_sig, EdgeStats())
             created_flag = key in created_nodes
 
@@ -948,7 +1138,7 @@ class MCTS:
                 if (not banned_commit) and (self._best_commit is None or delta_j < self._best_commit[1]):
                     self._best_commit = (commit_action, float(delta_j))
 
-            self._record_action(action)
+            state_before = state
 
             # Count environment/state transition as one action
             self._inc_action("step", sim_index=sim_index, step_index=step_index)
@@ -961,6 +1151,14 @@ class MCTS:
             delta_phi = phi_sp - phi_s
             r_shaped = r_base + delta_phi
             total_return += r_shaped
+
+            self._record_action(
+                state_before,
+                action,
+                reward=float(r_shaped),
+                q_value=float(est_sel.Q),
+                prior=float(node.P.get(best_sig, 0.0)),
+            )
             self._dbg(
                 f"[MCTS/step] {type(action).__name__} commit={bool(is_commit)} term={bool(is_terminal)} r_base={float(r_base):.3f} Δphi={float(delta_phi):.3f} r={float(r_shaped):.3f} G={float(total_return):.3f} {self._state_brief(next_state)}"
             )
@@ -1209,7 +1407,12 @@ class MCTS:
             sig = self._signature_for_action(state, a)
             if isinstance(a, AddFlow):
                 proxy = np.asarray(proxies.get(a.flow_id, []), dtype=float)
-                logits[sig] = float(proxy.sum()) if proxy.size else 1.0
+                if proxy.size:
+                    proxy = np.nan_to_num(proxy, nan=0.0, posinf=0.0, neginf=0.0)
+                    total = max(float(proxy.sum()), 0.0)
+                    logits[sig] = math.log1p(total)
+                else:
+                    logits[sig] = math.log1p(1.0)
             elif isinstance(a, PickHotspot):
                 # Read prior from candidate metadata when available
                 prior = None
@@ -1231,7 +1434,7 @@ class MCTS:
             elif isinstance(a, RemoveFlow):
                 logits[sig] = 0.5  # mildly discouraged initially
             elif isinstance(a, Continue):
-                logits[sig] = 1.0
+                logits[sig] = 0.5
             elif isinstance(a, CommitRegulation):
                 logits[sig] = 0.5
             elif isinstance(a, Back):
@@ -1250,6 +1453,36 @@ class MCTS:
         Z = sum(exps.values()) or 1.0
         priors = {k: (v / Z) for k, v in exps.items()}
         return priors
+
+    def _apply_dirichlet_noise(
+        self,
+        priors: Mapping[Tuple, float],
+        *,
+        epsilon: float,
+        alpha: float,
+    ) -> Dict[Tuple, float]:
+        if not priors:
+            return {}
+        eps = float(epsilon)
+        if eps <= 0.0:
+            return dict(priors)
+        keys = list(priors.keys())
+        base = np.array([max(float(priors[k]), 0.0) for k in keys], dtype=float)
+        base_sum = base.sum()
+        if not np.isfinite(base_sum) or base_sum <= 0.0:
+            base = np.full(len(keys), 1.0 / len(keys), dtype=float)
+        else:
+            base /= base_sum
+        alpha_val = max(float(alpha), 1e-6)
+        dirichlet = self.rng.dirichlet(np.full(len(keys), alpha_val, dtype=float))
+        mixed = (1.0 - eps) * base + eps * dirichlet
+        mixed = np.maximum(mixed, 0.0)
+        total = mixed.sum()
+        if not np.isfinite(total) or total <= 0.0:
+            mixed = np.full(len(keys), 1.0 / len(keys), dtype=float)
+        else:
+            mixed /= total
+        return {keys[i]: float(mixed[i]) for i in range(len(keys))}
 
     # ------------------------------ Commits --------------------------------
     def _commit_is_banned(self, state: PlanState) -> bool:
@@ -1394,6 +1627,8 @@ class MCTS:
                 sim_index=sim_index,
                 step_index=step_index,
             )
+            if len(self._commit_eval_cache) < int(self.cfg.min_unique_commit_evals):
+                self._seed_extra_commit_eval(state, ctx, flows, sim_index=sim_index, step_index=step_index)
         else:
             if self._commit_calls >= int(self.cfg.commit_eval_limit):
                 # Treat as no-op commit with zero improvement to avoid extra cost
@@ -1430,6 +1665,8 @@ class MCTS:
                     sim_index=sim_index,
                     step_index=step_index,
                 )
+                if len(self._commit_eval_cache) < int(self.cfg.min_unique_commit_evals):
+                    self._seed_extra_commit_eval(state, ctx, flows, sim_index=sim_index, step_index=step_index)
 
         # Sanitize committed rates for serialization and canonicalization
         sanitized: Dict[str, int] | int | None
@@ -1453,6 +1690,86 @@ class MCTS:
 
         commit_action = CommitRegulation(committed_rates=sanitized, diagnostics={"rate_finder": info})
         return commit_action, float(delta_j)
+
+    def _seed_extra_commit_eval(
+        self,
+        state: PlanState,
+        ctx: Any,
+        base_flows: Mapping[str, Sequence[str]],
+        *,
+        sim_index: Optional[int] = None,
+        step_index: Optional[int] = None,
+    ) -> None:
+        try:
+            target = int(self.cfg.min_unique_commit_evals)
+        except Exception:
+            target = 0
+        if target <= 0 or len(self._commit_eval_cache) >= target:
+            return
+        if self._commit_calls >= int(self.cfg.commit_eval_limit):
+            return
+        candidate_ids = []
+        try:
+            candidate_ids = [str(fid) for fid in getattr(ctx, "candidate_flow_ids", [])]
+        except Exception:
+            candidate_ids = []
+        if not candidate_ids:
+            return
+        try:
+            flow_to_flights = (getattr(ctx, "metadata", {}) or {}).get("flow_to_flights", {}) or {}
+        except Exception:
+            flow_to_flights = {}
+        base_ids = set(str(fid) for fid in base_flows.keys())
+        attempts = 0
+        while len(self._commit_eval_cache) < target and attempts < len(candidate_ids) + 2:
+            attempts += 1
+            alt_ids = set(base_ids)
+            available = [fid for fid in candidate_ids if fid not in alt_ids]
+            if available:
+                alt_ids.add(str(self.rng.choice(available)))
+            elif len(candidate_ids) >= 2:
+                sample_size = min(len(candidate_ids), max(2, len(base_ids)))
+                alt_ids = set(str(x) for x in self.rng.choice(candidate_ids, size=sample_size, replace=False))
+            else:
+                break
+            new_signature = tuple(sorted(alt_ids))
+            new_key = (
+                state.canonical_key(),
+                str(getattr(ctx, "control_volume_id", "")),
+                tuple(int(b) for b in getattr(ctx, "window_bins", (0, 0))),
+                new_signature,
+            )
+            if new_key in self._commit_eval_cache:
+                continue
+            alt_flows: Dict[str, Tuple[str, ...]] = {}
+            for fid in alt_ids:
+                flights = flow_to_flights.get(fid, ())
+                alt_flows[str(fid)] = tuple(str(x) for x in flights)
+            try:
+                with self._timed("mcts.rate_finder.find_rates"):
+                    rates, delta_j, info = self.rate_finder.find_rates(
+                        plan_state=state,
+                        control_volume_id=str(getattr(ctx, "control_volume_id", "")),
+                        window_bins=tuple(int(b) for b in getattr(ctx, "window_bins", (0, 0))),
+                        flows=alt_flows,
+                        mode="per_flow" if getattr(ctx, "mode", "per_flow") == "per_flow" else "blanket",
+                    )
+            except Exception:
+                continue
+            self._commit_calls += 1
+            self._commit_eval_cache[new_key] = (rates, delta_j, info)
+            self._log_debug_event(
+                "seed_commit_eval",
+                {
+                    "flows": len(alt_flows),
+                    "cache_size": len(self._commit_eval_cache),
+                    "min_target": target,
+                },
+                sim_index=sim_index,
+                step_index=step_index,
+            )
+            if self._commit_calls >= int(self.cfg.commit_eval_limit):
+                break
 
     # --------------------------- Signatures/decoding -----------------------
     def _signature_for_action(self, state: PlanState, action: Action) -> Tuple:
@@ -1616,6 +1933,19 @@ class MCTS:
                     print(f"[MCTS/backprop] value={v:.3f} path_len={len(path)} (no_root)")
             except Exception:
                 pass
+
+    def _build_action_stats(self) -> Dict[str, Dict[str, Any]]:
+        aggregated: Dict[str, Dict[str, Any]] = {}
+        for stage, actions in self._action_counts_by_stage.items():
+            for label, stats in actions.items():
+                key = f"{stage}:{label}"
+                record = dict(stats)
+                record["stage"] = stage
+                aggregated[key] = record
+        return aggregated
+
+    def get_action_stats(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        return {stage: {label: dict(stats) for label, stats in action_map.items()} for stage, action_map in self._action_counts_by_stage.items()}
 
 
 __all__ = ["MCTS", "MCTSConfig", "TreeNode", "EdgeStats"]

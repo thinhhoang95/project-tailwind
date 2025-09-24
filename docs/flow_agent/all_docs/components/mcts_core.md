@@ -11,6 +11,7 @@ Main classes
   - `max_sims`, `max_time_s`: Budgets for number of simulations and wall-clock time.
   - `commit_eval_limit`: Legacy limiter for commit evaluation calls; effective limit is by `max_sims` and caching.
   - `priors_temperature`: Softmax temperature for priors (when applied).
+  - `min_unique_commit_evals`: Forces extra RateFinder probes until this many unique commit signatures have been evaluated.
   - `phi_scale`: Scales potential shaping signal.
   - `seed`: RNG seed for stable tie-breaking.
 - `TreeNode`: Node statistics and structure.
@@ -37,8 +38,10 @@ How it works
   - `select_flows`: `AddFlow` for not-yet-selected candidates, `RemoveFlow` for selected, `Continue` if any selected, plus `Stop`.
   - `confirm`: `CommitRegulation`, `Back`, `Stop`.
 - `_compute_priors(...)`: Scores actions using hotspot and flow metadata.
-  - `AddFlow`: Sums the flow’s proxy histogram (proportional to entrants in window).
+  - `AddFlow`: Uses log1p(sum(proxy histogram)) to flatten extreme entrant counts.
   - `PickHotspot`: Reads `hotspot_prior` from candidate payloads and normalizes.
+  - Dirichlet noise: Blends exploration noise into root priors, the first `select_hotspot`, and the first `select_flows` node to prevent early collapse.
+  - Extra commit seeding: when unique RateFinder evaluations are scarce, the search synthesizes additional flow combinations to populate the cache.
 
 3) Commit caching and best commit
 - `_commit_eval_cache`: Memoizes `(rates, delta_j, info)` by a signature of the selected flows and hotspot window.

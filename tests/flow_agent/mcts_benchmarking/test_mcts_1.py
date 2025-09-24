@@ -153,7 +153,7 @@ def test_mcts_agent_real_data_smoke(tmp_path: Path):
         rate_finder_cfg=rf_cfg,
         discovery_cfg=disc_cfg,
         logger=logger,
-        max_regulations=1,
+        max_regulation_count=1,
         timer=timed,
     )
 

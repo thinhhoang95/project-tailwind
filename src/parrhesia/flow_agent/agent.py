@@ -58,6 +58,7 @@ class MCTSAgent:
         debug_logger: Optional[SearchLogger] = None,
         cold_logger: Optional[SearchLogger] = None,
         max_regulations: Optional[int] = None,
+        max_regulation_count: Optional[int] = None,
         timer: Optional[Callable[[str], ContextManager[Any]]] = None,
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
         early_stop_no_improvement: bool = False,
@@ -70,7 +71,15 @@ class MCTSAgent:
         self.logger = logger
         self.debug_logger = debug_logger
         self.cold_logger = cold_logger
-        self.max_regulations = None if max_regulations is None else int(max(0, max_regulations))
+        if max_regulation_count is None:
+            max_regulation_count = max_regulations
+        if max_regulation_count is None:
+            sanitized_reg_limit: Optional[int] = None
+        else:
+            sanitized_reg_limit = int(max(0, max_regulation_count))
+        self.max_regulation_count = sanitized_reg_limit
+        # Preserve legacy attribute name for downstream callers that may still reference it.
+        self.max_regulations = sanitized_reg_limit
         self._timer_factory = timer
         self._progress_cb = progress_cb
         self.early_stop_no_improvement = bool(early_stop_no_improvement)
@@ -201,7 +210,11 @@ class MCTSAgent:
                     {
                         "num_candidates": len(candidates),
                         "commit_depth": int(self.mcts_cfg.commit_depth),
-                        "max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
+                        "max_regulation_count": (
+                            int(self.max_regulation_count)
+                            if self.max_regulation_count is not None
+                            else None
+                        ),
                         "max_sims": int(self.mcts_cfg.max_sims),
                         "max_time_s": float(self.mcts_cfg.max_time_s),
                         "commit_eval_limit": int(self.mcts_cfg.commit_eval_limit),
@@ -213,10 +226,16 @@ class MCTSAgent:
 
         commits = 0
         total_delta_j = 0.0
+        commit_depth_limit = int(max(0, self.mcts_cfg.commit_depth))
+        configured_reg_limit = (
+            int(self.max_regulation_count)
+            if self.max_regulation_count is not None
+            else None
+        )
         # Loop: allow multiple commits until STOP logic or inventory exhaustion
-        limit = int(self.mcts_cfg.commit_depth)
-        if self.max_regulations is not None:
-            limit = min(limit, int(self.max_regulations))
+        outer_loop_budget = (
+            int(max(0, configured_reg_limit)) if configured_reg_limit is not None else commit_depth_limit
+        )
         aggregated_counts: Dict[str, int] = {}
         outer_stop_reason: Optional[str] = None
         outer_stop_info: Dict[str, Any] = {}
@@ -229,15 +248,19 @@ class MCTSAgent:
             try:
                 self._progress_cb({
                     "outer_commits": int(commits),
-                    "outer_commit_depth": int(self.mcts_cfg.commit_depth),
-                    "outer_max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
-                    "outer_limit": int(limit),
+                    "outer_commit_depth": int(commit_depth_limit),
+                    "outer_max_regulation_count": (
+                        int(self.max_regulation_count)
+                        if self.max_regulation_count is not None
+                        else None
+                    ),
+                    "outer_limit": int(outer_loop_budget),
                     "outer_early_stop_no_improvement": bool(self.early_stop_no_improvement),
                     "outer_run_index": int(run_idx),
                 })
             except Exception:
                 pass
-        for _ in range(max(1, limit)):
+        for _ in range(max(1, int(outer_loop_budget))):
             # Ensure we are in idle to start a new regulation
             state.stage = "idle"
             try:
@@ -266,9 +289,13 @@ class MCTSAgent:
                                 "outer_stop_reason": "no_commit_available",
                                 "outer_stop_info": {"status": "no_commit_evaluated", "exc_type": type(exc).__name__},
                                 "outer_commits": int(commits),
-                                "outer_commit_depth": int(self.mcts_cfg.commit_depth),
-                                "outer_max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
-                                "outer_limit": int(limit),
+                                "outer_commit_depth": int(commit_depth_limit),
+                                "outer_max_regulation_count": (
+                                    int(self.max_regulation_count)
+                                    if self.max_regulation_count is not None
+                                    else None
+                                ),
+                                "outer_limit": int(outer_loop_budget),
                                 "outer_run_index": int(run_idx),
                             })
                         except Exception:
@@ -289,9 +316,13 @@ class MCTSAgent:
                             "outer_stop_reason": "mcts_error",
                             "outer_stop_info": {"error": message, "exc_type": type(exc).__name__},
                             "outer_commits": int(commits),
-                            "outer_commit_depth": int(self.mcts_cfg.commit_depth),
-                            "outer_max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
-                            "outer_limit": int(limit),
+                            "outer_commit_depth": int(commit_depth_limit),
+                            "outer_max_regulation_count": (
+                                int(self.max_regulation_count)
+                                if self.max_regulation_count is not None
+                                else None
+                            ),
+                            "outer_limit": int(outer_loop_budget),
                             "outer_run_index": int(run_idx),
                         })
                     except Exception:
@@ -494,9 +525,13 @@ class MCTSAgent:
                 try:
                     self._progress_cb({
                         "outer_commits": int(commits),
-                        "outer_commit_depth": int(self.mcts_cfg.commit_depth),
-                        "outer_max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
-                        "outer_limit": int(limit),
+                        "outer_commit_depth": int(commit_depth_limit),
+                        "outer_max_regulation_count": (
+                            int(self.max_regulation_count)
+                            if self.max_regulation_count is not None
+                            else None
+                        ),
+                        "outer_limit": int(outer_loop_budget),
                         "outer_last_delta_j": float(delta_j),
                         "outer_early_stop_no_improvement": bool(self.early_stop_no_improvement),
                         "outer_run_index": int(run_idx),
@@ -641,21 +676,25 @@ class MCTSAgent:
                     try:
                         self.debug_logger.event(
                             "outer_stop_no_improvement",
-                            {"delta_j": float(delta_j), "commits": int(commits), "limit": int(limit)},
+                            {"delta_j": float(delta_j), "commits": int(commits), "limit": int(outer_loop_budget)},
                         )
                     except Exception:
                         pass
                 outer_stop_reason = "no_improvement"
-                outer_stop_info = {"delta_j": float(delta_j), "commits": int(commits), "limit": int(limit)}
+                outer_stop_info = {"delta_j": float(delta_j), "commits": int(commits), "limit": int(outer_loop_budget)}
                 if self._progress_cb is not None:
                     try:
                         self._progress_cb({
                             "outer_stop_reason": "no_improvement",
-                            "outer_stop_info": {"delta_j": float(delta_j), "commits": int(commits), "limit": int(limit)},
+                            "outer_stop_info": {"delta_j": float(delta_j), "commits": int(commits), "limit": int(outer_loop_budget)},
                             "outer_commits": int(commits),
-                            "outer_commit_depth": int(self.mcts_cfg.commit_depth),
-                            "outer_max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
-                            "outer_limit": int(limit),
+                            "outer_commit_depth": int(commit_depth_limit),
+                            "outer_max_regulation_count": (
+                                int(self.max_regulation_count)
+                                if self.max_regulation_count is not None
+                                else None
+                            ),
+                            "outer_limit": int(outer_loop_budget),
                             "outer_last_delta_j": float(delta_j),
                             "outer_early_stop_no_improvement": bool(self.early_stop_no_improvement),
                             "outer_run_index": int(run_idx),
@@ -666,11 +705,14 @@ class MCTSAgent:
 
             run_idx += 1
 
-        if self.max_regulations is not None and commits >= self.max_regulations and self.logger is not None:
-            self.logger.event("regulation_limit_reached", {"limit": int(self.max_regulations)})
-        if self.max_regulations is not None and commits >= self.max_regulations and self.debug_logger is not None:
+        if self.max_regulation_count is not None and commits >= self.max_regulation_count and self.logger is not None:
+            self.logger.event("regulation_limit_reached", {"limit": int(self.max_regulation_count)})
+        if self.max_regulation_count is not None and commits >= self.max_regulation_count and self.debug_logger is not None:
             try:
-                self.debug_logger.event("outer_stop_regulation_limit", {"limit": int(self.max_regulations), "commits": int(commits)})
+                self.debug_logger.event(
+                    "outer_stop_regulation_limit",
+                    {"limit": int(self.max_regulation_count), "commits": int(commits)}
+                )
             except Exception:
                 pass
 
@@ -685,9 +727,9 @@ class MCTSAgent:
         # Determine final stop reason and info irrespective of debug logging
         final_stop_reason = outer_stop_reason
         if final_stop_reason is None:
-            if self.max_regulations is not None and commits >= self.max_regulations:
+            if configured_reg_limit is not None and commits >= configured_reg_limit:
                 final_stop_reason = "regulation_limit_reached"
-            elif commits >= limit:
+            elif configured_reg_limit is None and commits >= commit_depth_limit:
                 final_stop_reason = "commit_depth_limit_reached"
             else:
                 final_stop_reason = "completed"
@@ -700,9 +742,13 @@ class MCTSAgent:
                     "outer_stop_reason": final_stop_reason,
                     "outer_stop_info": final_stop_info,
                     "outer_commits": int(commits),
-                    "outer_commit_depth": int(self.mcts_cfg.commit_depth),
-                    "outer_max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
-                    "outer_limit": int(limit),
+                    "outer_commit_depth": int(commit_depth_limit),
+                    "outer_max_regulation_count": (
+                        int(self.max_regulation_count)
+                        if self.max_regulation_count is not None
+                        else None
+                    ),
+                    "outer_limit": int(outer_loop_budget),
                 })
             except Exception:
                 pass
@@ -714,9 +760,13 @@ class MCTSAgent:
                     "stop_reason": final_stop_reason,
                     "stop_info": (final_stop_info or None),
                     "commits": int(commits),
-                    "limit": int(limit),
-                    "commit_depth": int(self.mcts_cfg.commit_depth),
-                    "max_regulations": (int(self.max_regulations) if self.max_regulations is not None else None),
+                    "limit": int(outer_loop_budget),
+                    "commit_depth": int(commit_depth_limit),
+                    "max_regulation_count": (
+                        int(self.max_regulation_count)
+                        if self.max_regulation_count is not None
+                        else None
+                    ),
                     "total_delta_j": float(total_delta_j),
                     "objective": float(final_summary.get("objective", 0.0)),
                     "num_flows": int(final_summary.get("num_flows", 0)),
