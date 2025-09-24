@@ -304,190 +304,198 @@ class MCTSAgent:
 
         _set_ensemble_rate_finder(self.rate_finder)
         cfg_base = asdict(self.mcts_cfg)
-        progress_queue = mp_ctx.Queue()
-        futures = []
-        results: List[Dict[str, Any]] = []
-        worker_progress: Dict[int, Dict[str, Any]] = {}
-        worker_status: Dict[int, str] = {}
-        worker_errors: Dict[int, str] = {}
-        last_progress_payload: Optional[Dict[str, Any]] = None
 
-        def _safe_int(value: Any, default: int = 0) -> int:
-            try:
-                return int(value)
-            except Exception:
-                return default
+        manager = mp_ctx.Manager()
+        try:
+            progress_queue = manager.Queue()
+            futures = []
+            results: List[Dict[str, Any]] = []
+            worker_progress: Dict[int, Dict[str, Any]] = {}
+            worker_status: Dict[int, str] = {}
+            worker_errors: Dict[int, str] = {}
+            last_progress_payload: Optional[Dict[str, Any]] = None
 
-        def _safe_float(value: Any) -> Optional[float]:
-            try:
-                f = float(value)
-            except Exception:
+            def _safe_int(value: Any, default: int = 0) -> int:
+                try:
+                    return int(value)
+                except Exception:
+                    return default
+
+            def _safe_float(value: Any) -> Optional[float]:
+                try:
+                    f = float(value)
+                except Exception:
+                    return None
+                if np.isfinite(f):
+                    return f
                 return None
-            if np.isfinite(f):
-                return f
-            return None
 
-        def _compose_worker_progress() -> Optional[Dict[str, Any]]:
-            if not worker_progress:
-                return None
-            _lead_id, lead_payload = max(
-                worker_progress.items(),
-                key=lambda kv: _safe_int((kv[1] or {}).get("sims_done"), 0),
-            )
-            aggregated = dict(lead_payload or {})
-            max_sims_done = max(
-                _safe_int((data or {}).get("sims_done"), 0) for data in worker_progress.values()
-            )
-            aggregated["sims_done"] = max_sims_done
-            sims_total_candidates = [
-                _safe_int((data or {}).get("sims_total"), int(self.mcts_cfg.max_sims))
-                for data in worker_progress.values()
-            ]
-            if sims_total_candidates:
-                aggregated["sims_total"] = max(sims_total_candidates)
-            else:
-                aggregated["sims_total"] = int(self.mcts_cfg.max_sims)
+            def _compose_worker_progress() -> Optional[Dict[str, Any]]:
+                if not worker_progress:
+                    return None
+                _lead_id, lead_payload = max(
+                    worker_progress.items(),
+                    key=lambda kv: _safe_int((kv[1] or {}).get("sims_done"), 0),
+                )
+                aggregated = dict(lead_payload or {})
+                max_sims_done = max(
+                    _safe_int((data or {}).get("sims_done"), 0) for data in worker_progress.values()
+                )
+                aggregated["sims_done"] = max_sims_done
+                sims_total_candidates = [
+                    _safe_int((data or {}).get("sims_total"), int(self.mcts_cfg.max_sims))
+                    for data in worker_progress.values()
+                ]
+                if sims_total_candidates:
+                    aggregated["sims_total"] = max(sims_total_candidates)
+                else:
+                    aggregated["sims_total"] = int(self.mcts_cfg.max_sims)
 
-            combined_counts: Dict[str, int] = {}
-            total_commit_evals = 0
-            total_actions_done = 0
-            best_delta: Optional[float] = None
-            best_worker_id: Optional[int] = None
-            workers_summary: List[Dict[str, Any]] = []
+                combined_counts: Dict[str, int] = {}
+                total_commit_evals = 0
+                total_actions_done = 0
+                best_delta: Optional[float] = None
+                best_worker_id: Optional[int] = None
+                workers_summary: List[Dict[str, Any]] = []
 
-            for wid, data in worker_progress.items():
-                payload = data or {}
-                counts = payload.get("action_counts") or {}
-                for label, count in counts.items():
+                for wid, data in worker_progress.items():
+                    payload = data or {}
+                    counts = payload.get("action_counts") or {}
+                    for label, count in counts.items():
+                        try:
+                            combined_counts[str(label)] = combined_counts.get(str(label), 0) + int(count)
+                        except Exception:
+                            continue
+                    commit_evals = _safe_int(payload.get("commit_evals"), 0)
+                    actions_done = _safe_int(payload.get("actions_done"), 0)
+                    total_commit_evals += commit_evals
+                    total_actions_done += actions_done
+                    best_val = _safe_float(payload.get("best_delta_j"))
+                    if best_val is not None and (best_delta is None or best_val < best_delta):
+                        best_delta = best_val
+                        best_worker_id = wid
+                    worker_entry: Dict[str, Any] = {
+                        "worker_id": int(wid),
+                        "sims_done": _safe_int(payload.get("sims_done"), 0),
+                        "best_delta_j": best_val,
+                        "last_delta_j": _safe_float(payload.get("last_delta_j")),
+                        "commit_evals": commit_evals,
+                        "actions_done": actions_done,
+                        "status": worker_status.get(wid, "running"),
+                    }
+                    if worker_entry["status"] == "error":
+                        worker_entry["error"] = worker_errors.get(wid)
+                    workers_summary.append(worker_entry)
+
+                aggregated["action_counts"] = combined_counts
+                aggregated["commit_evals"] = total_commit_evals
+                aggregated["actions_done"] = total_actions_done
+                aggregated["ensemble_workers"] = sorted(
+                    workers_summary, key=lambda item: item["worker_id"]
+                )
+                aggregated["ensemble_worker_count"] = len(worker_progress)
+                aggregated["ensemble_progress_source"] = "ensemble"
+                if best_worker_id is not None:
+                    aggregated["ensemble_best_worker"] = int(best_worker_id)
+                if best_delta is not None:
+                    aggregated["best_delta_j"] = best_delta
+                    aggregated["last_delta_j"] = best_delta
+                aggregated.setdefault("sims_total", int(self.mcts_cfg.max_sims))
+                if aggregated.get("max_actions") is None:
+                    aggregated["max_actions"] = cfg_base.get("max_actions")
+                return aggregated
+
+            def _drain_progress_queue(block: bool = False) -> bool:
+                nonlocal last_progress_payload
+                if progress_queue is None:
+                    return False
+                processed = False
+                updated = False
+                while True:
                     try:
-                        combined_counts[str(label)] = combined_counts.get(str(label), 0) + int(count)
+                        if block:
+                            item = progress_queue.get(timeout=0.1)
+                        else:
+                            item = progress_queue.get_nowait()
+                    except (queue.Empty, EOFError):
+                        break
+                    processed = True
+                    if not isinstance(item, tuple) or len(item) < 3:
+                        continue
+                    kind, worker_id, payload = item
+                    try:
+                        wid = int(worker_id)
                     except Exception:
                         continue
-                commit_evals = _safe_int(payload.get("commit_evals"), 0)
-                actions_done = _safe_int(payload.get("actions_done"), 0)
-                total_commit_evals += commit_evals
-                total_actions_done += actions_done
-                best_val = _safe_float(payload.get("best_delta_j"))
-                if best_val is not None and (best_delta is None or best_val < best_delta):
-                    best_delta = best_val
-                    best_worker_id = wid
-                worker_entry: Dict[str, Any] = {
-                    "worker_id": int(wid),
-                    "sims_done": _safe_int(payload.get("sims_done"), 0),
-                    "best_delta_j": best_val,
-                    "last_delta_j": _safe_float(payload.get("last_delta_j")),
-                    "commit_evals": commit_evals,
-                    "actions_done": actions_done,
-                    "status": worker_status.get(wid, "running"),
-                }
-                if worker_entry["status"] == "error":
-                    worker_entry["error"] = worker_errors.get(wid)
-                workers_summary.append(worker_entry)
+                    if kind == "error":
+                        worker_status[wid] = "error"
+                        if isinstance(payload, Mapping):
+                            worker_errors[wid] = str(payload.get("message"))
+                        if wid not in worker_progress:
+                            worker_progress[wid] = {}
+                        updated = True
+                        continue
+                    if kind in {"progress", "complete"}:
+                        if isinstance(payload, Mapping):
+                            worker_progress[wid] = dict(payload)
+                        if kind == "complete":
+                            worker_status[wid] = "done"
+                        elif worker_status.get(wid) != "done":
+                            worker_status[wid] = "running"
+                        updated = True
+                if updated:
+                    aggregate = _compose_worker_progress()
+                    if aggregate is not None:
+                        last_progress_payload = aggregate
+                        if self._progress_cb is not None:
+                            try:
+                                self._progress_cb(aggregate)
+                            except Exception:
+                                pass
+                return processed
 
-            aggregated["action_counts"] = combined_counts
-            aggregated["commit_evals"] = total_commit_evals
-            aggregated["actions_done"] = total_actions_done
-            aggregated["ensemble_workers"] = sorted(
-                workers_summary, key=lambda item: item["worker_id"]
-            )
-            aggregated["ensemble_worker_count"] = len(worker_progress)
-            aggregated["ensemble_progress_source"] = "ensemble"
-            if best_worker_id is not None:
-                aggregated["ensemble_best_worker"] = int(best_worker_id)
-            if best_delta is not None:
-                aggregated["best_delta_j"] = best_delta
-                aggregated["last_delta_j"] = best_delta
-            aggregated.setdefault("sims_total", int(self.mcts_cfg.max_sims))
-            if aggregated.get("max_actions") is None:
-                aggregated["max_actions"] = cfg_base.get("max_actions")
-            return aggregated
-
-        def _drain_progress_queue(block: bool = False) -> bool:
-            nonlocal last_progress_payload
-            if progress_queue is None:
-                return False
-            processed = False
-            updated = False
-            while True:
-                try:
-                    if block:
-                        item = progress_queue.get(timeout=0.1)
-                    else:
-                        item = progress_queue.get_nowait()
-                except (queue.Empty, EOFError):
-                    break
-                processed = True
-                if not isinstance(item, tuple) or len(item) < 3:
-                    continue
-                kind, worker_id, payload = item
-                try:
-                    wid = int(worker_id)
-                except Exception:
-                    continue
-                if kind == "error":
-                    worker_status[wid] = "error"
-                    if isinstance(payload, Mapping):
-                        worker_errors[wid] = str(payload.get("message"))
-                    if wid not in worker_progress:
-                        worker_progress[wid] = {}
-                    updated = True
-                    continue
-                if kind in {"progress", "complete"}:
-                    if isinstance(payload, Mapping):
-                        worker_progress[wid] = dict(payload)
-                    if kind == "complete":
-                        worker_status[wid] = "done"
-                    elif worker_status.get(wid) != "done":
-                        worker_status[wid] = "running"
-                    updated = True
-            if updated:
-                aggregate = _compose_worker_progress()
-                if aggregate is not None:
-                    last_progress_payload = aggregate
-                    if self._progress_cb is not None:
-                        try:
-                            self._progress_cb(aggregate)
-                        except Exception:
-                            pass
-            return processed
-
-        with ProcessPoolExecutor(max_workers=worker_count, mp_context=mp_ctx) as executor:
-            for idx in range(worker_count):
-                cfg_payload = dict(cfg_base)
-                cfg_payload["root_parallel_workers"] = 1
-                base_seed = int(self.mcts_cfg.seed)
-                cfg_payload["seed"] = base_seed + _ENSEMBLE_SEED_OFFSET * (idx + 1)
-                max_actions_val = cfg_payload.get("max_actions")
-                if max_actions_val in (None, 0):
-                    cfg_payload["max_actions"] = None
-                else:
-                    try:
-                        cfg_payload["max_actions"] = int(max_actions_val)
-                    except Exception:
+            with ProcessPoolExecutor(max_workers=worker_count, mp_context=mp_ctx) as executor:
+                for idx in range(worker_count):
+                    cfg_payload = dict(cfg_base)
+                    cfg_payload["root_parallel_workers"] = 1
+                    base_seed = int(self.mcts_cfg.seed)
+                    cfg_payload["seed"] = base_seed + _ENSEMBLE_SEED_OFFSET * (idx + 1)
+                    max_actions_val = cfg_payload.get("max_actions")
+                    if max_actions_val in (None, 0):
                         cfg_payload["max_actions"] = None
-                state_payload = copy.deepcopy(state)
-                futures.append(
-                    executor.submit(
-                        _root_parallel_mcts_worker,
-                        (state_payload, cfg_payload, run_index, idx, progress_queue),
+                    else:
+                        try:
+                            cfg_payload["max_actions"] = int(max_actions_val)
+                        except Exception:
+                            cfg_payload["max_actions"] = None
+                    state_payload = copy.deepcopy(state)
+                    futures.append(
+                        executor.submit(
+                            _root_parallel_mcts_worker,
+                            (state_payload, cfg_payload, run_index, idx, progress_queue),
+                        )
                     )
-                )
 
-            pending = set(futures)
-            while pending:
-                done, not_done = wait(pending, timeout=0.1)
-                _drain_progress_queue(block=False)
-                for fut in done:
-                    results.append(fut.result())
-                pending = not_done
-            while _drain_progress_queue(block=False):
+                pending = set(futures)
+                while pending:
+                    done, not_done = wait(pending, timeout=0.1)
+                    _drain_progress_queue(block=False)
+                    for fut in done:
+                        results.append(fut.result())
+                    pending = not_done
+                while _drain_progress_queue(block=False):
+                    pass
+
+            try:
+                progress_queue.close()
+                progress_queue.join_thread()
+            except Exception:
                 pass
-
-        try:
-            progress_queue.close()
-            progress_queue.join_thread()
-        except Exception:
-            pass
+        finally:
+            try:
+                manager.shutdown()
+            except Exception:
+                pass
 
         if not results:
             return None
