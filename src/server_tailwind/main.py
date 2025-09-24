@@ -6,11 +6,15 @@ Provides endpoints for traffic volume occupancy analysis.
 from fastapi import FastAPI, HTTPException, Query, Depends
 from fastapi.security import OAuth2PasswordRequestForm
 from datetime import timedelta
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from .airspace.airspace_api_wrapper import AirspaceAPIWrapper
 from .deepflow.flows_api_wrapper import FlowsWrapper
 from .CountAPIWrapper import CountAPIWrapper
 from .query.QueryAPIWrapper import QueryAPIWrapper
+from .query.NLPQueryParser import (
+    NLPQueryParser,
+    NLPQueryParserError,
+)
 from .core.resources import get_resources
 from parrhesia.api.base_evaluation import compute_base_evaluation
 from parrhesia.api.automatic_rate_adjustment import compute_automatic_rate_adjustment
@@ -35,6 +39,7 @@ airspace_wrapper = AirspaceAPIWrapper()
 flows_wrapper = FlowsWrapper()
 count_wrapper = CountAPIWrapper()
 query_wrapper = QueryAPIWrapper()
+nlp_query_parser = NLPQueryParser(resources=_res, query_wrapper=query_wrapper)
 
 # Auth utilities (kept separate so endpoints remain pure)
 from .auth import (
@@ -332,6 +337,119 @@ async def post_flight_query_ast(
         raise HTTPException(status_code=400, detail=msg)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+ALLOWED_NLP_OPTION_KEYS = {
+    "select",
+    "order_by",
+    "limit",
+    "deduplicate",
+    "flight_ids",
+    "debug",
+}
+
+VALID_SELECT_VALUES = {"flight_ids", "count", "ids_and_times"}
+VALID_ORDER_BY_VALUES = {
+    "first_crossing_time",
+    "last_crossing_time",
+    "takeoff_time",
+    "dest",
+}
+
+
+def _validate_flight_query_nlp_options(options: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized: Dict[str, Any] = {}
+    for key, value in options.items():
+        if key not in ALLOWED_NLP_OPTION_KEYS:
+            raise HTTPException(status_code=400, detail=f"Unsupported option '{key}'")
+        if key == "select":
+            if not isinstance(value, str) or value not in VALID_SELECT_VALUES:
+                raise HTTPException(status_code=400, detail="Invalid 'select' value")
+            sanitized[key] = value
+        elif key == "order_by":
+            if not isinstance(value, str) or value not in VALID_ORDER_BY_VALUES:
+                raise HTTPException(status_code=400, detail="Invalid 'order_by' value")
+            sanitized[key] = value
+        elif key == "limit":
+            try:
+                limit_val = int(value)
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=400, detail="'limit' must be an integer") from exc
+            if limit_val <= 0:
+                raise HTTPException(status_code=400, detail="'limit' must be positive")
+            sanitized[key] = limit_val
+        elif key == "deduplicate":
+            if not isinstance(value, bool):
+                raise HTTPException(status_code=400, detail="'deduplicate' must be a boolean")
+            sanitized[key] = value
+        elif key == "flight_ids":
+            if not isinstance(value, list):
+                raise HTTPException(status_code=400, detail="'flight_ids' must be a list of strings")
+            normalized: List[str] = []
+            for item in value:
+                if not isinstance(item, str):
+                    raise HTTPException(status_code=400, detail="'flight_ids' entries must be strings")
+                normalized.append(item)
+            sanitized[key] = normalized
+        elif key == "debug":
+            if not isinstance(value, bool):
+                raise HTTPException(status_code=400, detail="'debug' must be a boolean")
+            sanitized[key] = value
+    return sanitized
+
+
+@app.post("/flight_query_nlp")
+async def post_flight_query_nlp(
+    payload: Dict[str, Any],
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    try:
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+        prompt = payload.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise HTTPException(status_code=400, detail="'prompt' must be a non-empty string")
+
+        raw_options = payload.get("options")
+        if raw_options is None:
+            raw_options = {}
+        if not isinstance(raw_options, dict):
+            raise HTTPException(status_code=400, detail="'options' must be an object when provided")
+
+        sanitized_options = _validate_flight_query_nlp_options(raw_options)
+
+        model = payload.get("model")
+        if model is not None and not isinstance(model, str):
+            raise HTTPException(status_code=400, detail="'model' must be a string when provided")
+
+        debug = bool(sanitized_options.get("debug", False))
+
+        parser_result = await nlp_query_parser.parse(prompt=prompt, model=model, debug=debug)
+
+        evaluation_payload = {"query": parser_result.query, "options": sanitized_options}
+        result = await query_wrapper.evaluate(evaluation_payload)
+
+        if debug:
+            enriched = dict(result)
+            enriched["ast"] = parser_result.ast
+            metadata = dict(enriched.get("metadata", {}))
+            metadata["llm"] = parser_result.llm
+            enriched["metadata"] = metadata
+            return enriched
+
+        return result
+    except HTTPException:
+        raise
+    except NLPQueryParserError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except ValueError as exc:
+        msg = str(exc)
+        if "Unknown traffic volume id" in msg:
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=400, detail=msg)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(exc)}")
 
 @app.post("/original_counts")
 async def original_counts(request: Dict[str, Any], current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
