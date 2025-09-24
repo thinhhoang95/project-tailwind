@@ -577,7 +577,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         pass
 
     # Final summary and quick checks (non-fatal)
-    console.print(f"[runner] Commits: {info.commits}")
+    console.print(f"[runner] Number of Regulations: {info.commits}") # basically the final commit equals to the number of regulations because that's how regulation is added
     try:
         reason = getattr(info, "stop_reason", None)
         if reason:
