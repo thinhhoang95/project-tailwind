@@ -46,6 +46,9 @@ class MCTSConfig:
     # once this many low-level actions (selection, expansion, step, backup) are performed.
     # None or 0 disables this budget.
     max_actions: Optional[int] = None # controlled externally
+    # Number of root-parallel workers for ensemble MCTS. When greater than 1,
+    # the agent may launch multiple independent searches and merge the results.
+    root_parallel_workers: int = 1
     # Priors
     priors_temperature: float = 8.0 # higher = more uniform over the actions such as RemoveFlow, AddFlow, etc.
     root_dirichlet_epsilon: float = 0.25

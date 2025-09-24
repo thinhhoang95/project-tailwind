@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
+import multiprocessing
 from contextlib import nullcontext
-from dataclasses import dataclass
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from typing import Any, Callable, ContextManager, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -11,7 +14,7 @@ from project_tailwind.optimize.eval.network_evaluator import NetworkEvaluator
 from project_tailwind.optimize.eval.flight_list import FlightList
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 
-from .actions import NewRegulation
+from .actions import Action, NewRegulation
 from .logging import SearchLogger
 from .mcts import MCTS, MCTSConfig
 from .rate_finder import RateFinder, RateFinderConfig
@@ -24,6 +27,106 @@ from .hotspot_discovery import (
 
 from parrhesia.optim.objective import ObjectiveWeights, build_score_context
 from parrhesia.flow_agent.safespill_objective import score_with_context
+
+_ENSEMBLE_RATE_FINDER: Optional[RateFinder] = None
+_ENSEMBLE_SEED_OFFSET = 10_000
+
+
+def _set_ensemble_rate_finder(rate_finder: RateFinder) -> None:
+    global _ENSEMBLE_RATE_FINDER
+    _ENSEMBLE_RATE_FINDER = rate_finder
+
+
+def _root_parallel_mcts_worker(payload: Tuple[PlanState, Dict[str, Any], Optional[int], int]) -> Dict[str, Any]:
+    state, cfg_dict, run_index, worker_index = payload
+    rate_finder = _ENSEMBLE_RATE_FINDER
+    if rate_finder is None:
+        raise RuntimeError("Ensemble worker started without RateFinder context")
+
+    cfg = MCTSConfig(**cfg_dict)
+    cfg.root_parallel_workers = 1
+
+    mcts = MCTS(
+        transition=CheapTransition(),
+        rate_finder=rate_finder,
+        config=cfg,
+        timer=None,
+        progress_cb=None,
+        debug_logger=None,
+        cold_logger=None,
+    )
+
+    commit_action = mcts.run(state, run_index=run_index)
+    last_stats = dict(mcts.last_run_stats or {})
+
+    root_key = state.canonical_key()
+    root_node = mcts.nodes.get(root_key)
+    root_visits = int(root_node.N) if root_node is not None else 0
+    root_children = len(root_node.children) if root_node is not None else 0
+    root_top: List[Tuple] = []
+    if root_node is not None:
+        tmp: List[Tuple] = []
+        for sig, est in root_node.edges.items():
+            p = float(root_node.P.get(sig, 0.0))
+            tmp.append((sig, int(est.N), float(est.Q), p))
+        tmp.sort(key=lambda x: (-x[1], -x[2]))
+        root_top = tmp
+
+    diagnostics = getattr(commit_action, "diagnostics", {}) or {}
+    rf_diag = diagnostics.get("rate_finder", {}) if isinstance(diagnostics, Mapping) else {}
+    try:
+        delta_j = float(rf_diag.get("delta_j"))
+    except Exception:
+        delta_j = float("inf")
+
+    best_delta = (delta_j if np.isfinite(delta_j) else None)
+    progress_payload = {
+        "sims_done": root_visits,
+        "sims_total": int(cfg.max_sims),
+        "elapsed_s": float(last_stats.get("elapsed_s", 0.0)),
+        "eta_s": 0.0,
+        "nodes": len(mcts.nodes),
+        "root_visits": root_visits,
+        "root_children": root_children,
+        "root_top": root_top,
+        "root_plan_state": MCTS._state_brief(state),
+        "all_action_stats": mcts.get_action_stats(),
+        "commit_evals": int(last_stats.get("commit_calls", 0)),
+        "best_delta_j": best_delta,
+        "last_delta_j": best_delta,
+        "last_return": None,
+        "action_counts": dict(mcts.action_counts),
+        "actions_done": int(last_stats.get("actions_done", 0)),
+        "max_actions": last_stats.get("max_actions"),
+    }
+
+    return {
+        "commit_action": commit_action,
+        "action_counts": dict(mcts.action_counts),
+        "action_stats": mcts.get_action_stats(),
+        "last_run_stats": last_stats,
+        "root_visits": root_visits,
+        "root_children": root_children,
+        "root_top": root_top,
+        "root_plan_state": MCTS._state_brief(state),
+        "nodes": len(mcts.nodes),
+        "delta_j": float(delta_j),
+        "progress": progress_payload,
+        "worker_id": int(worker_index),
+    }
+
+
+@dataclass
+class _EnsembleRunResult:
+    commit_action: Action
+    best_worker_index: int
+    best_action_counts: Dict[str, int]
+    combined_action_counts: Dict[str, int]
+    last_run_stats: Dict[str, Any]
+    best_delta_j: float
+    progress_payload: Dict[str, Any]
+    worker_summaries: List[Dict[str, Any]]
+
 
 @dataclass
 class RunInfo:
@@ -149,6 +252,124 @@ class MCTSAgent:
         if removed:
             state.metadata["hotspot_candidates"] = filtered
 
+    def _run_root_parallel(
+        self,
+        state: PlanState,
+        *,
+        run_index: int,
+        worker_count: int,
+    ) -> Optional[_EnsembleRunResult]:
+        if worker_count <= 1:
+            return None
+        try:
+            mp_ctx = multiprocessing.get_context("fork")
+        except (ValueError, RuntimeError):
+            mp_ctx = None
+        if mp_ctx is None:
+            return None
+
+        _set_ensemble_rate_finder(self.rate_finder)
+        cfg_base = asdict(self.mcts_cfg)
+        futures = []
+        results: List[Dict[str, Any]] = []
+
+        with ProcessPoolExecutor(max_workers=worker_count, mp_context=mp_ctx) as executor:
+            for idx in range(worker_count):
+                cfg_payload = dict(cfg_base)
+                cfg_payload["root_parallel_workers"] = 1
+                base_seed = int(self.mcts_cfg.seed)
+                cfg_payload["seed"] = base_seed + _ENSEMBLE_SEED_OFFSET * (idx + 1)
+                max_actions_val = cfg_payload.get("max_actions")
+                if max_actions_val in (None, 0):
+                    cfg_payload["max_actions"] = None
+                else:
+                    try:
+                        cfg_payload["max_actions"] = int(max_actions_val)
+                    except Exception:
+                        cfg_payload["max_actions"] = None
+                state_payload = copy.deepcopy(state)
+                futures.append(
+                    executor.submit(
+                        _root_parallel_mcts_worker,
+                        (state_payload, cfg_payload, run_index, idx),
+                    )
+                )
+
+            for fut in as_completed(futures):
+                results.append(fut.result())
+
+        if not results:
+            return None
+
+        results.sort(key=lambda entry: int(entry.get("worker_id", 0)))
+        combined_counts: Dict[str, int] = {}
+        worker_summaries: List[Dict[str, Any]] = []
+        best_entry: Optional[Dict[str, Any]] = None
+        best_delta = float("inf")
+
+        for res in results:
+            counts = {str(k): int(v) for k, v in (res.get("action_counts") or {}).items()}
+            for label, count in counts.items():
+                combined_counts[label] = combined_counts.get(label, 0) + count
+            delta = float(res.get("delta_j", float("inf")))
+            worker_summaries.append(
+                {
+                    "worker_id": int(res.get("worker_id", 0)),
+                    "delta_j": float(delta),
+                    "commit_calls": int((res.get("last_run_stats") or {}).get("commit_calls", 0)),
+                    "actions_done": int((res.get("last_run_stats") or {}).get("actions_done", 0)),
+                    "root_visits": int(res.get("root_visits", 0)),
+                }
+            )
+            if delta < best_delta:
+                best_delta = delta
+                best_entry = res
+
+        if best_entry is None:
+            raise RuntimeError("Ensemble MCTS produced no valid result")
+
+        progress_payload = dict(best_entry.get("progress") or {})
+        progress_payload["action_counts"] = combined_counts
+        if np.isfinite(best_delta):
+            progress_payload["best_delta_j"] = float(best_delta)
+            progress_payload["last_delta_j"] = float(best_delta)
+        else:
+            if progress_payload.get("best_delta_j") is None:
+                progress_payload["best_delta_j"] = None
+            if progress_payload.get("last_delta_j") is None:
+                progress_payload["last_delta_j"] = None
+        progress_payload.setdefault("sims_total", int(self.mcts_cfg.max_sims))
+
+        if self._progress_cb is not None and progress_payload:
+            try:
+                self._progress_cb(progress_payload)
+            except Exception:
+                pass
+
+        if self.debug_logger is not None and worker_summaries:
+            try:
+                self.debug_logger.event(
+                    "root_parallel_summary",
+                    {
+                        "workers": worker_summaries,
+                        "best_worker_index": int(best_entry.get("worker_id", 0)),
+                        "best_delta_j": float(best_delta),
+                    },
+                )
+            except Exception:
+                pass
+
+        return _EnsembleRunResult(
+            commit_action=best_entry["commit_action"],
+            best_worker_index=int(best_entry.get("worker_id", 0)),
+            best_action_counts={k: int(v) for k, v in (best_entry.get("action_counts") or {}).items()},
+            combined_action_counts=combined_counts,
+            last_run_stats=dict(best_entry.get("last_run_stats") or {}),
+            best_delta_j=float(best_delta),
+            progress_payload=progress_payload,
+            worker_summaries=worker_summaries,
+        )
+
     # ------------------------------------------------------------------
     def run(self) -> Tuple[PlanState, RunInfo]:
         # Build hotspot inventory and seed plan state
@@ -224,6 +445,14 @@ class MCTSAgent:
             except Exception:
                 pass
 
+        root_parallel_workers_raw = getattr(self.mcts_cfg, "root_parallel_workers", 1)
+        try:
+            root_parallel_workers = int(root_parallel_workers_raw)
+        except Exception:
+            root_parallel_workers = 1
+        if root_parallel_workers <= 0:
+            root_parallel_workers = 1
+
         commits = 0
         total_delta_j = 0.0
         commit_depth_limit = int(max(0, self.mcts_cfg.commit_depth))
@@ -263,12 +492,31 @@ class MCTSAgent:
         for _ in range(max(1, int(outer_loop_budget))):
             # Ensure we are in idle to start a new regulation
             state.stage = "idle"
+            action_counts_this_run: Dict[str, int] = {}
+            combined_action_counts: Dict[str, int] = {}
+            run_stats_this_run: Dict[str, Any] = {}
+            run_result: Optional[_EnsembleRunResult] = None
             try:
                 with self._timed("agent.mcts.run"):
-                    commit_action = mcts.run(state, run_index=run_idx)
+                    if root_parallel_workers > 1:
+                        run_result = self._run_root_parallel(
+                            state,
+                            run_index=run_idx,
+                            worker_count=root_parallel_workers,
+                        )
+                    if run_result is None:
+                        commit_action = mcts.run(state, run_index=run_idx)
+                        action_counts_this_run = dict(mcts.action_counts)
+                        combined_action_counts = dict(mcts.action_counts)
+                        run_stats_this_run = dict(mcts.last_run_stats or {})
+                    else:
+                        commit_action = run_result.commit_action
+                        action_counts_this_run = dict(run_result.best_action_counts)
+                        combined_action_counts = dict(run_result.combined_action_counts)
+                        run_stats_this_run = dict(run_result.last_run_stats)
             except Exception as exc:
                 message = str(exc)
-                for k, v in mcts.action_counts.items():
+                for k, v in combined_action_counts.items():
                     aggregated_counts[k] = aggregated_counts.get(k, 0) + int(v)
                 if isinstance(exc, RuntimeError) and "MCTS did not evaluate any commit" in message:
                     if self.logger is not None:
@@ -329,12 +577,12 @@ class MCTSAgent:
                         pass
                 break
 
-            for k, v in mcts.action_counts.items():
+            for k, v in combined_action_counts.items():
                 aggregated_counts[k] = aggregated_counts.get(k, 0) + int(v)
 
             # Cold Feet: capture per-run stats
             try:
-                stats = getattr(mcts, "last_run_stats", {}) or {}
+                stats = dict(run_stats_this_run)
                 if isinstance(stats, dict):
                     mx = int(stats.get("max_commits_path", 0))
                     max_commits_per_inner.append(mx)
