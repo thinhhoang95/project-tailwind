@@ -10,6 +10,7 @@ from typing import Dict, Any, Optional
 from .airspace.airspace_api_wrapper import AirspaceAPIWrapper
 from .deepflow.flows_api_wrapper import FlowsWrapper
 from .CountAPIWrapper import CountAPIWrapper
+from .query.QueryAPIWrapper import QueryAPIWrapper
 from .core.resources import get_resources
 from parrhesia.api.base_evaluation import compute_base_evaluation
 from parrhesia.api.automatic_rate_adjustment import compute_automatic_rate_adjustment
@@ -33,6 +34,7 @@ if parr_res is not None:
 airspace_wrapper = AirspaceAPIWrapper()
 flows_wrapper = FlowsWrapper()
 count_wrapper = CountAPIWrapper()
+query_wrapper = QueryAPIWrapper()
 
 # Auth utilities (kept separate so endpoints remain pure)
 from .auth import (
@@ -314,6 +316,22 @@ async def get_flows(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to compute flows: {str(e)}")
+
+
+@app.post("/flight_query_ast")
+async def post_flight_query_ast(
+    payload: Dict[str, Any],
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    try:
+        return await query_wrapper.evaluate(payload)
+    except ValueError as e:
+        msg = str(e)
+        if "Unknown traffic volume id" in msg:
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=400, detail=msg)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.post("/original_counts")
 async def original_counts(request: Dict[str, Any], current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:

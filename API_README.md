@@ -39,6 +39,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 - **`/slack_distribution`** - For a source TV and reference time, returns per-TV slack at the query bin shifted by nominal travel time (475 kts), with an optional additional shift `delta_min` (minutes)
 - **`/regulation_plan_simulation`** - Simulate a regulation plan to get per-flight delays, objective metrics, and rolling-hour occupancy for all TVs that changed (pre/post); no server-side ranking
 - **`/common_traffic_volumes`** - Given a list of flight identifiers, returns the list of unique traffic volumes that any of these flights pass through (union)
+- **`/flight_query_ast`** - Evaluate composable JSON AST queries over flights (crossings, sequences, time windows, capacity checks)
 - **Authentication** - OAuth2 password flow with JWT access tokens
 - **`/token`** - Issue access token and user info (`display_name`, `organization`) (demo users: `nm@intuelle.com` / `nm123`, `thinh.hoangdinh@enac.fr` / `Vy011195`)
 - **`/protected`** - Example protected endpoint requiring `Authorization: Bearer <token>`
@@ -600,6 +601,124 @@ curl -H "Authorization: Bearer $TOKEN" \
 curl -H "Authorization: Bearer $TOKEN" \
   "http://localhost:8000/hotspots?threshold=0.0"
 ```
+
+### POST `/flight_query_ast`
+
+Evaluate composable JSON AST queries against the flight occupancy dataset. The evaluator supports logical composition (`and`, `or`, `not`) and atomic predicates such as `cross`, `sequence`, `origin`, `destination`, `arrival_window`, `takeoff_window`, `capacity_state`, `duration_between`, `count_crossings`, and `geo_region_cross`.
+
+**Request (JSON):**
+```json
+{
+  "query": { "type": "cross", "tv": "TVA", "time": { "clock": { "from": "11:15", "to": "11:45" } } },
+  "options": {
+    "select": "flight_ids",
+    "order_by": "takeoff_time",
+    "limit": 200,
+    "deduplicate": true,
+    "debug": false
+  }
+}
+```
+
+Fields:
+- `query`: required root node of the AST (see plan for node types). Logical nodes combine children; atomic nodes filter flights via TV/time/airport/capacity predicates.
+- `options` (optional): overrides for result shape.
+  - `select`: `"flight_ids"` (default), `"count"`, or `"ids_and_times"`.
+  - `order_by`: `"first_crossing_time"`, `"last_crossing_time"`, `"takeoff_time"`, `"dest"`, or omitted for natural order.
+  - `limit`: cap number of returned flights (defaults to 50k hard limit when omitted).
+  - `flight_ids`: restrict evaluation to a provided list of flight identifiers; unknown IDs trigger a 400.
+  - `deduplicate`: keep/skip deduplication (default `true`).
+  - `debug`: include cache diagnostics in `metadata.explain`.
+
+**Response:**
+- When `select = "flight_ids"` (default):
+  ```json
+  {
+    "flight_ids": ["F1", "F2"],
+    "metadata": {
+      "time_bin_minutes": 15,
+      "bins_per_tv": 96,
+      "evaluation_ms": 12.4,
+      "node_cache_hits": 3,
+      "total_matches": 128,
+      "result_size": 50,
+      "truncated": true
+    }
+  }
+  ```
+- `select = "count"`: returns `{ "count": <int>, "metadata": {...} }`.
+- `select = "ids_and_times"`: returns `{ "ids_and_times": [{"flight_id": ..., "first_crossing_time": "HH:MM:SS", "last_crossing_time": "HH:MM:SS"}, ...], "metadata": {...} }`.
+
+**Example Queries:**
+1. Flights crossing TVA between 11:15–11:45 (default response):
+   ```json
+   {
+     "query": {
+       "type": "cross",
+       "tv": "TVA",
+       "time": { "clock": { "from": "11:15", "to": "11:45" } }
+     }
+   }
+   ```
+2. Flights that cross TVA then TVB within 45 minutes and arrive at LFPO between 11:15–12:15:
+   ```json
+   {
+     "query": {
+       "type": "and",
+       "children": [
+         {
+           "type": "sequence",
+           "steps": [
+             { "type": "cross", "tv": "TVA" },
+             { "type": "cross", "tv": "TVB" }
+           ],
+           "within": { "minutes": 45 }
+         },
+         { "type": "destination", "airport": "LFPO" },
+         {
+           "type": "arrival_window",
+           "clock": { "from": "11:15", "to": "12:15" },
+           "method": "last_crossing"
+         }
+       ]
+     }
+   }
+   ```
+3. Count flights crossing any of `["TVX", "TVY", "TVZ"]` while overloaded:
+   ```json
+   {
+     "query": {
+       "type": "capacity_state",
+       "tv": { "anyOf": ["TVX", "TVY", "TVZ"] },
+       "time": { "bins": { "from": 32, "to": 44 } },
+       "condition": "overloaded"
+     },
+     "options": { "select": "count" }
+   }
+   ```
+4. Return ordered IDs with first/last crossing time summaries:
+   ```json
+   {
+     "query": {
+       "type": "cross",
+       "tv": "TVHOT",
+       "select": "ids_and_times"
+     },
+     "options": { "order_by": "first_crossing_time", "limit": 25 }
+   }
+   ```
+5. Restrict evaluation to a provided flight list:
+   ```json
+   {
+     "query": { "type": "cross", "tv": "TVA" },
+     "options": { "flight_ids": ["0200AFRAM650E", "3944E1AFR96RF"] }
+   }
+   ```
+
+Errors:
+- 400 for malformed ASTs or invalid time specifications.
+- 404 when referencing unknown traffic volume IDs.
+- 500 for unexpected server errors during evaluation.
 
 ## Configuration
 
