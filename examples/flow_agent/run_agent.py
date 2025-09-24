@@ -433,6 +433,89 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         tbl.add_row("Latest ΔJ", last_s)
         return tbl
 
+
+    def _build_ensemble_table(payload: Dict[str, Any]) -> Table:
+        tbl = Table(title="Ensemble Workers", box=box.SIMPLE_HEAVY)
+        tbl.add_column("Worker", justify="right", style="cyan")
+        tbl.add_column("Status", style="magenta")
+        tbl.add_column("Sims", justify="right")
+        tbl.add_column("Best ΔJ", justify="right")
+        tbl.add_column("Last ΔJ", justify="right")
+        tbl.add_column("Commit evals", justify="right")
+        tbl.add_column("Actions", justify="right")
+        workers = payload.get("ensemble_workers") or []
+        best_worker = payload.get("ensemble_best_worker")
+        try:
+            best_worker_id = int(best_worker) if best_worker is not None else None
+        except Exception:
+            best_worker_id = None
+
+        def _sort_key(entry: Dict[str, Any]) -> float:
+            val = entry.get("best_delta_j")
+            try:
+                fval = float(val)
+            except Exception:
+                return float("inf")
+            return fval if math.isfinite(fval) else float("inf")
+
+        status_map = {
+            "running": "[cyan]running[/cyan]",
+            "done": "[green]done[/green]",
+            "error": "[red]error[/red]",
+        }
+
+        if isinstance(workers, list) and workers:
+            for entry in sorted(workers, key=_sort_key):
+                worker_id = entry.get("worker_id")
+                try:
+                    worker_id_int = int(worker_id)
+                except Exception:
+                    worker_id_int = None
+                status_raw = str(entry.get("status", "running"))
+                status_label = status_map.get(status_raw, status_raw)
+                if status_raw == "error" and entry.get("error"):
+                    status_label += f" ({entry['error']})"
+                sims_val = entry.get("sims_done")
+                commit_val = entry.get("commit_evals")
+                actions_val = entry.get("actions_done")
+                best_val = entry.get("best_delta_j")
+                last_val = entry.get("last_delta_j")
+                sims_s = str(int(sims_val)) if isinstance(sims_val, (int, float)) else "0"
+                commit_s = str(int(commit_val)) if isinstance(commit_val, (int, float)) else "0"
+                actions_s = str(int(actions_val)) if isinstance(actions_val, (int, float)) else "0"
+                try:
+                    best_float = float(best_val)
+                except Exception:
+                    best_float = None
+                if best_float is not None and math.isfinite(best_float):
+                    best_s = f"{best_float:.3f}"
+                else:
+                    best_s = "—"
+                try:
+                    last_float = float(last_val)
+                except Exception:
+                    last_float = None
+                if last_float is not None and math.isfinite(last_float):
+                    last_s = f"{last_float:.3f}"
+                else:
+                    last_s = "—"
+                row_style = None
+                if best_worker_id is not None and worker_id_int == best_worker_id:
+                    row_style = "bold green"
+                tbl.add_row(
+                    str(worker_id) if worker_id is not None else "—",
+                    status_label,
+                    sims_s,
+                    best_s,
+                    last_s,
+                    commit_s,
+                    actions_s,
+                    style=row_style,
+                )
+        else:
+            tbl.add_row("—", "—", "—", "—", "—", "—", "—")
+        return tbl
+
     def _build_outer_table(state: Dict[str, Any]) -> Table:
         tbl = Table(title="Outer Loop", box=box.SIMPLE_HEAVY)
         tbl.add_column("Metric", style="yellow")
@@ -466,6 +549,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             prog,
             # _build_outer_table(outer_state),  # Temporarily hidden per request
             _build_delta_table(last_payload),
+            _build_ensemble_table(last_payload),
             _build_root_table(last_payload),
             _build_actions_table(last_payload),
         )
