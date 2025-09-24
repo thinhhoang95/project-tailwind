@@ -619,6 +619,7 @@ class MCTSAgent:
                 threshold=float(cfg.threshold),
                 top_hotspots=int(cfg.top_hotspots),
                 top_flows=int(cfg.top_flows),
+                min_flights_per_flow=int(cfg.min_flights_per_flow),
                 max_flights_per_flow=int(cfg.max_flights_per_flow),
                 leiden_params=cfg.leiden_params,
                 direction_opts=cfg.direction_opts,

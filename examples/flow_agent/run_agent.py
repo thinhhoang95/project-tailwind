@@ -293,6 +293,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         top_hotspots=64,
         top_flows=12,
         max_flights_per_flow=64,
+        min_flights_per_flow=5,
         leiden_params={"threshold": 0.64, "resolution": 1.0, "seed": 0},
         direction_opts={"mode": "none"},
     )
@@ -753,7 +754,7 @@ if __name__ == '__main__':
     console.print(Panel.fit(
         "[bold cyan]AIR TRAFFIC FLOW MANAGEMENT REGULATION AGENT[/bold cyan]\n\n"
         "[dim]Created by:[/dim] [green]Thinh Hoang[/green] ([blue]thinh.hoangdinh@enac.fr[/blue])\n"
-        "[dim]Latest Revisions:[/dim] [yellow]22/09/2025[/yellow]",
+        "[dim]Latest Revisions:[/dim] [yellow]24/09/2025[/yellow]",
         title="[bold magenta]MCTS Flow Agent[/bold magenta]",
         border_style="bright_blue",
         padding=(1, 2)

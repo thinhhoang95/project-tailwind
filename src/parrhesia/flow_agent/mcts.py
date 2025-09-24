@@ -32,7 +32,7 @@ from .rate_finder import RateFinder
 @dataclass
 class MCTSConfig:
     # PUCT + widening
-    c_puct: float = 64.0 # prev. 4.0
+    c_puct: float = 2400.0 # prev. 4.0
     alpha: float = 0.7
     k0: int = 4
     k1: float = 1.0
