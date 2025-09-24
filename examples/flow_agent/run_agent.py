@@ -249,18 +249,25 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
 
     # Configure agent budgets small to keep runtime reasonable
     # Limit to a single regulation to shorten runtime and match the request
-    parallel_workers = max(1, min(os.cpu_count() or 1, 4))
+    # parallel_workers = max(1, min(os.cpu_count() or 1, 4))
+    parallel_workers = max(os.cpu_count() - 3, 4) # at least 4 MCTS workers
     mcts_cfg = MCTSConfig(
-        max_sims=128,
-        commit_depth=2,
-        commit_eval_limit=32,
-        max_actions=64,
+        max_sims=8192,
+        commit_depth=512,
+        commit_eval_limit=512,
+        max_actions=None,
         seed=69420,
         debug_prints=False,
         root_parallel_workers=int(parallel_workers),
+        flow_dirichlet_epsilon = 0.4,
+        flow_dirichlet_alpha = 0.5
     )
+    if mcts_cfg.max_actions in (None, 0):
+        action_budget_msg = "∞"
+    else:
+        action_budget_msg = str(int(mcts_cfg.max_actions))
     console.print(
-        f"[runner] Ensemble MCTS enabled with {int(parallel_workers)} worker(s); action budget set to {int(mcts_cfg.max_actions)}"
+        f"[runner] Ensemble MCTS enabled with {int(parallel_workers)} worker(s); action budget set to {action_budget_msg}"
     )
     # Force full scorer for consistency investigation (can be toggled via env)
     os.environ.setdefault("RATE_FINDER_FAST_SCORER", "0")
