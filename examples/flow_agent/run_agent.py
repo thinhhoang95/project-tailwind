@@ -752,9 +752,9 @@ if __name__ == '__main__':
     from rich.panel import Panel
     
     console.print(Panel.fit(
-        "[bold cyan]AIR TRAFFIC FLOW MANAGEMENT REGULATION AGENT[/bold cyan]\n\n"
+        "[bold cyan]AIR TRAFFIC FLOW MANAGEMENT REGULATION AGENT 3.5[/bold cyan]\n\n"
         "[dim]Created by:[/dim] [green]Thinh Hoang[/green] ([blue]thinh.hoangdinh@enac.fr[/blue])\n"
-        "[dim]Latest Revisions:[/dim] [yellow]24/09/2025[/yellow]",
+        "[dim]Latest Revisions:[/dim] [yellow]26/09/2025[/yellow]",
         title="[bold magenta]MCTS Flow Agent[/bold magenta]",
         border_style="bright_blue",
         padding=(1, 2)
