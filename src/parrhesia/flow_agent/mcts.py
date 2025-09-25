@@ -40,7 +40,7 @@ class MCTSConfig:
     # Budgets
     commit_depth: int = 1 # controlled externally
     max_sims: int = 36 # controlled externally
-    max_time_s: float = 300.0
+    max_time_s: float = 10.0
     commit_eval_limit: int = 3 # controlled externally
     # Global action budget across the search run. When set, the search stops
     # once this many low-level actions (selection, expansion, step, backup) are performed.

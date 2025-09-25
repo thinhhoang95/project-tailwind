@@ -652,6 +652,12 @@ class MCTSAgent:
         state = PlanState()
         state.metadata["hotspot_candidates"] = candidates
 
+        initial_summary: Dict[str, Any] = {}
+        try:
+            initial_summary = self._compute_final_objective(state)
+        except Exception:
+            initial_summary = {}
+
         transition = CheapTransition()
         mcts = MCTS(
             transition=transition,
@@ -664,7 +670,22 @@ class MCTSAgent:
         )
 
         if self.logger is not None:
-            self.logger.event("run_start", {"num_candidates": len(candidates), "mcts_cfg": self.mcts_cfg.__dict__})
+            payload: Dict[str, Any] = {
+                "num_candidates": len(candidates),
+                "mcts_cfg": self.mcts_cfg.__dict__,
+            }
+            if initial_summary:
+                payload.update(
+                    {
+                        "objective": initial_summary.get("objective"),
+                        "components": dict(initial_summary.get("components", {})),
+                        "artifacts": initial_summary.get("artifacts"),
+                        "num_flows": initial_summary.get("num_flows"),
+                        "spill_T": initial_summary.get("spill_T"),
+                        "in_window_releases": initial_summary.get("in_window_releases"),
+                    }
+                )
+            self.logger.event("run_start", payload)
         if self.debug_logger is not None:
             try:
                 self.debug_logger.event(

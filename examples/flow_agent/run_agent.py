@@ -624,7 +624,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         logger=logger,
         debug_logger=debug_logger,
         cold_logger=cold_logger,
-        max_regulation_count=1,
+        max_regulation_count=8,
         timer=timed,
         progress_cb=_on_progress,
         early_stop_no_improvement=early_stop_no_improvement,
