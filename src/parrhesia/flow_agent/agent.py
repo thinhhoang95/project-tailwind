@@ -13,6 +13,8 @@ import numpy as np
 
 from project_tailwind.optimize.eval.network_evaluator import NetworkEvaluator
 from project_tailwind.optimize.eval.flight_list import FlightList
+from project_tailwind.optimize.eval.delta_flight_list import DeltaFlightList
+from project_tailwind.optimize.fcfs.scheduler import assign_delays
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 
 from .actions import Action, NewRegulation
@@ -200,6 +202,7 @@ class MCTSAgent:
         early_stop_no_improvement: bool = False,
     ) -> None:
         self.evaluator = evaluator
+        self._base_flight_list = flight_list
         self.flight_list = flight_list
         self.indexer = indexer
         self.mcts_cfg = mcts_cfg or MCTSConfig()
@@ -220,14 +223,16 @@ class MCTSAgent:
         self._progress_cb = progress_cb
         self.early_stop_no_improvement = bool(early_stop_no_improvement)
 
+        self._rate_finder_cfg = rate_finder_cfg or RateFinderConfig(use_adaptive_grid=True)
         self.rate_finder = RateFinder(
             evaluator=evaluator,
             flight_list=flight_list,
             indexer=indexer,
-            config=rate_finder_cfg or RateFinderConfig(use_adaptive_grid=True),
+            config=self._rate_finder_cfg,
             timer=timer,
         )
         self.inventory = HotspotInventory(evaluator=evaluator, flight_list=flight_list, indexer=indexer)
+        self._aggregated_delays_by_flight: Dict[str, int] = {}
 
     def _timed(self, name: str) -> ContextManager[Any]:
         if self._timer_factory is None:
@@ -285,6 +290,300 @@ class MCTSAgent:
         if removed:
             state.metadata["hotspot_candidates"] = filtered
 
+
+    def _collect_crossing_flights(
+        self,
+        control_volume_id: str,
+        active_windows: Sequence[int],
+    ) -> List[str]:
+        iter_fn = getattr(self.flight_list, "iter_hotspot_crossings", None)
+        if not callable(iter_fn):
+            return []
+        flights: set[str] = set()
+        aw_seq = [int(w) for w in active_windows]
+        try:
+            for fid, *_ in iter_fn([control_volume_id], active_windows=aw_seq):
+                flights.add(str(fid))
+        except TypeError:
+            try:
+                for fid, *_ in iter_fn([control_volume_id], active_windows={control_volume_id: aw_seq}):
+                    flights.add(str(fid))
+            except Exception:
+                return []
+        except Exception:
+            return []
+        return sorted(flights)
+
+    def _extract_flow_to_flights(
+        self,
+        diagnostics: Mapping[str, Any] | None,
+        flow_ids: Sequence[str],
+    ) -> Dict[str, List[str]]:
+        flow_set = {str(fid) for fid in flow_ids}
+        result: Dict[str, List[str]] = {fid: [] for fid in flow_set}
+        if not isinstance(diagnostics, Mapping):
+            return result
+
+        candidates: List[Mapping[Any, Any]] = []
+        direct = diagnostics.get("flow_to_flights")
+        if isinstance(direct, Mapping):
+            candidates.append(direct)
+        meta = diagnostics.get("metadata") if isinstance(diagnostics, Mapping) else None
+        if isinstance(meta, Mapping):
+            meta_map = meta.get("flow_to_flights")
+            if isinstance(meta_map, Mapping):
+                candidates.append(meta_map)
+        rf_diag = diagnostics.get("rate_finder") if isinstance(diagnostics, Mapping) else None
+        if isinstance(rf_diag, Mapping):
+            rf_map = rf_diag.get("flow_to_flights")
+            if isinstance(rf_map, Mapping):
+                candidates.append(rf_map)
+
+        for candidate in candidates:
+            for key, flights in candidate.items():
+                fid = str(key)
+                if fid not in flow_set:
+                    continue
+                try:
+                    iterable = flights or []
+                except Exception:
+                    iterable = []
+                dedup = {str(x) for x in iterable if x is not None}
+                if dedup:
+                    result[fid] = sorted(dedup)
+        return result
+
+    def _compute_delays_for_regulation(self, regulation: "RegulationSpec") -> Dict[str, int]:
+        ctrl = str(regulation.control_volume_id)
+        t0 = int(regulation.window_bins[0])
+        t1 = int(regulation.window_bins[1])
+        if t1 <= t0:
+            active_windows = [t0]
+        else:
+            active_windows = list(range(t0, t1))
+
+        flow_ids = [str(fid) for fid in regulation.flow_ids]
+        flow_map = self._extract_flow_to_flights(regulation.diagnostics, flow_ids)
+        union_ids: set[str] = {fid for flights in flow_map.values() for fid in flights}
+
+        if not union_ids:
+            fallback = self._collect_crossing_flights(ctrl, active_windows)
+            union_ids.update(fallback)
+            for fid in flow_ids:
+                if not flow_map.get(fid):
+                    flow_map[fid] = list(fallback)
+        else:
+            union_sorted = sorted(union_ids)
+            for fid in flow_ids:
+                if not flow_map.get(fid):
+                    flow_map[fid] = list(union_sorted)
+
+        union_sorted = sorted(union_ids)
+        delays: Dict[str, int] = {}
+        mode = str(regulation.mode or "per_flow")
+        rates = regulation.committed_rates
+
+        if mode == "per_flow" and isinstance(rates, Mapping):
+            rate_map: Dict[str, int] = {}
+            for key, value in rates.items():
+                try:
+                    iv = int(value)
+                except Exception:
+                    continue
+                if iv > 0:
+                    rate_map[str(key)] = iv
+            for fid in flow_ids:
+                hourly_rate = rate_map.get(str(fid))
+                if hourly_rate is None or hourly_rate <= 0:
+                    continue
+                flight_ids = sorted({str(x) for x in flow_map.get(fid, []) if x is not None})
+                if not flight_ids:
+                    continue
+                try:
+                    assigned = assign_delays(
+                        flight_list=self.flight_list,
+                        identifier_list=flight_ids,
+                        reference_location=ctrl,
+                        tvtw_indexer=self.indexer,
+                        hourly_rate=int(hourly_rate),
+                        active_time_windows=list(active_windows),
+                    )
+                except Exception:
+                    continue
+                for flight_id, delay in assigned.items():
+                    try:
+                        delay_int = int(delay)
+                    except Exception:
+                        continue
+                    if delay_int <= 0:
+                        continue
+                    if delay_int > delays.get(str(flight_id), 0):
+                        delays[str(flight_id)] = delay_int
+        else:
+            try:
+                blanket_rate = int(rates) if rates is not None else 0
+            except Exception:
+                blanket_rate = 0
+            if blanket_rate > 0 and union_sorted:
+                try:
+                    assigned = assign_delays(
+                        flight_list=self.flight_list,
+                        identifier_list=union_sorted,
+                        reference_location=ctrl,
+                        tvtw_indexer=self.indexer,
+                        hourly_rate=int(blanket_rate),
+                        active_time_windows=list(active_windows),
+                    )
+                except Exception:
+                    assigned = {}
+                for flight_id, delay in assigned.items():
+                    try:
+                        delay_int = int(delay)
+                    except Exception:
+                        continue
+                    if delay_int <= 0:
+                        continue
+                    if delay_int > delays.get(str(flight_id), 0):
+                        delays[str(flight_id)] = delay_int
+
+        return delays
+
+    def _rebuild_views_after_delay(
+        self,
+        state: PlanState,
+        mcts: Optional[MCTS],
+    ) -> List[Any]:
+        if self._aggregated_delays_by_flight:
+            delta_view: FlightList = DeltaFlightList(
+                self._base_flight_list,
+                dict(self._aggregated_delays_by_flight),
+            )
+        else:
+            delta_view = self._base_flight_list
+
+        self.flight_list = delta_view
+        self.evaluator.update_flight_list(delta_view)
+        self.rate_finder = RateFinder(
+            evaluator=self.evaluator,
+            flight_list=delta_view,
+            indexer=self.indexer,
+            config=self._rate_finder_cfg,
+            timer=self._timer_factory,
+        )
+        _set_ensemble_rate_finder(self.rate_finder)
+        if mcts is not None:
+            mcts.rate_finder = self.rate_finder
+
+        self.inventory = HotspotInventory(
+            evaluator=self.evaluator,
+            flight_list=delta_view,
+            indexer=self.indexer,
+        )
+
+        cfg = self.discovery_cfg
+        descriptors = self.inventory.build_from_segments(
+            threshold=float(cfg.threshold),
+            top_hotspots=int(cfg.top_hotspots),
+            top_flows=int(cfg.top_flows),
+            min_flights_per_flow=int(cfg.min_flights_per_flow),
+            max_flights_per_flow=int(cfg.max_flights_per_flow),
+            leiden_params=cfg.leiden_params,
+            direction_opts=cfg.direction_opts,
+        )
+        state.metadata["hotspot_candidates"] = self.inventory.to_candidate_payloads(descriptors)
+        return descriptors
+
+    def _summarize_delay_application(
+        self,
+        regulation: "RegulationSpec",
+        new_delays: Mapping[str, int],
+    ) -> Dict[str, Any]:
+        values = [int(v) for v in new_delays.values() if int(v) > 0]
+        count = len(values)
+        mean_delay = float(sum(values) / count) if count else 0.0
+        max_delay = int(max(values)) if values else 0
+
+        agg_values = [int(v) for v in self._aggregated_delays_by_flight.values() if int(v) > 0]
+        agg_count = len(agg_values)
+        agg_mean = float(sum(agg_values) / agg_count) if agg_count else 0.0
+        agg_max = int(max(agg_values)) if agg_values else 0
+
+        t0, t1 = int(regulation.window_bins[0]), int(regulation.window_bins[1])
+        message = (
+            f"Applied regulation {regulation.control_volume_id} [{t0}-{t1}); "
+            f"delayed {count} flights; mean delay {mean_delay:.1f} min; updated occupancy."
+        )
+
+        return {
+            "control_volume_id": regulation.control_volume_id,
+            "window_bins": [t0, t1],
+            "mode": regulation.mode,
+            "new_delayed_flights": count,
+            "new_mean_delay_min": mean_delay,
+            "new_max_delay_min": max_delay,
+            "aggregated_delayed_flights": agg_count,
+            "aggregated_mean_delay_min": agg_mean,
+            "aggregated_max_delay_min": agg_max,
+            "message": message,
+        }
+
+    def _summarize_hotspots(self, descriptors: Sequence[Any]) -> Dict[str, Any]:
+        descriptors_list = list(descriptors)
+        count = len(descriptors_list)
+        top = descriptors_list[0] if descriptors_list else None
+        peak_metric: Optional[float] = None
+        if top is not None:
+            meta = getattr(top, "metadata", {}) or {}
+            for key in ("peak_overload", "peak_delta", "max_overload", "overload", "severity"):
+                value = meta.get(key)
+                if isinstance(value, (int, float)):
+                    peak_metric = float(value)
+                    break
+            if peak_metric is None:
+                try:
+                    peak_metric = float(getattr(top, "hotspot_prior", 0.0))
+                except Exception:
+                    peak_metric = None
+
+        if top is not None:
+            t0, t1 = int(top.window_bins[0]), int(top.window_bins[1])
+            peak_text = f"{peak_metric:.2f}" if peak_metric is not None else "n/a"
+            message = (
+                f"Hotspots recomputed: {count} segments; top segment TV {top.control_volume_id} "
+                f"[{t0}-{t1}), peak {peak_text}."
+            )
+            top_window = [t0, t1]
+            top_tv = top.control_volume_id
+        else:
+            message = "Hotspots recomputed: 0 segments."
+            top_window = None
+            top_tv = None
+
+        return {
+            "segment_count": count,
+            "top_control_volume_id": top_tv,
+            "top_window_bins": top_window,
+            "top_peak_metric": peak_metric,
+            "message": message,
+        }
+
+    def _apply_committed_regulation(
+        self,
+        state: PlanState,
+        regulation: "RegulationSpec",
+        mcts: Optional[MCTS],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        delays = self._compute_delays_for_regulation(regulation)
+        positive_delays = {fid: int(v) for fid, v in delays.items() if int(v) > 0}
+        for flight_id, delay in positive_delays.items():
+            current = int(self._aggregated_delays_by_flight.get(flight_id, 0))
+            if delay > current:
+                self._aggregated_delays_by_flight[flight_id] = delay
+
+        descriptors = self._rebuild_views_after_delay(state, mcts)
+        delay_summary = self._summarize_delay_application(regulation, positive_delays)
+        hotspot_summary = self._summarize_hotspots(descriptors)
+        return delay_summary, hotspot_summary
 
     def _run_root_parallel(
         self,
@@ -1027,6 +1326,7 @@ class MCTSAgent:
                 control_volume_id=ctrl,
                 window_bins=wb,
             )
+            delay_summary, hotspot_summary = self._apply_committed_regulation(state, regulation, mcts)
             total_delta_j += delta_j
             commits += 1
 
@@ -1167,6 +1467,10 @@ class MCTSAgent:
                     "N_entrants_flows_max": n_entrants_flows_max,
                     "entrants_max_flow_id": entrants_max_flow_id,
                 })
+                if delay_summary:
+                    self.logger.event("post_commit_delay_overlay", delay_summary)
+                if hotspot_summary:
+                    self.logger.event("post_commit_hotspot_refresh", hotspot_summary)
             if self.debug_logger is not None:
                 try:
                     self.debug_logger.event(
@@ -1177,6 +1481,10 @@ class MCTSAgent:
                             "reg": state.plan[-1].to_canonical_dict(),
                         },
                     )
+                    if delay_summary:
+                        self.debug_logger.event("overlay_update", delay_summary)
+                    if hotspot_summary:
+                        self.debug_logger.event("hotspot_refresh", hotspot_summary)
                 except Exception:
                     pass
 
