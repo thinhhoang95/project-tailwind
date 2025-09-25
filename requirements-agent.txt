@@ -7,3 +7,4 @@ shapely
 pytest-cov
 ijson
 rich
+jay
