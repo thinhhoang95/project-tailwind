@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass
@@ -17,6 +18,9 @@ except Exception:  # pragma: no cover - fallback path for tests without OpenAI i
 
 from server_tailwind.core.resources import AppResources, get_resources
 from server_tailwind.query.QueryAPIWrapper import QueryAPIWrapper
+
+
+_logger = logging.getLogger("uvicorn.error").getChild(__name__)
 
 
 SYSTEM_PROMPT = """You are FlightQueryAST, a deterministic semantic parser. Convert natural language requests about flights into a JSON object with exactly one top-level key: "query". The "query" value must be a valid AST node for the /flight_query_ast endpoint.
@@ -119,7 +123,7 @@ class NLPQueryParser:
         self._query_wrapper = query_wrapper
         self._client = client
         self._api_key = os.getenv("OPENAI_API_KEY")
-        self._default_model = os.getenv("FLIGHT_QUERY_NLP_MODEL", "gpt-4o-mini")
+        self._default_model = os.getenv("FLIGHT_QUERY_NLP_MODEL", "gpt-5")
         timeout_str = os.getenv("FLIGHT_QUERY_NLP_TIMEOUT_S", "20")
         try:
             self._timeout_s = float(timeout_str)
@@ -208,7 +212,7 @@ class NLPQueryParser:
                 "content": json.dumps(
                     {
                         "prompt": prompt,
-                        "context": self._context_payload(),
+                        # "context": self._context_payload(), # currently context is disabled
                     },
                     separators=(",", ":"),
                 ),
@@ -221,16 +225,20 @@ class NLPQueryParser:
             response = await client.chat.completions.create(
                 model=resolved_model,
                 messages=messages,
-                temperature=0,
                 response_format={"type": "json_object"},
                 timeout=self._timeout_s,
+                reasoning_effort="medium"
             )
         except (APITimeoutError, APIConnectionError) as exc:
             raise NLPQueryParserError("LLM parser request timed out", status_code=502) from exc
         except APIStatusError as exc:
-            raise NLPQueryParserError(f"LLM parser request failed ({exc.status_code})", status_code=502) from exc
+            import traceback
+            error_details = f"OpenAI error: {type(exc).__name__}: {str(exc)}\nTraceback:\n{traceback.format_exc()}"
+            raise NLPQueryParserError(f"LLM parser request failed: {error_details}", status_code=502) from exc
         except OpenAIError as exc:  # pragma: no cover - defensive
-            raise NLPQueryParserError("LLM parser request failed", status_code=502) from exc
+            import traceback
+            error_details = f"OpenAI error: {type(exc).__name__}: {str(exc)}\nTraceback:\n{traceback.format_exc()}"
+            raise NLPQueryParserError(f"LLM parser request failed: {error_details}", status_code=502) from exc
 
         latency_ms = (time.perf_counter() - start) * 1000.0
         if not response.choices:
@@ -242,6 +250,7 @@ class NLPQueryParser:
 
         try:
             parsed = json.loads(content)
+            _logger.info("Parsed query payload: %s", json.dumps(parsed, separators=(",", ":")))
         except json.JSONDecodeError as exc:
             raise NLPQueryParserError("LLM returned invalid JSON", status_code=400) from exc
 
