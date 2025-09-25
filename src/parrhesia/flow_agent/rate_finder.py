@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from statistics import median
+import threading
 from typing import Any, Callable, ContextManager, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -129,6 +130,7 @@ class RateFinder:
         self._rate_grid_cache: "OrderedDict[Tuple, Tuple[float, ...]]" = OrderedDict()
         self._base_occ_cache: "OrderedDict[Tuple[str, str], Tuple[np.ndarray, np.ndarray]]" = OrderedDict()
         self._timer_factory = timer
+        self._lock = threading.RLock()
 
     def _timed(self, name: str) -> ContextManager[Any]:
         if self._timer_factory is None:
@@ -137,6 +139,24 @@ class RateFinder:
 
     # ------------------------------------------------------------------
     def find_rates(
+        self,
+        *,
+        plan_state: PlanState,
+        control_volume_id: str,
+        window_bins: Tuple[int, int],
+        flows: Mapping[str, Sequence[str]],
+        mode: str = "per_flow",
+    ) -> Tuple[Union[int, Dict[str, float]], float, Dict[str, object]]:
+        with self._lock:
+            return self._find_rates_locked(
+                plan_state=plan_state,
+                control_volume_id=control_volume_id,
+                window_bins=window_bins,
+                flows=flows,
+                mode=mode,
+            )
+
+    def _find_rates_locked(
         self,
         *,
         plan_state: PlanState,

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import math
+import threading
 import time
+from concurrent.futures import Executor, Future
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable, ContextManager, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
@@ -111,6 +113,7 @@ class MCTS:
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
         debug_logger: Optional[SearchLogger] = None,
         cold_logger: Optional[SearchLogger] = None,
+        commit_executor: Optional[Executor] = None,
     ) -> None:
         self.transition = transition
         self.rate_finder = rate_finder
@@ -138,9 +141,87 @@ class MCTS:
         self._root_noise_applied_run: bool = False
         self._flow_noise_nodes_run: Set[str] = set()
         self._hotspot_noise_nodes_run: Set[str] = set()
+        self._commit_executor = commit_executor
+        self._commit_lock = threading.Lock()
+        self._pending_commit_jobs: Dict[Tuple, Future] = {}
 
     class _ActionBudgetExhausted(Exception):
         pass
+
+    def _pending_commit_count(self) -> int:
+        with self._commit_lock:
+            return sum(1 for fut in self._pending_commit_jobs.values() if not fut.done())
+
+    def _commit_eval_job(
+        self,
+        plan_state: PlanState,
+        control_volume_id: str,
+        window_bins: Tuple[int, int],
+        flows: Mapping[str, Sequence[str]],
+        mode: str,
+    ) -> Tuple[Dict[str, float] | int, float, Dict[str, Any]]:
+        with self._timed("mcts.rate_finder.find_rates"):
+            result = self.rate_finder.find_rates(
+                plan_state=plan_state,
+                control_volume_id=control_volume_id,
+                window_bins=window_bins,
+                flows=flows,
+                mode=mode,
+            )
+        return result
+
+    def _finalize_commit_future(
+        self,
+        key: Tuple,
+        future: Future,
+        *,
+        reason: str,
+        sim_index: Optional[int] = None,
+        step_index: Optional[int] = None,
+    ) -> None:
+        try:
+            rates, delta_j, info = future.result()
+        except Exception as exc:
+            rates = {}
+            delta_j = 0.0
+            info = {"reason": "async_error", "error": repr(exc)}
+        with self._commit_lock:
+            existing = self._pending_commit_jobs.get(key)
+            if existing is not future:
+                return
+            self._pending_commit_jobs.pop(key, None)
+            self._commit_eval_cache[key] = (rates, float(delta_j), info)
+            self._commit_calls += 1
+            self._last_delta_j = float(delta_j)
+        self._log_debug_event(
+            "commit_eval_async_complete",
+            {
+                "cache_size": len(self._commit_eval_cache),
+                "delta_j": float(delta_j),
+                "reason": reason,
+            },
+            sim_index=sim_index,
+            step_index=step_index,
+        )
+
+    def _commit_future_callback(
+        self,
+        key: Tuple,
+        reason: str,
+        sim_index: Optional[int],
+        step_index: Optional[int],
+    ) -> Callable[[Future], None]:
+        def _cb(fut: Future) -> None:
+            self._finalize_commit_future(key, fut, reason=reason, sim_index=sim_index, step_index=step_index)
+
+        return _cb
+
+    def wait_for_pending_commit_evals(self, timeout: Optional[float] = None) -> None:
+        futures: List[Future]
+        with self._commit_lock:
+            futures = list(self._pending_commit_jobs.values())
+        for fut in futures:
+            fut.result(timeout=timeout)
 
     def _timed(self, name: str) -> ContextManager[Any]:
         if self._timer_factory is None:
@@ -1618,7 +1699,18 @@ class MCTS:
             tuple(int(b) for b in ctx.window_bins),
             tuple(sorted(flows.keys())),
         )
-        cached = self._commit_eval_cache.get(base_key)
+        cached: Optional[Tuple[Dict[str, float] | int, float, Dict[str, Any]]]
+        future: Optional[Future]
+        with self._commit_lock:
+            cached = self._commit_eval_cache.get(base_key)
+            future = self._pending_commit_jobs.get(base_key)
+
+        if cached is None and future is not None and future.done():
+            self._finalize_commit_future(base_key, future, reason="reuse", sim_index=sim_index, step_index=step_index)
+            with self._commit_lock:
+                cached = self._commit_eval_cache.get(base_key)
+                future = self._pending_commit_jobs.get(base_key)
+
         if cached is not None:
             rates, delta_j, info = cached
             self._log_debug_event(
@@ -1632,9 +1724,31 @@ class MCTS:
             )
             if len(self._commit_eval_cache) < int(self.cfg.min_unique_commit_evals):
                 self._seed_extra_commit_eval(state, ctx, flows, sim_index=sim_index, step_index=step_index)
+        elif future is not None:
+            self._log_debug_event(
+                "commit_eval_pending",
+                {
+                    "flows": len(ctx.selected_flow_ids),
+                    "commit_calls": int(self._commit_calls),
+                    "pending": self._pending_commit_count(),
+                },
+                sim_index=sim_index,
+                step_index=step_index,
+            )
+            pending_diag = {
+                "control_volume_id": str(ctx.control_volume_id),
+                "window_bins": [window_norm[0], window_norm[1]],
+                "mode": mode_norm,
+                "reason": "async_pending",
+            }
+            commit_action = CommitRegulation(
+                committed_rates={},
+                diagnostics={"rate_finder": pending_diag},
+            )
+            return commit_action, 0.0
         else:
-            if self._commit_calls >= int(self.cfg.commit_eval_limit):
-                # Treat as no-op commit with zero improvement to avoid extra cost
+            outstanding = self._commit_calls + self._pending_commit_count()
+            if outstanding >= int(self.cfg.commit_eval_limit):
                 rates, delta_j, info = ({}, 0.0, {"reason": "eval_budget_exhausted"})
                 self._log_debug_event(
                     "commit_eval_budget_exhausted",
@@ -1646,6 +1760,48 @@ class MCTS:
                     sim_index=sim_index,
                     step_index=step_index,
                 )
+            elif self._commit_executor is not None:
+                job_state = state.copy()
+                window_tuple = tuple(int(b) for b in ctx.window_bins)
+                mode_value = "per_flow" if ctx.mode == "per_flow" else "blanket"
+                future_job = self._commit_executor.submit(
+                    self._commit_eval_job,
+                    job_state,
+                    str(ctx.control_volume_id),
+                    window_tuple,
+                    flows,
+                    mode_value,
+                )
+                with self._commit_lock:
+                    self._pending_commit_jobs[base_key] = future_job
+                future_job.add_done_callback(
+                    self._commit_future_callback(
+                        base_key,
+                        reason="scheduled",
+                        sim_index=sim_index,
+                        step_index=step_index,
+                    )
+                )
+                self._log_debug_event(
+                    "commit_eval_async_submitted",
+                    {
+                        "flows": len(ctx.selected_flow_ids),
+                        "pending": self._pending_commit_count(),
+                    },
+                    sim_index=sim_index,
+                    step_index=step_index,
+                )
+                pending_diag = {
+                    "control_volume_id": str(ctx.control_volume_id),
+                    "window_bins": [window_norm[0], window_norm[1]],
+                    "mode": mode_norm,
+                    "reason": "async_pending",
+                }
+                commit_action = CommitRegulation(
+                    committed_rates={},
+                    diagnostics={"rate_finder": pending_diag},
+                )
+                return commit_action, 0.0
             else:
                 with self._timed("mcts.rate_finder.find_rates"):
                     rates, delta_j, info = self.rate_finder.find_rates(
@@ -1657,7 +1813,8 @@ class MCTS:
                     )
                 self._commit_calls += 1
                 self._last_delta_j = float(delta_j)
-                self._commit_eval_cache[base_key] = (rates, delta_j, info)
+                with self._commit_lock:
+                    self._commit_eval_cache[base_key] = (rates, delta_j, info)
                 self._log_debug_event(
                     "commit_eval_result",
                     {
@@ -1742,37 +1899,77 @@ class MCTS:
                 tuple(int(b) for b in getattr(ctx, "window_bins", (0, 0))),
                 new_signature,
             )
-            if new_key in self._commit_eval_cache:
+            with self._commit_lock:
+                key_in_cache = new_key in self._commit_eval_cache
+                key_pending = new_key in self._pending_commit_jobs
+            if key_in_cache or key_pending:
                 continue
             alt_flows: Dict[str, Tuple[str, ...]] = {}
             for fid in alt_ids:
                 flights = flow_to_flights.get(fid, ())
                 alt_flows[str(fid)] = tuple(str(x) for x in flights)
-            try:
-                with self._timed("mcts.rate_finder.find_rates"):
-                    rates, delta_j, info = self.rate_finder.find_rates(
-                        plan_state=state,
-                        control_volume_id=str(getattr(ctx, "control_volume_id", "")),
-                        window_bins=tuple(int(b) for b in getattr(ctx, "window_bins", (0, 0))),
-                        flows=alt_flows,
-                        mode="per_flow" if getattr(ctx, "mode", "per_flow") == "per_flow" else "blanket",
-                    )
-            except Exception:
-                continue
-            self._commit_calls += 1
-            self._commit_eval_cache[new_key] = (rates, delta_j, info)
-            self._log_debug_event(
-                "seed_commit_eval",
-                {
-                    "flows": len(alt_flows),
-                    "cache_size": len(self._commit_eval_cache),
-                    "min_target": target,
-                },
-                sim_index=sim_index,
-                step_index=step_index,
-            )
-            if self._commit_calls >= int(self.cfg.commit_eval_limit):
+            outstanding = self._commit_calls + self._pending_commit_count()
+            if outstanding >= int(self.cfg.commit_eval_limit):
                 break
+            mode_value = "per_flow" if getattr(ctx, "mode", "per_flow") == "per_flow" else "blanket"
+            window_tuple = tuple(int(b) for b in getattr(ctx, "window_bins", (0, 0)))
+            if self._commit_executor is not None:
+                job_state = state.copy()
+                future_job = self._commit_executor.submit(
+                    self._commit_eval_job,
+                    job_state,
+                    str(getattr(ctx, "control_volume_id", "")),
+                    window_tuple,
+                    alt_flows,
+                    mode_value,
+                )
+                with self._commit_lock:
+                    self._pending_commit_jobs[new_key] = future_job
+                future_job.add_done_callback(
+                    self._commit_future_callback(
+                        new_key,
+                        reason="seed",
+                        sim_index=sim_index,
+                        step_index=step_index,
+                    )
+                )
+                self._log_debug_event(
+                    "seed_commit_eval_scheduled",
+                    {
+                        "flows": len(alt_flows),
+                        "pending": self._pending_commit_count(),
+                        "min_target": target,
+                    },
+                    sim_index=sim_index,
+                    step_index=step_index,
+                )
+            else:
+                try:
+                    with self._timed("mcts.rate_finder.find_rates"):
+                        rates, delta_j, info = self.rate_finder.find_rates(
+                            plan_state=state,
+                            control_volume_id=str(getattr(ctx, "control_volume_id", "")),
+                            window_bins=window_tuple,
+                            flows=alt_flows,
+                            mode=mode_value,
+                        )
+                except Exception:
+                    continue
+                self._commit_calls += 1
+                with self._commit_lock:
+                    self._commit_eval_cache[new_key] = (rates, delta_j, info)
+                self._log_debug_event(
+                    "seed_commit_eval",
+                    {
+                        "flows": len(alt_flows),
+                        "cache_size": len(self._commit_eval_cache),
+                        "min_target": target,
+                    },
+                    sim_index=sim_index,
+                    step_index=step_index,
+                )
+                if self._commit_calls >= int(self.cfg.commit_eval_limit):
+                    break
 
     # --------------------------- Signatures/decoding -----------------------
     def _signature_for_action(self, state: PlanState, action: Action) -> Tuple:

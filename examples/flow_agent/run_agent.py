@@ -248,9 +248,8 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         console.print(f"[yellow]Failed to instrument commit attempts:[/yellow] {_exc}")
 
     # Configure agent budgets small to keep runtime reasonable
-    # Limit to a single regulation to shorten runtime and match the request
-    # parallel_workers = max(1, min(os.cpu_count() or 1, 4))
-    parallel_workers = max(os.cpu_count() - 3, 4) # at least 4 MCTS workers
+    # Force a single persistent tree (Statement 2) by running a single root worker
+    parallel_workers = 1
     mcts_cfg = MCTSConfig(
         max_sims=8192,
         commit_depth=512,
@@ -624,7 +623,8 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         logger=logger,
         debug_logger=debug_logger,
         cold_logger=cold_logger,
-        max_regulation_count=8,
+        # Allow up to three committed regulations for this demo run
+        max_regulation_count=3,
         timer=timed,
         progress_cb=_on_progress,
         early_stop_no_improvement=early_stop_no_improvement,
