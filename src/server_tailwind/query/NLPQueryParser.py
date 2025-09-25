@@ -133,7 +133,7 @@ class NLPQueryParser:
         self._client = client
         self._api_key = os.getenv("OPENAI_API_KEY")
         self._default_model = os.getenv("FLIGHT_QUERY_NLP_MODEL", "gpt-5")
-        timeout_str = os.getenv("FLIGHT_QUERY_NLP_TIMEOUT_S", "20")
+        timeout_str = os.getenv("FLIGHT_QUERY_NLP_TIMEOUT_S", "50")
         try:
             self._timeout_s = float(timeout_str)
         except ValueError:
