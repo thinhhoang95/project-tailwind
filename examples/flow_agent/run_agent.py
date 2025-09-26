@@ -83,6 +83,10 @@ def _build_params_table(
     indexer_path: Path,
     caps_path: Path,
     early_stop_no_improvement: bool,
+    outer_max_runs: Optional[int],
+    outer_max_time_s: Optional[float],
+    outer_max_actions: Optional[int],
+    diversify_ban_selected: bool,
 ) -> Table:
     tbl = Table(title="MCTS Agent Parameters", box=box.SIMPLE)
     tbl.add_column("Component", style="cyan", no_wrap=True)
@@ -107,6 +111,22 @@ def _build_params_table(
     add_cfg_rows("Discovery", disc_cfg)
     # Agent flags
     tbl.add_row("Agent", "early_stop_no_improvement", str(early_stop_no_improvement))
+    tbl.add_row(
+        "Agent",
+        "outer_max_runs",
+        ("∞" if outer_max_runs in (None, 0) else str(int(outer_max_runs))),
+    )
+    tbl.add_row(
+        "Agent",
+        "outer_max_time_s",
+        ("∞" if outer_max_time_s in (None, 0.0) else f"{float(outer_max_time_s):.1f}"),
+    )
+    tbl.add_row(
+        "Agent",
+        "outer_max_actions",
+        ("∞" if outer_max_actions in (None, 0) else str(int(outer_max_actions))),
+    )
+    tbl.add_row("Agent", "diversify_ban_selected", str(bool(diversify_ban_selected)))
     return tbl
 
 
@@ -299,6 +319,42 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
 
     # Agent-level flags
     early_stop_no_improvement = False
+    outer_max_runs_env = os.environ.get("FLOW_AGENT_OUTER_MAX_RUNS")
+    outer_max_time_env = os.environ.get("FLOW_AGENT_OUTER_MAX_TIME_S")
+    outer_max_actions_env = os.environ.get("FLOW_AGENT_OUTER_MAX_ACTIONS")
+    diversify_env = os.environ.get("FLOW_AGENT_DIVERSIFY_BAN_SELECTED", "0")
+
+    def _parse_int(value: Optional[str]) -> Optional[int]:
+        if not value:
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _parse_float(value: Optional[str]) -> Optional[float]:
+        if not value:
+            return None
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    outer_max_runs_param = _parse_int(outer_max_runs_env)
+    if outer_max_runs_param is None:
+        outer_max_runs_param = 1
+    elif outer_max_runs_param <= 0:
+        outer_max_runs_param = None
+
+    outer_max_time_param = _parse_float(outer_max_time_env)
+    if outer_max_time_param is not None and outer_max_time_param <= 0:
+        outer_max_time_param = None
+
+    outer_max_actions_param = _parse_int(outer_max_actions_env)
+    if outer_max_actions_param is not None and outer_max_actions_param <= 0:
+        outer_max_actions_param = None
+
+    diversify_flag = bool(str(diversify_env).strip() not in ("", "0", "false", "False"))
 
     # Prepare Rich progress bar and callback
     prog = Progress(
@@ -342,6 +398,13 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         "outer_stop_info": None,
         "outer_last_delta_j": None,
         "outer_run_index": 1,
+        "outer_master_runs_completed": 0,
+        "outer_master_max_runs": (None if outer_max_runs_param in (None, 0) else int(outer_max_runs_param)),
+        "outer_master_max_time_s": outer_max_time_param,
+        "outer_master_max_actions": outer_max_actions_param,
+        "outer_master_total_actions": 0,
+        "outer_master_elapsed_s": 0.0,
+        "outer_master_run_index": 1,
     }
 
     def _sig_to_label(sig: Any) -> str:
@@ -542,6 +605,27 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             tbl.add_row("Stop info", str(compact))
         else:
             tbl.add_row("Stop info", "—")
+        mruns = state.get("outer_master_runs_completed")
+        tbl.add_row(
+            "Master runs",
+            f"{int(mruns) if isinstance(mruns, (int, float)) else 0}/"
+            f"{('∞' if state.get('outer_master_max_runs') in (None, 0) else str(int(state.get('outer_master_max_runs'))))}",
+        )
+        tbl.add_row(
+            "Master actions",
+            f"{int(state.get('outer_master_total_actions', 0))}/"
+            f"{('∞' if state.get('outer_master_max_actions') in (None, 0) else str(int(state.get('outer_master_max_actions'))))}",
+        )
+        elapsed_master = state.get("outer_master_elapsed_s")
+        tbl.add_row(
+            "Master elapsed s",
+            f"{float(elapsed_master):.1f}" if isinstance(elapsed_master, (int, float)) else "—",
+        )
+        max_time = state.get("outer_master_max_time_s")
+        tbl.add_row(
+            "Master max time s",
+            "∞" if max_time in (None, 0.0) else f"{float(max_time):.1f}",
+        )
         return tbl
 
     def _compose_live() -> Group:
@@ -628,6 +712,10 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         timer=timed,
         progress_cb=_on_progress,
         early_stop_no_improvement=early_stop_no_improvement,
+        outer_max_runs=outer_max_runs_param,
+        outer_max_time_s=outer_max_time_param,
+        outer_max_actions=outer_max_actions_param,
+        diversify_ban_selected=diversify_flag,
     )
 
     # Show parameter table once before starting
@@ -641,6 +729,10 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         indexer_path=indexer_path,
         caps_path=caps_path,
         early_stop_no_improvement=early_stop_no_improvement,
+        outer_max_runs=outer_max_runs_param,
+        outer_max_time_s=outer_max_time_param,
+        outer_max_actions=outer_max_actions_param,
+        diversify_ban_selected=diversify_flag,
     ))
 
     console.print("[runner] Starting agent.run() ...")
