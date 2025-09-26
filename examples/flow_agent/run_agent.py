@@ -19,7 +19,7 @@ from rich.console import Group
 
 # Time Profiling helpers ===
 from contextlib import contextmanager
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 import time, atexit
 
 _stats = defaultdict(lambda: [0, 0.0])  # name -> [calls, total_seconds]
@@ -71,6 +71,414 @@ from project_tailwind.optimize.eval.network_evaluator import NetworkEvaluator
 
 console = Console()
 
+
+class GlobalStats:
+    """Session-wide aggregator for monitoring and telemetry."""
+
+    def __init__(self, *, logger: Optional[SearchLogger] = None) -> None:
+        self.outer_runs_started: int = 0
+        self.outer_runs_completed: int = 0
+        self._outer_last_index: int = 0
+        self.started_at_ts: float = time.time()
+        self.last_snapshot_ts: float = self.started_at_ts
+
+        self.outer_max_run_param: Optional[int] = None
+        self.outer_max_time: Optional[float] = None
+        self.outer_max_evals: Optional[int] = None
+        self.outer_max_expansions: Optional[int] = None
+        self.outer_max_actions: Optional[int] = None
+
+        self.last_stop_reason: Optional[str] = None
+        self.last_stop_info: Optional[Dict[str, Any]] = None
+
+        self.best_objective_value: Optional[float] = None
+        self.best_delta_j: Optional[float] = None
+        self.best_outer_iter: Optional[int] = None
+        self.best_plan_id: Optional[str] = None
+        self.best_timestamp: Optional[float] = None
+        self.best_plan_summary: Optional[str] = None
+        self.best_N_flights_flows: Optional[int] = None
+        self.best_N_entrants_flows: Optional[int] = None
+
+        self.action_counts: Counter[str] = Counter()
+        self.inner_stats: Dict[str, Any] = {}
+
+        self._logger = logger
+        self._current_outer_index: Optional[int] = None
+        self._current_outer_started_at: Optional[float] = None
+        self._best_updated_this_outer: bool = False
+        self._outer_runs_since_best: int = 0
+
+    @staticmethod
+    def _coerce_int(value: Any) -> Optional[int]:
+        try:
+            if value is None:
+                return None
+            iv = int(value)
+            return iv
+        except Exception:
+            return None
+
+    @staticmethod
+    def _coerce_float(value: Any) -> Optional[float]:
+        try:
+            if value is None:
+                return None
+            fv = float(value)
+            if math.isfinite(fv):
+                return fv
+            return None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_flow_map(flow_map: Mapping[str, Sequence[Any]] | None) -> Dict[str, List[str]]:
+        if not isinstance(flow_map, Mapping):
+            return {}
+        out: Dict[str, List[str]] = {}
+        for key, flights in flow_map.items():
+            try:
+                key_s = str(key)
+            except Exception:
+                key_s = repr(key)
+            items: List[str] = []
+            if isinstance(flights, Sequence):
+                for item in flights:
+                    try:
+                        items.append(str(item))
+                    except Exception:
+                        continue
+            out[key_s] = items
+        return out
+
+    @staticmethod
+    def _normalize_entrants(entrants: Mapping[str, Any] | None) -> Dict[str, int]:
+        if not isinstance(entrants, Mapping):
+            return {}
+        out: Dict[str, int] = {}
+        for key, value in entrants.items():
+            try:
+                key_s = str(key)
+            except Exception:
+                key_s = repr(key)
+            try:
+                out[key_s] = int(value)
+            except Exception:
+                out[key_s] = 0
+        return out
+
+    @staticmethod
+    def _compute_flow_metrics(
+        flow_to_flights: Mapping[str, Sequence[str]] | None,
+        entrants_by_flow: Mapping[str, int] | None,
+    ) -> Tuple[Optional[int], Optional[int]]:
+        flights_total: Optional[int] = None
+        if flow_to_flights:
+            unique: set[str] = set()
+            for flights in flow_to_flights.values():
+                for fid in flights:
+                    unique.add(str(fid))
+            flights_total = len(unique)
+
+        entrants_total: Optional[int] = None
+        if entrants_by_flow:
+            total = 0
+            for count in entrants_by_flow.values():
+                try:
+                    total += int(count)
+                except Exception:
+                    continue
+            entrants_total = total
+        return flights_total, entrants_total
+
+    @staticmethod
+    def _summarize_plan(meta: Mapping[str, Any], flow_to_flights: Mapping[str, Sequence[str]]) -> str:
+        ctrl = meta.get("control_volume_id")
+        t0, t1 = meta.get("window_bins", [None, None])
+        mode = meta.get("mode", "?")
+        flow_ids = meta.get("flow_ids")
+        if not isinstance(flow_ids, Sequence) or isinstance(flow_ids, (str, bytes)):
+            flow_ids = list(flow_to_flights.keys())
+        flow_count = len(flow_ids) if flow_ids else 0
+        rates = meta.get("committed_rates") or meta.get("rates")
+        rate_summary = ""
+        if isinstance(rates, Mapping):
+            try:
+                vals = [float(v) for v in rates.values() if float(v) > 0]
+                if vals:
+                    rate_summary = f" rates≈[{min(vals):.0f},{max(vals):.0f}]"
+            except Exception:
+                rate_summary = ""
+        elif isinstance(rates, (int, float)):
+            try:
+                if float(rates) > 0:
+                    rate_summary = f" rate≈{float(rates):.0f}"
+            except Exception:
+                rate_summary = ""
+        return (
+            f"TV {ctrl} bins {t0}-{t1} [{mode}] flows={flow_count}{rate_summary}"
+            if ctrl is not None
+            else f"[{mode}] flows={flow_count}{rate_summary}"
+        )
+
+    def _top_actions(self, limit: int = 5) -> List[Dict[str, Any]]:
+        total = sum(self.action_counts.values())
+        if total <= 0:
+            return []
+        top_items = self.action_counts.most_common(limit)
+        out: List[Dict[str, Any]] = []
+        for action, count in top_items:
+            percent = (count / total) * 100.0 if total else 0.0
+            out.append({"action": action, "count": count, "percent": percent})
+        return out
+
+    def _emit_snapshot(self, event: str, extra: Optional[Mapping[str, Any]] = None) -> None:
+        if self._logger is None:
+            return
+        payload: Dict[str, Any] = {
+            "event": event,
+            "timestamp": time.time(),
+            "outer_runs_started": self.outer_runs_started,
+            "outer_runs_completed": self.outer_runs_completed,
+            "outer_max_run_param": self.outer_max_run_param,
+            "outer_max_time": self.outer_max_time,
+            "outer_max_actions": self.outer_max_actions,
+            "outer_max_evals": self.outer_max_evals,
+            "outer_max_expansions": self.outer_max_expansions,
+            "last_stop_reason": self.last_stop_reason,
+            "best_objective_value": self.best_objective_value,
+            "best_delta_j": self.best_delta_j,
+            "best_outer_iter": self.best_outer_iter,
+            "best_plan_id": self.best_plan_id,
+            "best_plan_summary": self.best_plan_summary,
+            "best_N_flights_flows": self.best_N_flights_flows,
+            "best_N_entrants_flows": self.best_N_entrants_flows,
+            "actions_top": self._top_actions(),
+            "actions_total": sum(self.action_counts.values()),
+        }
+        if extra:
+            for key, value in extra.items():
+                if key not in payload:
+                    payload[key] = value
+        event_name = "global_best_update" if event == "best_update" else "global_stats_snapshot"
+        self._logger.event(event_name, payload)
+
+    def on_outer_start(self, outer_index: int, limits: Optional[Mapping[str, Any]] = None) -> None:
+        self.outer_runs_started = max(self.outer_runs_started, int(max(outer_index, 0)))
+        self._current_outer_index = int(max(outer_index, 0))
+        self._current_outer_started_at = time.time()
+        self.last_snapshot_ts = self._current_outer_started_at
+        self._best_updated_this_outer = False
+
+        if limits:
+            maybe_runs = self._coerce_int(limits.get("outer_max_run_param"))
+            if maybe_runs and maybe_runs > 0:
+                self.outer_max_run_param = maybe_runs
+            maybe_time = self._coerce_float(limits.get("outer_max_time"))
+            if maybe_time and maybe_time > 0:
+                self.outer_max_time = maybe_time
+            maybe_actions = self._coerce_int(limits.get("outer_max_actions"))
+            if maybe_actions and maybe_actions > 0:
+                self.outer_max_actions = maybe_actions
+            maybe_evals = self._coerce_int(limits.get("outer_max_evals"))
+            if maybe_evals and maybe_evals > 0:
+                self.outer_max_evals = maybe_evals
+            maybe_exp = self._coerce_int(limits.get("outer_max_expansions"))
+            if maybe_exp and maybe_exp > 0:
+                self.outer_max_expansions = maybe_exp
+
+    def on_outer_end(self, outer_index: int, meta: Optional[Mapping[str, Any]] = None) -> None:
+        self.outer_runs_completed += 1
+        self._outer_last_index = int(max(outer_index, 0))
+        self.last_snapshot_ts = time.time()
+        if not self._best_updated_this_outer and self.outer_runs_completed > 0:
+            self._outer_runs_since_best += 1
+        if meta:
+            stop_reason = meta.get("stop_reason")
+            if isinstance(stop_reason, str):
+                self.last_stop_reason = stop_reason
+            stop_info = meta.get("stop_info")
+            if isinstance(stop_info, Mapping):
+                self.last_stop_info = dict(stop_info)
+            total_delta = meta.get("total_delta_j")
+            if total_delta is not None:
+                try:
+                    meta_total_delta = float(total_delta)
+                except Exception:
+                    meta_total_delta = None
+            else:
+                meta_total_delta = None
+            extra = {
+                "outer_index": int(max(outer_index, 0)),
+                "commits": meta.get("commits"),
+                "total_delta_j": meta_total_delta,
+                "stop_reason": self.last_stop_reason,
+            }
+        else:
+            extra = {"outer_index": int(max(outer_index, 0))}
+        self._emit_snapshot("outer_end", extra)
+        self._current_outer_index = None
+        self._current_outer_started_at = None
+
+    def on_candidate_scored(
+        self,
+        candidate_id: str,
+        objective: float,
+        delta_j: float,
+        meta: Mapping[str, Any],
+    ) -> None:
+        flow_map = self._normalize_flow_map(meta.get("flow_to_flights"))
+        entrants_map = self._normalize_entrants(meta.get("entrants_by_flow"))
+        self._maybe_update_best(
+            source="candidate",
+            identifier=candidate_id,
+            objective=self._coerce_float(objective),
+            delta_j=self._coerce_float(delta_j),
+            flow_to_flights=flow_map,
+            entrants_by_flow=entrants_map,
+            meta=meta,
+        )
+
+    def on_action(self, action_type: str, count: int = 1) -> None:
+        if count <= 0:
+            return
+        self.action_counts[action_type] += int(count)
+
+    def on_plan_committed(
+        self,
+        plan: Sequence[Any],
+        delta_j: float,
+        flow_to_flights: Mapping[str, Sequence[str]] | None,
+        entrants_by_flow: Mapping[str, Any] | None,
+        meta: Mapping[str, Any],
+    ) -> None:
+        normalized_flows = self._normalize_flow_map(flow_to_flights)
+        entrants_map = self._normalize_entrants(entrants_by_flow)
+        extended_meta = dict(meta)
+        extended_meta.setdefault("flow_ids", [str(idx) for idx in normalized_flows.keys()])
+        extended_meta.setdefault("committed_rates", meta.get("committed_rates") or meta.get("rates"))
+        self._maybe_update_best(
+            source="commit",
+            identifier=str(meta.get("plan_id") or len(plan)),
+            objective=self._coerce_float(meta.get("objective")),
+            delta_j=self._coerce_float(delta_j),
+            flow_to_flights=normalized_flows,
+            entrants_by_flow=entrants_map,
+            meta=extended_meta,
+        )
+
+    def on_limit_hit(self, kind: str, meta: Optional[Mapping[str, Any]] = None) -> None:
+        self.last_stop_reason = str(kind)
+        if isinstance(meta, Mapping):
+            self.last_stop_info = dict(meta)
+        else:
+            self.last_stop_info = None
+
+    def update_inner_stats(self, payload: Mapping[str, Any]) -> None:
+        try:
+            self.inner_stats = dict(payload)
+        except Exception:
+            self.inner_stats = {}
+
+    def snapshot_for_display(self) -> Dict[str, Any]:
+        now = time.time()
+        elapsed = now - self.started_at_ts
+        time_since_outer = None
+        if self._current_outer_started_at is not None:
+            time_since_outer = now - self._current_outer_started_at
+        time_since_best = None
+        if self.best_timestamp is not None:
+            time_since_best = max(0.0, now - self.best_timestamp)
+        outer_pct = None
+        if self.outer_max_run_param:
+            outer_pct = (self.outer_runs_completed / self.outer_max_run_param) * 100.0
+        time_pct = None
+        if self.outer_max_time and self.outer_max_time > 0:
+            time_pct = min(100.0, (elapsed / self.outer_max_time) * 100.0)
+        progress = {
+            "outer_runs_completed": self.outer_runs_completed,
+            "outer_runs_started": self.outer_runs_started,
+            "outer_last_index": self._outer_last_index,
+            "outer_max_run_param": self.outer_max_run_param,
+            "outer_progress_pct": outer_pct,
+            "time_elapsed": elapsed,
+            "outer_max_time": self.outer_max_time,
+            "time_progress_pct": time_pct,
+            "outer_max_actions": self.outer_max_actions,
+            "outer_max_evals": self.outer_max_evals,
+            "outer_max_expansions": self.outer_max_expansions,
+            "current_outer_index": self._current_outer_index,
+            "time_since_outer_start": time_since_outer,
+            "last_stop_reason": self.last_stop_reason,
+            "last_stop_info": self.last_stop_info,
+            "outer_runs_since_best": self._outer_runs_since_best,
+        }
+        best = {
+            "objective": self.best_objective_value,
+            "delta_j": self.best_delta_j,
+            "outer_iter": self.best_outer_iter,
+            "plan_id": self.best_plan_id,
+            "timestamp": self.best_timestamp,
+            "time_since_best": time_since_best,
+            "plan_summary": self.best_plan_summary,
+            "n_flights_flows": self.best_N_flights_flows,
+            "n_entrants_flows": self.best_N_entrants_flows,
+        }
+        actions = {
+            "top": self._top_actions(),
+            "total": sum(self.action_counts.values()),
+        }
+        return {
+            "progress": progress,
+            "best": best,
+            "actions": actions,
+            "inner": dict(self.inner_stats),
+        }
+
+    def _maybe_update_best(
+        self,
+        *,
+        source: str,
+        identifier: str,
+        objective: Optional[float],
+        delta_j: Optional[float],
+        flow_to_flights: Mapping[str, Sequence[str]],
+        entrants_by_flow: Mapping[str, int],
+        meta: Mapping[str, Any],
+    ) -> None:
+        if objective is None:
+            return
+        if self.best_objective_value is not None and objective >= self.best_objective_value:
+            return
+
+        flights_total, entrants_total = self._compute_flow_metrics(flow_to_flights, entrants_by_flow)
+        summary = self._summarize_plan(meta, flow_to_flights)
+        now = time.time()
+        outer_idx = meta.get("outer_index")
+        if not isinstance(outer_idx, int):
+            outer_idx = self._current_outer_index
+
+        self.best_objective_value = objective
+        self.best_delta_j = delta_j
+        self.best_outer_iter = outer_idx
+        self.best_plan_id = identifier
+        self.best_timestamp = now
+        self.best_plan_summary = summary
+        self.best_N_flights_flows = flights_total
+        self.best_N_entrants_flows = entrants_total
+        self._best_updated_this_outer = True
+        self._outer_runs_since_best = 0
+
+        self._emit_snapshot(
+            "best_update",
+            {
+                "source": source,
+                "identifier": identifier,
+                "objective": objective,
+                "delta_j": delta_j,
+                "outer_index": outer_idx,
+            },
+        )
 
 def _build_params_table(
     *,
@@ -236,6 +644,8 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     commit_logger, commit_logger_path = SearchLogger.to_timestamped(str(log_dir), prefix="commit_attempts")
     console.print(f"[runner] Commit attempts log path: {commit_logger_path}")
 
+    global_stats = GlobalStats(logger=logger)
+
     # Instrument CheapTransition inside the agent to record every CommitRegulation step
     try:
         import parrhesia.flow_agent.agent as _agent_mod
@@ -342,12 +752,14 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
 
     outer_max_runs_param = _parse_int(outer_max_runs_env)
     if outer_max_runs_param is None:
-        outer_max_runs_param = 1
+        outer_max_runs_param = 1_000_000 # unlimited
     elif outer_max_runs_param <= 0:
         outer_max_runs_param = None
 
     outer_max_time_param = _parse_float(outer_max_time_env)
-    if outer_max_time_param is not None and outer_max_time_param <= 0:
+    if outer_max_time_param is None:
+        outer_max_time_param = 300 # 5 minutes
+    elif outer_max_time_param <= 0:
         outer_max_time_param = None
 
     outer_max_actions_param = _parse_int(outer_max_actions_env)
@@ -363,7 +775,11 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         TextColumn("{task.completed}/{task.total} sims"),
         TimeElapsedColumn(),
         TimeRemainingColumn(),
-        TextColumn(" • nodes {task.fields[nodes]} • best ΔJ {task.fields[best]} • last ΔJ {task.fields[last]} • evals {task.fields[evals]} • acts {task.fields[actions]}/{task.fields[action_budget]}")
+        TextColumn(
+            " • nodes {task.fields[nodes]} • best ΔJ {task.fields[best]} • last ΔJ {task.fields[last]} "
+            "• evals {task.fields[evals]} • acts {task.fields[actions]}/{task.fields[action_budget]}"
+        ),
+        auto_refresh=False,
     )
 
     initial_budget = getattr(mcts_cfg, "max_actions", None)
@@ -387,26 +803,6 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     # Track total simulations attempted across all internal MCTS runs
     sim_counter: Dict[str, Any] = {"total": 0, "last_sd": 0, "init": False}
     live_holder: Dict[str, Any] = {"live": None}
-    # Track outer-loop status (commits/limits/stop monitoring)
-    outer_state: Dict[str, Any] = {
-        "outer_commits": 0,
-        "outer_commit_depth": int(mcts_cfg.commit_depth),
-        "outer_max_regulation_count": None,
-        "outer_limit": int(mcts_cfg.commit_depth),
-        "outer_early_stop_no_improvement": bool(early_stop_no_improvement),
-        "outer_stop_reason": None,
-        "outer_stop_info": None,
-        "outer_last_delta_j": None,
-        "outer_run_index": 1,
-        "outer_master_runs_completed": 0,
-        "outer_master_max_runs": (None if outer_max_runs_param in (None, 0) else int(outer_max_runs_param)),
-        "outer_master_max_time_s": outer_max_time_param,
-        "outer_master_max_actions": outer_max_actions_param,
-        "outer_master_total_actions": 0,
-        "outer_master_elapsed_s": 0.0,
-        "outer_master_run_index": 1,
-    }
-
     def _sig_to_label(sig: Any) -> str:
         try:
             if not isinstance(sig, (list, tuple)) or not sig:
@@ -431,6 +827,125 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
             return str(sig)
         except Exception:
             return str(sig)
+
+    def _render_global_progress(progress: Dict[str, Any], inner_payload: Dict[str, Any], actions_total: int) -> Table:
+        tbl = Table(title="Global Progress", box=box.SIMPLE_HEAVY)
+        tbl.add_column("Metric", style="cyan", no_wrap=True)
+        tbl.add_column("Value", style="white")
+
+        completed = int(progress.get("outer_runs_completed", 0))
+        max_runs = progress.get("outer_max_run_param")
+        pct = progress.get("outer_progress_pct")
+        max_runs_s = "∞" if not max_runs else str(int(max_runs))
+        pct_s = f"{float(pct):.1f}%" if isinstance(pct, (int, float)) and math.isfinite(float(pct)) else "—"
+        tbl.add_row("Outer runs", f"{completed} / {max_runs_s} ({pct_s})")
+
+        elapsed = progress.get("time_elapsed")
+        elapsed_s = f"{float(elapsed):.1f}s" if isinstance(elapsed, (int, float)) else "—"
+        max_time = progress.get("outer_max_time")
+        if isinstance(max_time, (int, float)) and max_time > 0:
+            time_pct = progress.get("time_progress_pct")
+            pct_time_s = f"{float(time_pct):.1f}%" if isinstance(time_pct, (int, float)) and math.isfinite(float(time_pct)) else "—"
+            tbl.add_row("Elapsed time", f"{elapsed_s} / {float(max_time):.1f}s ({pct_time_s})")
+        else:
+            tbl.add_row("Elapsed time", elapsed_s)
+
+        sims_done = inner_payload.get("sims_done")
+        sims_s = str(int(sims_done)) if isinstance(sims_done, (int, float)) else "—"
+        max_exp = progress.get("outer_max_expansions")
+        if isinstance(max_exp, (int, float)) and max_exp > 0:
+            tbl.add_row("Search expansions", f"{sims_s} / {int(max_exp)}")
+        else:
+            tbl.add_row("Search expansions", sims_s)
+
+        commit_evals = inner_payload.get("commit_evals")
+        evals_s = str(int(commit_evals)) if isinstance(commit_evals, (int, float)) else "—"
+        max_evals = progress.get("outer_max_evals")
+        if isinstance(max_evals, (int, float)) and max_evals > 0:
+            tbl.add_row("Plan evals", f"{evals_s} / {int(max_evals)}")
+        else:
+            tbl.add_row("Plan evals", evals_s)
+
+        actions_val = actions_total
+        max_actions = progress.get("outer_max_actions")
+        if isinstance(max_actions, (int, float)) and max_actions > 0 and actions_total >= 0:
+            pct_actions = (actions_total / float(max_actions)) * 100.0
+            tbl.add_row("Actions", f"{actions_total} / {int(max_actions)} ({pct_actions:.1f}%)")
+        else:
+            tbl.add_row("Actions", str(actions_total))
+
+        current_outer = progress.get("current_outer_index")
+        if current_outer:
+            tbl.add_row("Current outer", str(current_outer))
+        time_since_outer = progress.get("time_since_outer_start")
+        if isinstance(time_since_outer, (int, float)) and time_since_outer >= 0:
+            tbl.add_row("Outer runtime", f"{time_since_outer:.1f}s")
+        stalls = progress.get("outer_runs_since_best")
+        if isinstance(stalls, int) and stalls >= 0:
+            tbl.add_row("Runs since best", str(stalls))
+        stop_reason = progress.get("last_stop_reason")
+        if stop_reason:
+            tbl.add_row("Last stop", str(stop_reason))
+        stop_info = progress.get("last_stop_info")
+        if isinstance(stop_info, dict) and stop_info:
+            compact = {k: stop_info[k] for k in list(stop_info.keys())[:3]}
+            tbl.add_row("Stop info", str(compact))
+        return tbl
+
+    def _render_global_best(best: Dict[str, Any]) -> Table:
+        tbl = Table(title="Best Plan (Global)", box=box.SIMPLE_HEAVY)
+        tbl.add_column("Metric", style="green", no_wrap=True)
+        tbl.add_column("Value", style="white")
+
+        objective = best.get("objective")
+        delta_j = best.get("delta_j")
+        outer_iter = best.get("outer_iter")
+        plan_id = best.get("plan_id")
+        plan_summary = best.get("plan_summary")
+        n_flights = best.get("n_flights_flows")
+        n_entrants = best.get("n_entrants_flows")
+        time_since_best = best.get("time_since_best")
+
+        obj_s = f"{float(objective):.3f}" if isinstance(objective, (int, float)) else "—"
+        delta_s = f"{float(delta_j):.3f}" if isinstance(delta_j, (int, float)) else "—"
+        outer_s = str(int(outer_iter)) if isinstance(outer_iter, (int, float)) else "—"
+        plan_id_s = str(plan_id) if plan_id is not None else "—"
+        summary_s = str(plan_summary) if plan_summary else "—"
+        flights_s = str(int(n_flights)) if isinstance(n_flights, (int, float)) else "—"
+        entrants_s = str(int(n_entrants)) if isinstance(n_entrants, (int, float)) else "—"
+        since_best_s = f"{float(time_since_best):.1f}s" if isinstance(time_since_best, (int, float)) else "—"
+
+        tbl.add_row("Objective", obj_s)
+        tbl.add_row("Best ΔJ", delta_s)
+        tbl.add_row("Outer iter", outer_s)
+        tbl.add_row("Plan id", plan_id_s)
+        tbl.add_row("Summary", summary_s)
+        tbl.add_row("Flights (unique)", flights_s)
+        tbl.add_row("Entrants", entrants_s)
+        tbl.add_row("Since best", since_best_s)
+        return tbl
+
+    def _render_global_actions(actions: Dict[str, Any]) -> Table:
+        tbl = Table(title="Global Actions (Top 5)", box=box.SIMPLE_HEAVY)
+        tbl.add_column("Action", style="magenta")
+        tbl.add_column("Count", justify="right")
+        tbl.add_column("%", justify="right")
+
+        top = actions.get("top") or []
+        for entry in top:
+            name = str(entry.get("action", ""))
+            count = entry.get("count")
+            percent = entry.get("percent")
+            count_s = str(int(count)) if isinstance(count, (int, float)) else "—"
+            percent_s = f"{float(percent):.1f}%" if isinstance(percent, (int, float)) else "—"
+            tbl.add_row(name, count_s, percent_s)
+        if not top:
+            tbl.add_row("—", "0", "0.0%")
+
+        total = actions.get("total")
+        if isinstance(total, (int, float)):
+            tbl.caption = f"Total actions: {int(total)}"
+        return tbl
 
     def _build_root_table(payload: Dict[str, Any]) -> Table:
         tbl = Table(title="Root: Action Summary", box=box.SIMPLE_HEAVY)
@@ -496,147 +1011,34 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         tbl.add_row("Latest ΔJ", last_s)
         return tbl
 
-
-    def _build_ensemble_table(payload: Dict[str, Any]) -> Table:
-        tbl = Table(title="Ensemble Workers", box=box.SIMPLE_HEAVY)
-        tbl.add_column("Worker", justify="right", style="cyan")
-        tbl.add_column("Status", style="magenta")
-        tbl.add_column("Sims", justify="right")
-        tbl.add_column("Best ΔJ", justify="right")
-        tbl.add_column("Last ΔJ", justify="right")
-        tbl.add_column("Commit evals", justify="right")
-        tbl.add_column("Actions", justify="right")
-        workers = payload.get("ensemble_workers") or []
-        best_worker = payload.get("ensemble_best_worker")
-        try:
-            best_worker_id = int(best_worker) if best_worker is not None else None
-        except Exception:
-            best_worker_id = None
-
-        def _sort_key(entry: Dict[str, Any]) -> float:
-            val = entry.get("best_delta_j")
-            try:
-                fval = float(val)
-            except Exception:
-                return float("inf")
-            return fval if math.isfinite(fval) else float("inf")
-
-        status_map = {
-            "running": "[cyan]running[/cyan]",
-            "done": "[green]done[/green]",
-            "error": "[red]error[/red]",
-        }
-
-        if isinstance(workers, list) and workers:
-            for entry in sorted(workers, key=_sort_key):
-                worker_id = entry.get("worker_id")
-                try:
-                    worker_id_int = int(worker_id)
-                except Exception:
-                    worker_id_int = None
-                status_raw = str(entry.get("status", "running"))
-                status_label = status_map.get(status_raw, status_raw)
-                if status_raw == "error" and entry.get("error"):
-                    status_label += f" ({entry['error']})"
-                sims_val = entry.get("sims_done")
-                commit_val = entry.get("commit_evals")
-                actions_val = entry.get("actions_done")
-                best_val = entry.get("best_delta_j")
-                last_val = entry.get("last_delta_j")
-                sims_s = str(int(sims_val)) if isinstance(sims_val, (int, float)) else "0"
-                commit_s = str(int(commit_val)) if isinstance(commit_val, (int, float)) else "0"
-                actions_s = str(int(actions_val)) if isinstance(actions_val, (int, float)) else "0"
-                try:
-                    best_float = float(best_val)
-                except Exception:
-                    best_float = None
-                if best_float is not None and math.isfinite(best_float):
-                    best_s = f"{best_float:.3f}"
-                else:
-                    best_s = "—"
-                try:
-                    last_float = float(last_val)
-                except Exception:
-                    last_float = None
-                if last_float is not None and math.isfinite(last_float):
-                    last_s = f"{last_float:.3f}"
-                else:
-                    last_s = "—"
-                row_style = None
-                if best_worker_id is not None and worker_id_int == best_worker_id:
-                    row_style = "bold green"
-                tbl.add_row(
-                    str(worker_id) if worker_id is not None else "—",
-                    status_label,
-                    sims_s,
-                    best_s,
-                    last_s,
-                    commit_s,
-                    actions_s,
-                    style=row_style,
-                )
-        else:
-            tbl.add_row("—", "—", "—", "—", "—", "—", "—")
-        return tbl
-
-    def _build_outer_table(state: Dict[str, Any]) -> Table:
-        tbl = Table(title="Outer Loop", box=box.SIMPLE_HEAVY)
-        tbl.add_column("Metric", style="yellow")
-        tbl.add_column("Value", justify="right")
-        commits = state.get("outer_commits", 0) or 0
-        limit = state.get("outer_limit")
-        limit_s = (str(int(limit)) if isinstance(limit, (int, float)) else "?")
-        tbl.add_row("Commits", f"{int(commits)}/{limit_s}")
-        cd = state.get("outer_commit_depth")
-        tbl.add_row("Commit depth", (str(int(cd)) if isinstance(cd, (int, float)) else "?"))
-        mr = state.get("outer_max_regulation_count")
-        tbl.add_row("Max regulations", ("∞" if mr in (None, 0) else str(int(mr))))
-        eno = state.get("outer_early_stop_no_improvement")
-        tbl.add_row("Early stop if ΔJ≥0", ("true" if bool(eno) else "false"))
-        lcdj = state.get("outer_last_delta_j")
-        tbl.add_row("Last committed ΔJ", (f"{float(lcdj):.3f}" if isinstance(lcdj, (int, float)) else "—"))
-        sr = state.get("outer_stop_reason")
-        tbl.add_row("Stop reason", (str(sr) if sr else "—"))
-        si = state.get("outer_stop_info") or {}
-        if isinstance(si, dict) and si:
-            # show a compact one-line view
-            keys = list(si.keys())[:4]
-            compact = {k: si[k] for k in keys}
-            tbl.add_row("Stop info", str(compact))
-        else:
-            tbl.add_row("Stop info", "—")
-        mruns = state.get("outer_master_runs_completed")
-        tbl.add_row(
-            "Master runs",
-            f"{int(mruns) if isinstance(mruns, (int, float)) else 0}/"
-            f"{('∞' if state.get('outer_master_max_runs') in (None, 0) else str(int(state.get('outer_master_max_runs'))))}",
-        )
-        tbl.add_row(
-            "Master actions",
-            f"{int(state.get('outer_master_total_actions', 0))}/"
-            f"{('∞' if state.get('outer_master_max_actions') in (None, 0) else str(int(state.get('outer_master_max_actions'))))}",
-        )
-        elapsed_master = state.get("outer_master_elapsed_s")
-        tbl.add_row(
-            "Master elapsed s",
-            f"{float(elapsed_master):.1f}" if isinstance(elapsed_master, (int, float)) else "—",
-        )
-        max_time = state.get("outer_master_max_time_s")
-        tbl.add_row(
-            "Master max time s",
-            "∞" if max_time in (None, 0.0) else f"{float(max_time):.1f}",
-        )
-        return tbl
+    # Controls for verbose Rich tables; keep data builders available but default hidden.
+    SHOW_GLOBAL_ACTIONS_PANEL = False
+    SHOW_ACTION_COUNTS_TABLE = False
+    SHOW_ROOT_ACTION_SUMMARY = False
 
     def _compose_live() -> Group:
-        return Group(
-            prog,
-            # _build_outer_table(outer_state),  # Temporarily hidden per request
-            _build_delta_table(last_payload),
-            _build_ensemble_table(last_payload),
-            _build_root_table(last_payload),
-            _build_actions_table(last_payload),
-        )
+        snapshot = global_stats.snapshot_for_display()
+        actions_data = snapshot.get("actions", {}) or {}
+        actions_total = actions_data.get("total", 0)
+        progress_tbl = _render_global_progress(snapshot.get("progress", {}), last_payload, actions_total)
+        best_tbl = _render_global_best(snapshot.get("best", {}))
+
+        renderables = [
+            progress_tbl,
+            best_tbl,
+        ]
+        if SHOW_GLOBAL_ACTIONS_PANEL:
+            renderables.append(_render_global_actions(actions_data))
+
+        renderables.append(prog)
+        renderables.append(_build_delta_table(last_payload))
+
+        if SHOW_ROOT_ACTION_SUMMARY:
+            renderables.append(_build_root_table(last_payload))
+        if SHOW_ACTION_COUNTS_TABLE:
+            renderables.append(_build_actions_table(last_payload))
+
+        return Group(*renderables)
 
     def _on_progress(payload: Dict[str, Any]) -> None:
         # Update inner-loop progress only when relevant keys are present
@@ -683,16 +1085,15 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
                 evals=evals,
                 actions=actions_done,
                 action_budget=action_budget_s,
+                refresh=False,
             )
             # Merge new inner-loop fields while preserving any outer-loop fields
             last_payload.update(payload)
-
-        # Update outer-loop tracking if payload carries any outer_* fields
-        if any(k.startswith("outer_") for k in payload.keys()):
             try:
-                outer_state.update({k: v for k, v in payload.items() if k.startswith("outer_")})
+                global_stats.update_inner_stats(last_payload)
             except Exception:
                 pass
+
         live = live_holder.get("live")
         if live is not None:
             live.update(_compose_live())
@@ -716,6 +1117,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         outer_max_time_s=outer_max_time_param,
         outer_max_actions=outer_max_actions_param,
         diversify_ban_selected=diversify_flag,
+        global_stats=global_stats,
     )
 
     # Show parameter table once before starting
@@ -736,7 +1138,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
     ))
 
     console.print("[runner] Starting agent.run() ...")
-    with Live(_compose_live(), refresh_per_second=8, console=console) as _live:
+    with Live(_compose_live(), refresh_per_second=8, console=console, vertical_overflow="visible") as _live:
         live_holder["live"] = _live
         with timed("agent.run"):
             state, info = agent.run()

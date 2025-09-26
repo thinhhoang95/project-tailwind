@@ -26,6 +26,7 @@ from .hotspot_discovery import (
     HotspotDiscoveryConfig,
     HotspotInventory,
 )
+from .monitoring import GlobalStatsHook
 
 from parrhesia.optim.objective import ObjectiveWeights, build_score_context
 from parrhesia.flow_agent.safespill_objective import score_with_context
@@ -198,6 +199,7 @@ class MCTSAgent:
         max_regulation_count: Optional[int] = None,
         timer: Optional[Callable[[str], ContextManager[Any]]] = None,
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
+        global_stats: Optional[GlobalStatsHook] = None,
         early_stop_no_improvement: bool = False,
         outer_max_runs: Optional[int] = 1,
         outer_max_time_s: Optional[float] = None,
@@ -223,6 +225,7 @@ class MCTSAgent:
         self.max_regulations = sanitized_reg_limit
         self._timer_factory = timer
         self._progress_cb = progress_cb
+        self._global_stats = global_stats
         self.early_stop_no_improvement = bool(early_stop_no_improvement)
 
         if outer_max_runs in (None, 0):
@@ -256,6 +259,7 @@ class MCTSAgent:
             indexer=indexer,
             config=rate_finder_cfg or RateFinderConfig(use_adaptive_grid=True),
             timer=timer,
+            monitoring=global_stats,
         )
         self.inventory = HotspotInventory(evaluator=evaluator, flight_list=flight_list, indexer=indexer)
 
@@ -823,10 +827,43 @@ class MCTSAgent:
         while True:
             now = time.perf_counter()
             if self.outer_max_runs is not None and master_runs_executed >= self.outer_max_runs:
+                if self._global_stats is not None:
+                    try:
+                        self._global_stats.on_limit_hit(
+                            "outer_max_run_param",
+                            {
+                                "outer_runs_completed": int(master_runs_executed),
+                                "outer_max_run_param": int(self.outer_max_runs),
+                            },
+                        )
+                    except Exception:
+                        pass
                 break
             if self.outer_max_time_s is not None and (now - master_start) >= float(self.outer_max_time_s):
+                if self._global_stats is not None:
+                    try:
+                        self._global_stats.on_limit_hit(
+                            "outer_max_time",
+                            {
+                                "elapsed_s": float(now - master_start),
+                                "outer_max_time": float(self.outer_max_time_s),
+                            },
+                        )
+                    except Exception:
+                        pass
                 break
             if self.outer_max_actions is not None and master_actions_total >= int(self.outer_max_actions):
+                if self._global_stats is not None:
+                    try:
+                        self._global_stats.on_limit_hit(
+                            "outer_max_actions",
+                            {
+                                "actions_total": int(master_actions_total),
+                                "outer_max_actions": int(self.outer_max_actions),
+                            },
+                        )
+                    except Exception:
+                        pass
                 break
 
             state = PlanState()
@@ -837,6 +874,22 @@ class MCTSAgent:
                 state.metadata.setdefault("banned_regulations", [])
 
             master_run_index = master_runs_executed
+            if self._global_stats is not None:
+                try:
+                    self._global_stats.on_outer_start(
+                        int(master_run_index + 1),
+                        {
+                            "outer_max_run_param": (int(self.outer_max_runs) if self.outer_max_runs is not None else None),
+                            "outer_max_time": (float(self.outer_max_time_s) if self.outer_max_time_s is not None else None),
+                            "outer_max_actions": (int(self.outer_max_actions) if self.outer_max_actions is not None else None),
+                            "outer_max_evals": int(self.mcts_cfg.commit_eval_limit),
+                            "outer_max_expansions": int(self.mcts_cfg.max_sims),
+                            "outer_loop_budget": int(outer_loop_budget),
+                            "commit_depth_limit": int(commit_depth_limit),
+                        },
+                    )
+                except Exception:
+                    pass
             try:
                 seed_base = int(getattr(self.mcts_cfg, "seed", 0))
             except Exception:
@@ -929,6 +982,11 @@ class MCTSAgent:
                     message = str(exc)
                     for k, v in combined_action_counts.items():
                         aggregated_counts[k] = aggregated_counts.get(k, 0) + int(v)
+                        if self._global_stats is not None:
+                            try:
+                                self._global_stats.on_action(str(k), int(v))
+                            except Exception:
+                                pass
                     if isinstance(exc, RuntimeError) and "MCTS did not evaluate any commit" in message:
                         if self.logger is not None:
                             self.logger.event(
@@ -969,6 +1027,17 @@ class MCTSAgent:
                             master_run_index=master_run_index,
                             partial_actions=master_actions_total + run_actions_total,
                         )
+                        if self._global_stats is not None:
+                            try:
+                                self._global_stats.on_limit_hit(
+                                    "no_commit_available",
+                                    {
+                                        "outer_index": int(master_run_index + 1),
+                                        "message": message,
+                                    },
+                                )
+                            except Exception:
+                                pass
                         break
                     if self.logger is not None:
                         self.logger.event("mcts_error", {"error": message})
@@ -1003,10 +1072,26 @@ class MCTSAgent:
                         master_run_index=master_run_index,
                         partial_actions=master_actions_total + run_actions_total,
                     )
+                    if self._global_stats is not None:
+                        try:
+                            self._global_stats.on_limit_hit(
+                                "mcts_error",
+                                {
+                                    "outer_index": int(master_run_index + 1),
+                                    "message": message,
+                                },
+                            )
+                        except Exception:
+                            pass
                     break
 
                 for k, v in combined_action_counts.items():
                     aggregated_counts[k] = aggregated_counts.get(k, 0) + int(v)
+                    if self._global_stats is not None:
+                        try:
+                            self._global_stats.on_action(str(k), int(v))
+                        except Exception:
+                            pass
 
                 run_actions_total += int(run_stats_this_run.get("actions_done", 0))
 
@@ -1184,8 +1269,25 @@ class MCTSAgent:
                     partial_actions=master_actions_total + run_actions_total,
                 )
 
+                diag_payload: Dict[str, Any] = {}
+                rf_info: Dict[str, Any] = {}
+                fin_comp: Dict[str, Any] = {}
+                fin_obj: Optional[float] = None
+                rate_menu_lower: Optional[int] = None
+                rate_menu_upper: Optional[int] = None
+                cand_nonzero_delays: Optional[int] = None
+                cand_max_delay: Optional[int] = None
+                cand_spill: Optional[int] = None
+                n_flights_flows: Optional[int] = None
+                n_flights_flows_max: Optional[int] = None
+                max_flow_id: Optional[str] = None
+                n_entrants_flows: Optional[int] = None
+                n_entrants_flows_max: Optional[int] = None
+                entrants_max_flow_id: Optional[str] = None
+                flow_to_flights_map: Dict[str, List[str]] = {}
+                entrants_counts_map: Dict[str, int] = {}
+
                 if self.logger is not None:
-                    diag_payload: Dict[str, Any] = {}
                     try:
                         diag_payload = dict(getattr(regulation, "diagnostics", {}) or {})
                     except Exception:
@@ -1195,8 +1297,6 @@ class MCTSAgent:
                     fin_obj = rf_info.get("final_objective", None)
                     rate_menu_lower = rf_info.get("rate_menu_lower") if isinstance(rf_info, dict) else None
                     rate_menu_upper = rf_info.get("rate_menu_upper") if isinstance(rf_info, dict) else None
-                    cand_nonzero_delays = None
-                    cand_max_delay = None
                     try:
                         fin_delays = rf_info.get("final_delays_min", {}) if isinstance(rf_info, dict) else {}
                         if isinstance(fin_delays, dict) and fin_delays:
@@ -1206,7 +1306,6 @@ class MCTSAgent:
                     except Exception:
                         cand_nonzero_delays = None
                         cand_max_delay = None
-                    cand_spill: Optional[int] = None
                     try:
                         arts = rf_info.get("final_artifacts", {}) if isinstance(rf_info, dict) else {}
                         nmap = arts.get("n", {}) if isinstance(arts, dict) else {}
@@ -1227,23 +1326,20 @@ class MCTSAgent:
                                 cand_spill = int(v)
                         except Exception:
                             pass
-                    n_flights_flows: Optional[int] = None
-                    n_flights_flows_max: Optional[int] = None
-                    max_flow_id: Optional[str] = None
-                    n_entrants_flows: Optional[int] = None
-                    n_entrants_flows_max: Optional[int] = None
-                    entrants_max_flow_id: Optional[str] = None
                     try:
                         desc = self.inventory.get(str(ctrl), (int(wb[0]), int(wb[1])))
                         meta = getattr(desc, "metadata", {}) if desc is not None else {}
                         flow_to_flights = meta.get("flow_to_flights", {}) if isinstance(meta, dict) else {}
-                        if isinstance(flow_to_flights, dict) and flow_ids:
+                        if isinstance(flow_to_flights, dict):
+                            for fid, flights in flow_to_flights.items():
+                                flow_to_flights_map[str(fid)] = [str(x) for x in (flights or [])]
+                        if flow_ids:
                             unique_total_set: set[str] = set()
                             unique_max = -1
                             unique_max_fid: Optional[str] = None
                             for fid in flow_ids:
-                                fl_list = flow_to_flights.get(str(fid), []) or []
-                                uniq = {str(x) for x in fl_list}
+                                fl_list = flow_to_flights_map.get(str(fid), [])
+                                uniq = set(fl_list)
                                 unique_total_set.update(uniq)
                                 size = len(uniq)
                                 if size > unique_max:
@@ -1257,12 +1353,18 @@ class MCTSAgent:
                         pass
                     try:
                         ent_map = rf_info.get("entrants_by_flow", {}) if isinstance(rf_info, dict) else {}
-                        if isinstance(ent_map, dict) and flow_ids:
+                        if isinstance(ent_map, dict):
+                            for fid, count in ent_map.items():
+                                try:
+                                    entrants_counts_map[str(fid)] = int(count)
+                                except Exception:
+                                    continue
+                        if flow_ids and entrants_counts_map:
                             entrants_total = 0
                             entrants_max = -1
                             entrants_max_fid = None
                             for fid in flow_ids:
-                                count = int(ent_map.get(str(fid), 0))
+                                count = int(entrants_counts_map.get(str(fid), 0))
                                 entrants_total += count
                                 if count > entrants_max:
                                     entrants_max = count
@@ -1295,6 +1397,40 @@ class MCTSAgent:
                             "outer_master_run_index": int(master_run_index + 1),
                         },
                     )
+                if self._global_stats is not None:
+                    try:
+                        plan_id = None
+                        if isinstance(diag_payload.get("plan_id"), str):
+                            plan_id = str(diag_payload.get("plan_id"))
+                        if not plan_id:
+                            plan_id = f"outer{master_run_index + 1}-commit{commits}"
+                        self._global_stats.on_plan_committed(
+                            plan=tuple(state.plan),
+                            delta_j=float(delta_j),
+                            flow_to_flights=flow_to_flights_map if flow_to_flights_map else None,
+                            entrants_by_flow=entrants_counts_map if entrants_counts_map else None,
+                            meta={
+                                "control_volume_id": ctrl,
+                                "window_bins": [int(wb[0]), int(wb[1])],
+                                "mode": mode,
+                                "objective": fin_obj,
+                                "components": fin_comp,
+                                "outer_index": int(master_run_index + 1),
+                                "plan_id": plan_id,
+                                "commits": int(commits),
+                                "committed_rates": rates_to_store,
+                                "rate_menu_lower": rate_menu_lower,
+                                "rate_menu_upper": rate_menu_upper,
+                                "delta_j": float(delta_j),
+                                "flow_ids": [str(fid) for fid in flow_ids],
+                                "timestamp": time.time(),
+                                "cand_nonzero_delays": cand_nonzero_delays,
+                                "cand_max_delay": cand_max_delay,
+                                "cand_spill": cand_spill,
+                            },
+                        )
+                    except Exception:
+                        pass
                 if self.debug_logger is not None:
                     try:
                         self.debug_logger.event(
@@ -1348,6 +1484,18 @@ class MCTSAgent:
                         master_run_index=master_run_index,
                         partial_actions=master_actions_total + run_actions_total,
                     )
+                    if self._global_stats is not None:
+                        try:
+                            self._global_stats.on_limit_hit(
+                                "no_improvement",
+                                {
+                                    "outer_index": int(master_run_index + 1),
+                                    "delta_j": float(delta_j),
+                                    "commits": int(commits),
+                                },
+                            )
+                        except Exception:
+                            pass
                     break
 
                 run_idx += 1
@@ -1370,6 +1518,18 @@ class MCTSAgent:
                         )
                     except Exception:
                         pass
+                if self._global_stats is not None:
+                    try:
+                        self._global_stats.on_limit_hit(
+                            "regulation_limit_reached",
+                            {
+                                "outer_index": int(master_run_index + 1),
+                                "limit": int(self.max_regulation_count),
+                                "commits": int(commits),
+                            },
+                        )
+                    except Exception:
+                        pass
 
             with self._timed("agent.final_objective"):
                 final_summary = self._compute_final_objective(state)
@@ -1382,6 +1542,18 @@ class MCTSAgent:
                     final_stop_reason = "regulation_limit_reached"
                 elif configured_reg_limit is None and commits >= commit_depth_limit:
                     final_stop_reason = "commit_depth_limit_reached"
+                    if self._global_stats is not None:
+                        try:
+                            self._global_stats.on_limit_hit(
+                                "commit_depth_limit_reached",
+                                {
+                                    "outer_index": int(master_run_index + 1),
+                                    "limit": int(commit_depth_limit),
+                                    "commits": int(commits),
+                                },
+                            )
+                        except Exception:
+                            pass
                 else:
                     final_stop_reason = "completed"
             final_stop_info = outer_stop_info or {}
@@ -1402,6 +1574,22 @@ class MCTSAgent:
                 master_run_index=master_run_index,
                 partial_actions=master_actions_total + run_actions_total,
             )
+
+            if self._global_stats is not None:
+                try:
+                    self._global_stats.on_outer_end(
+                        int(master_run_index + 1),
+                        {
+                            "stop_reason": final_stop_reason,
+                            "stop_info": final_stop_info,
+                            "total_delta_j": float(total_delta_j),
+                            "commits": int(commits),
+                            "objective": final_summary.get("objective"),
+                            "action_counts": dict(aggregated_counts),
+                        },
+                    )
+                except Exception:
+                    pass
 
             if self.debug_logger is not None:
                 try:
@@ -1551,9 +1739,6 @@ class MCTSAgent:
 
     # ------------------------------------------------------------------
     def _compute_final_objective(self, state: PlanState) -> Dict[str, Any]:
-        if not state.plan:
-            return {"objective": 0.0, "components": {}, "artifacts": {}, "num_flows": 0}
-
         # Build global flights_by_flow by stitching descriptors per (tv, window)
         flights_by_flow: Dict[str, List[Dict[str, Any]]] = {}
         capacities_by_tv: Dict[str, np.ndarray] = {}
@@ -1618,38 +1803,57 @@ class MCTSAgent:
                 out.setdefault(key, [])
             return out
 
-        # Aggregate per regulation
-        for reg in state.plan:
-            tv = str(reg.control_volume_id)
-            t0, t1 = int(reg.window_bins[0]), int(reg.window_bins[1])
-            desc = self.inventory.get(tv, (t0, t1))
-            if desc is None:
-                # Try fallback to candidates in state metadata
-                desc = None
-                for c in state.metadata.get("hotspot_candidates", []) or []:
-                    if str(c.get("control_volume_id")) == tv:
-                        wb = c.get("window_bins") or []
-                        if int(wb[0]) == t0 and int(wb[1]) == t1:
-                            desc = type("_Tmp", (), {"metadata": c.get("metadata", {}), "mode": c.get("mode", "per_flow")})
-                            break
-            meta = getattr(desc, "metadata", {}) if desc is not None else {}
-            flow_to_flights: Mapping[str, Sequence[str]] = meta.get("flow_to_flights", {}) or {}
+        if state.plan:
+            # Aggregate per regulation
+            for reg in state.plan:
+                tv = str(reg.control_volume_id)
+                t0, t1 = int(reg.window_bins[0]), int(reg.window_bins[1])
+                desc = self.inventory.get(tv, (t0, t1))
+                if desc is None:
+                    # Try fallback to candidates in state metadata
+                    desc = None
+                    for c in state.metadata.get("hotspot_candidates", []) or []:
+                        if str(c.get("control_volume_id")) == tv:
+                            wb = c.get("window_bins") or []
+                            if int(wb[0]) == t0 and int(wb[1]) == t1:
+                                desc = type("_Tmp", (), {"metadata": c.get("metadata", {}), "mode": c.get("mode", "per_flow")})
+                                break
+                meta = getattr(desc, "metadata", {}) if desc is not None else {}
+                flow_to_flights: Mapping[str, Sequence[str]] = meta.get("flow_to_flights", {}) or {}
 
-            _ensure_caps(tv)
+                _ensure_caps(tv)
 
-            # Build unique key prefix per regulation to avoid id collisions across hotspots/windows
-            flow_key_prefix = f"{tv}:{t0}-{t1}"
-            if isinstance(reg.committed_rates, dict):
-                # Per-flow
-                specs_map = _specs_for(tv, (t0, t1), {f: flow_to_flights.get(f, []) for f in reg.flow_ids}, flow_key_prefix)
+                # Build unique key prefix per regulation to avoid id collisions across hotspots/windows
+                flow_key_prefix = f"{tv}:{t0}-{t1}"
+                if isinstance(reg.committed_rates, dict):
+                    # Per-flow
+                    specs_map = _specs_for(tv, (t0, t1), {f: flow_to_flights.get(f, []) for f in reg.flow_ids}, flow_key_prefix)
+                    for k, v in specs_map.items():
+                        flights_by_flow[k] = v
+                else:
+                    # Blanket: union all listed flows under a synthetic id
+                    union_map: Dict[str, Sequence[str]] = {"__blanket__": [fid for f in reg.flow_ids for fid in flow_to_flights.get(f, [])]}
+                    synthetic = f"{flow_key_prefix}:__blanket__"
+                    specs_map = _specs_for(tv, (t0, t1), union_map, flow_key_prefix)
+                    flights_by_flow[synthetic] = specs_map.get(f"{flow_key_prefix}:__blanket__", [])
+        else:
+            # Baseline (no committed regulations): derive flows from hotspot candidates
+            for c in state.metadata.get("hotspot_candidates", []) or []:
+                try:
+                    tv = str(c.get("control_volume_id"))
+                    wb = c.get("window_bins") or []
+                    t0, t1 = int(wb[0]), int(wb[1])
+                except Exception:
+                    continue
+                meta = c.get("metadata") or {}
+                flow_to_flights = meta.get("flow_to_flights", {}) or {}
+                if not isinstance(flow_to_flights, Mapping):
+                    continue
+                _ensure_caps(tv)
+                flow_key_prefix = f"{tv}:{t0}-{t1}"
+                specs_map = _specs_for(tv, (t0, t1), flow_to_flights, flow_key_prefix)
                 for k, v in specs_map.items():
                     flights_by_flow[k] = v
-            else:
-                # Blanket: union all listed flows under a synthetic id
-                union_map: Dict[str, Sequence[str]] = {"__blanket__": [fid for f in reg.flow_ids for fid in flow_to_flights.get(f, [])]}
-                synthetic = f"{flow_key_prefix}:__blanket__"
-                specs_map = _specs_for(tv, (t0, t1), union_map, flow_key_prefix)
-                flights_by_flow[synthetic] = specs_map.get(f"{flow_key_prefix}:__blanket__", [])
 
         # Global context and schedule assembly
         weights = ObjectiveWeights()  # default weights
@@ -1663,23 +1867,50 @@ class MCTSAgent:
             weights=weights,
         )
 
-        # Compute schedules n_f(t) using committed rates per regulation
-        n_f_t: Dict[str, List[int]] = {k: [int(x) for x in np.zeros(self.indexer.num_time_bins + 1, dtype=int)] for k in flights_by_flow.keys()}
-        bin_minutes = max(1, int(getattr(self.indexer, "time_bin_minutes", 60)))
+        # Compute schedules n_f(t)
+        if state.plan:
+            # Use committed rates per regulation
+            n_f_t: Dict[str, List[int]] = {k: [int(x) for x in np.zeros(self.indexer.num_time_bins + 1, dtype=int)] for k in flights_by_flow.keys()}
+            bin_minutes = max(1, int(getattr(self.indexer, "time_bin_minutes", 60)))
 
-        for reg in state.plan:
-            tv = str(reg.control_volume_id)
-            t0, t1 = int(reg.window_bins[0]), int(reg.window_bins[1])
-            flow_key_prefix = f"{tv}:{t0}-{t1}"
-            active = sorted(set(range(t0, max(t0 + 1, t1))))
-            if isinstance(reg.committed_rates, dict):
-                for f, rate in reg.committed_rates.items():
-                    key = f"{flow_key_prefix}:{f}"
+            for reg in state.plan:
+                tv = str(reg.control_volume_id)
+                t0, t1 = int(reg.window_bins[0]), int(reg.window_bins[1])
+                flow_key_prefix = f"{tv}:{t0}-{t1}"
+                active = sorted(set(range(t0, max(t0 + 1, t1))))
+                if isinstance(reg.committed_rates, dict):
+                    for f, rate in reg.committed_rates.items():
+                        key = f"{flow_key_prefix}:{f}"
+                        d = context.d_by_flow.get(key)
+                        if d is None:
+                            continue
+                        schedule = list(d.tolist())
+                        rate_val = float(rate)
+                        quota = 0 if not (rate_val > 0 and not np.isinf(rate_val)) else int(round(rate_val * bin_minutes / 60.0))
+                        ready = 0
+                        released = 0
+                        for t in active:
+                            t = int(t)
+                            if t < 0 or t >= self.indexer.num_time_bins:
+                                continue
+                            ready += int(d[t])
+                            available = max(0, ready - released)
+                            take = min(quota, available) if quota > 0 else 0
+                            schedule[t] = int(take)
+                            released += int(take)
+                        total_non_overflow = int(sum(d[: self.indexer.num_time_bins]))
+                        scheduled_non_overflow = int(sum(schedule[: self.indexer.num_time_bins]))
+                        base_overflow = int(d[self.indexer.num_time_bins]) if len(d) > self.indexer.num_time_bins else 0
+                        schedule[self.indexer.num_time_bins] = int(base_overflow + max(0, total_non_overflow - scheduled_non_overflow))
+                        n_f_t[key] = schedule
+                else:
+                    # Blanket
+                    key = f"{flow_key_prefix}:__blanket__"
                     d = context.d_by_flow.get(key)
                     if d is None:
                         continue
                     schedule = list(d.tolist())
-                    rate_val = float(rate)
+                    rate_val = float(reg.committed_rates) if reg.committed_rates is not None else float("inf")
                     quota = 0 if not (rate_val > 0 and not np.isinf(rate_val)) else int(round(rate_val * bin_minutes / 60.0))
                     ready = 0
                     released = 0
@@ -1697,31 +1928,15 @@ class MCTSAgent:
                     base_overflow = int(d[self.indexer.num_time_bins]) if len(d) > self.indexer.num_time_bins else 0
                     schedule[self.indexer.num_time_bins] = int(base_overflow + max(0, total_non_overflow - scheduled_non_overflow))
                     n_f_t[key] = schedule
-            else:
-                # Blanket
-                key = f"{flow_key_prefix}:__blanket__"
-                d = context.d_by_flow.get(key)
-                if d is None:
-                    continue
-                schedule = list(d.tolist())
-                rate_val = float(reg.committed_rates) if reg.committed_rates is not None else float("inf")
-                quota = 0 if not (rate_val > 0 and not np.isinf(rate_val)) else int(round(rate_val * bin_minutes / 60.0))
-                ready = 0
-                released = 0
-                for t in active:
-                    t = int(t)
-                    if t < 0 or t >= self.indexer.num_time_bins:
-                        continue
-                    ready += int(d[t])
-                    available = max(0, ready - released)
-                    take = min(quota, available) if quota > 0 else 0
-                    schedule[t] = int(take)
-                    released += int(take)
-                total_non_overflow = int(sum(d[: self.indexer.num_time_bins]))
-                scheduled_non_overflow = int(sum(schedule[: self.indexer.num_time_bins]))
-                base_overflow = int(d[self.indexer.num_time_bins]) if len(d) > self.indexer.num_time_bins else 0
-                schedule[self.indexer.num_time_bins] = int(base_overflow + max(0, total_non_overflow - scheduled_non_overflow))
-                n_f_t[key] = schedule
+        else:
+            # Baseline schedule: release at requested bins (no regulation)
+            n_f_t = {}
+            for k, d in context.d_by_flow.items():
+                try:
+                    n_f_t[str(k)] = list(d.tolist())
+                except Exception:
+                    arr = np.asarray(d)
+                    n_f_t[str(k)] = [int(x) for x in arr.tolist()]
 
         objective, components, artifacts = score_with_context(n_f_t, flights_by_flow=flights_by_flow, capacities_by_tv=capacities_by_tv, flight_list=self.flight_list, context=context)
 
