@@ -19,6 +19,9 @@ if "geopandas" not in sys.modules:
     geopandas_stub.GeoDataFrame = object  # minimal placeholder for type hints
     sys.modules["geopandas"] = geopandas_stub
 
+if "networkx" not in sys.modules:
+    sys.modules["networkx"] = types.ModuleType("networkx")
+
 from server_tailwind.query.QueryAPIWrapper import QueryAPIWrapper
 
 
@@ -138,3 +141,26 @@ def test_flight_scope_unknown_id(wrapper: QueryAPIWrapper):
     }
     with pytest.raises(ValueError, match="Unknown flight id"):
         asyncio.run(wrapper.evaluate(payload))
+
+
+def test_origin_wildcard(wrapper: QueryAPIWrapper):
+    payload = {"query": {"type": "origin", "airport": "A*"}}
+    result = asyncio.run(wrapper.evaluate(payload))
+    assert result["flight_ids"] == ["F1", "F3"]
+
+
+def test_airport_include_exclude(wrapper: QueryAPIWrapper):
+    payload = {
+        "query": {
+            "type": "destination",
+            "airport": {"include": ["B*", "E*"], "exclude": "BBB"},
+        }
+    }
+    result = asyncio.run(wrapper.evaluate(payload))
+    assert result["flight_ids"] == ["F3"]
+
+
+def test_airport_exclude_only(wrapper: QueryAPIWrapper):
+    payload = {"query": {"type": "origin", "airport": {"exclude": ["C*"]}}}
+    result = asyncio.run(wrapper.evaluate(payload))
+    assert result["flight_ids"] == ["F1", "F3"]
