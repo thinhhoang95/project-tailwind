@@ -5,7 +5,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Mapping, Sequence, Tuple
 
 import geopandas as gpd
 import numpy as np
@@ -253,6 +253,9 @@ class GlobalStats:
             "best_plan_summary": self.best_plan_summary,
             "best_N_flights_flows": self.best_N_flights_flows,
             "best_N_entrants_flows": self.best_N_entrants_flows,
+            # Clarify scope of the "best" metrics captured here
+            "best_scope": "local_candidate",
+            "best_scope_desc": "Best candidate at a single TV/window; objective and ΔJ are local, not system-wide",
             "actions_top": self._top_actions(),
             "actions_total": sum(self.action_counts.values()),
         }
@@ -446,8 +449,40 @@ class GlobalStats:
         entrants_by_flow: Mapping[str, int],
         meta: Mapping[str, Any],
     ) -> None:
-        if objective is None:
-            return
+        if objective is None or (isinstance(objective, (int, float)) and not math.isfinite(float(objective))):
+            # Emit a diagnostic trace to the run log before raising to surface the root cause
+            if self._logger is not None:
+                try:
+                    outer_idx_hint = None
+                    plan_id_hint = None
+                    meta_keys = None
+                    try:
+                        outer_idx_hint = meta.get("outer_index")
+                    except Exception:
+                        outer_idx_hint = None
+                    try:
+                        plan_id_hint = meta.get("plan_id")
+                    except Exception:
+                        plan_id_hint = None
+                    try:
+                        meta_keys = list(meta.keys())
+                    except Exception:
+                        meta_keys = None
+                    self._logger.event(
+                        "invalid_best_objective",
+                        {
+                            "source": str(source),
+                            "identifier": str(identifier),
+                            "objective": objective,
+                            "delta_j": delta_j,
+                            "outer_index_hint": outer_idx_hint,
+                            "plan_id_hint": plan_id_hint,
+                            "meta_keys": meta_keys,
+                        },
+                    )
+                except Exception:
+                    pass
+            raise ValueError(f"Invalid objective for best-plan update (source={source}, id={identifier}): {objective}")
         if self.best_objective_value is not None and objective >= self.best_objective_value:
             return
 
@@ -893,7 +928,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         return tbl
 
     def _render_global_best(best: Dict[str, Any]) -> Table:
-        tbl = Table(title="Best Plan (Global)", box=box.SIMPLE_HEAVY)
+        tbl = Table(title="Best Candidate (Local)", box=box.SIMPLE_HEAVY)
         tbl.add_column("Metric", style="green", no_wrap=True)
         tbl.add_column("Value", style="white")
 
@@ -915,8 +950,8 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         entrants_s = str(int(n_entrants)) if isinstance(n_entrants, (int, float)) else "—"
         since_best_s = f"{float(time_since_best):.1f}s" if isinstance(time_since_best, (int, float)) else "—"
 
-        tbl.add_row("Objective", obj_s)
-        tbl.add_row("Best ΔJ", delta_s)
+        tbl.add_row("Candidate objective (local)", obj_s)
+        tbl.add_row("Best ΔJ (local)", delta_s)
         tbl.add_row("Outer iter", outer_s)
         tbl.add_row("Plan id", plan_id_s)
         tbl.add_row("Summary", summary_s)
@@ -1000,7 +1035,7 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         return tbl
 
     def _build_delta_table(payload: Dict[str, Any]) -> Table:
-        tbl = Table(title="ΔJ", box=box.SIMPLE_HEAVY)
+        tbl = Table(title="ΔJ (local)", box=box.SIMPLE_HEAVY)
         tbl.add_column("Metric", style="green")
         tbl.add_column("Value", justify="right")
         best = payload.get("best_delta_j")
@@ -1021,11 +1056,11 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         actions_data = snapshot.get("actions", {}) or {}
         actions_total = actions_data.get("total", 0)
         progress_tbl = _render_global_progress(snapshot.get("progress", {}), last_payload, actions_total)
-        best_tbl = _render_global_best(snapshot.get("best", {}))
+        # best_tbl = _render_global_best(snapshot.get("best", {}))
 
         renderables = [
             progress_tbl,
-            best_tbl,
+            # best_tbl,
         ]
         if SHOW_GLOBAL_ACTIONS_PANEL:
             renderables.append(_render_global_actions(actions_data))
@@ -1178,9 +1213,20 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         total_delta = info.total_delta_j
         if isinstance(final_obj, (int, float)):
             base_obj = final_obj - total_delta
-            console.print(f"[runner] Final objective: {base_obj:,.3f} → {final_obj:,.3f} (ΔJ: {total_delta:,.3f})")
+            console.print(f"[runner] Final plan objective (plan domain): {base_obj:,.3f} → {final_obj:,.3f} (ΣΔJ_local: {total_delta:,.3f})")
+            # Attempt to read system-wide objective from the last run_end payload captured in last_payload/global_stats
+            try:
+                # Prefer live last_payload if present
+                sys_obj = last_payload.get("system_objective") if isinstance(last_payload, dict) else None
+                if sys_obj is None and isinstance(info.summary, dict):
+                    # Fallback to summary if run_end merged it (not typical)
+                    sys_obj = info.summary.get("system_objective")
+                if isinstance(sys_obj, (int, float)):
+                    console.print(f"[runner] System objective (all TVs): {float(sys_obj):,.3f}")
+            except Exception:
+                pass
         else:
-            console.print(f"[runner] Final objective: {final_obj}")
+            console.print(f"[runner] Final plan objective (plan domain): {final_obj}")
     if info.log_path:
         console.print(f"[runner] Log path: {info.log_path}")
     # Debug log is disabled for this run

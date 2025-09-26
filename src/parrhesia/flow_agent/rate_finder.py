@@ -166,26 +166,23 @@ class RateFinder:
     ) -> None:
         if self._global_stats is None:
             return
-        try:
-            candidate_id = self._candidate_id_from_signature(signature)
-            flow_serialized = {str(k): [str(x) for x in v] for k, v in flow_map.items()}
-            entrants_serialized = {str(k): int(v) for k, v in entrants_counts.items()}
-            rates_serialized = {str(k): float(v) for k, v in rates_map.items()}
-            self._global_stats.on_candidate_scored(
-                candidate_id,
-                float(objective),
-                float(delta_j),
-                {
-                    "control_volume_id": str(control_volume_id),
-                    "window_bins": [int(window_bins[0]), int(window_bins[1])],
-                    "mode": str(mode),
-                    "rates": rates_serialized,
-                    "flow_to_flights": flow_serialized,
-                    "entrants_by_flow": entrants_serialized,
-                },
-            )
-        except Exception:
-            pass
+        candidate_id = self._candidate_id_from_signature(signature)
+        flow_serialized = {str(k): [str(x) for x in v] for k, v in flow_map.items()}
+        entrants_serialized = {str(k): int(v) for k, v in entrants_counts.items()}
+        rates_serialized = {str(k): float(v) for k, v in rates_map.items()}
+        self._global_stats.on_candidate_scored(
+            candidate_id,
+            float(objective),
+            float(delta_j),
+            {
+                "control_volume_id": str(control_volume_id),
+                "window_bins": [int(window_bins[0]), int(window_bins[1])],
+                "mode": str(mode),
+                "rates": rates_serialized,
+                "flow_to_flights": flow_serialized,
+                "entrants_by_flow": entrants_serialized,
+            },
+        )
 
     # ------------------------------------------------------------------
     def find_rates(

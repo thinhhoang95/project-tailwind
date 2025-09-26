@@ -687,10 +687,16 @@ class MCTSAgent:
         base_state.metadata["hotspot_candidates"] = copy.deepcopy(candidates)
 
         initial_summary: Dict[str, Any] = {}
+        system_initial_objective: Optional[float] = None
         try:
             initial_summary = self._compute_final_objective(base_state)
         except Exception:
             initial_summary = {}
+        try:
+            _sys0 = self._compute_system_objective(base_state)
+            system_initial_objective = float(_sys0.get("system_objective")) if isinstance(_sys0.get("system_objective"), (int, float)) else None
+        except Exception:
+            system_initial_objective = None
 
         transition = CheapTransition()
         mcts = MCTS(
@@ -717,8 +723,17 @@ class MCTSAgent:
                         "num_flows": initial_summary.get("num_flows"),
                         "spill_T": initial_summary.get("spill_T"),
                         "in_window_releases": initial_summary.get("in_window_releases"),
+                        # Clarify scope for the baseline objective at run_start
+                        "objective_scope": "system_candidates_union",
+                        "objective_scope_desc": "Baseline over the union of hotspot candidate TVs/windows",
                     }
                 )
+                if system_initial_objective is not None:
+                    payload.update({
+                        "system_objective": float(system_initial_objective),
+                        "system_components": None,
+                        "system_objective_scope": "all_tvs",
+                    })
             self.logger.event("run_start", payload)
 
         root_parallel_workers_raw = getattr(self.mcts_cfg, "root_parallel_workers", 1)
@@ -1398,39 +1413,36 @@ class MCTSAgent:
                         },
                     )
                 if self._global_stats is not None:
-                    try:
-                        plan_id = None
-                        if isinstance(diag_payload.get("plan_id"), str):
-                            plan_id = str(diag_payload.get("plan_id"))
-                        if not plan_id:
-                            plan_id = f"outer{master_run_index + 1}-commit{commits}"
-                        self._global_stats.on_plan_committed(
-                            plan=tuple(state.plan),
-                            delta_j=float(delta_j),
-                            flow_to_flights=flow_to_flights_map if flow_to_flights_map else None,
-                            entrants_by_flow=entrants_counts_map if entrants_counts_map else None,
-                            meta={
-                                "control_volume_id": ctrl,
-                                "window_bins": [int(wb[0]), int(wb[1])],
-                                "mode": mode,
-                                "objective": fin_obj,
-                                "components": fin_comp,
-                                "outer_index": int(master_run_index + 1),
-                                "plan_id": plan_id,
-                                "commits": int(commits),
-                                "committed_rates": rates_to_store,
-                                "rate_menu_lower": rate_menu_lower,
-                                "rate_menu_upper": rate_menu_upper,
-                                "delta_j": float(delta_j),
-                                "flow_ids": [str(fid) for fid in flow_ids],
-                                "timestamp": time.time(),
-                                "cand_nonzero_delays": cand_nonzero_delays,
-                                "cand_max_delay": cand_max_delay,
-                                "cand_spill": cand_spill,
-                            },
-                        )
-                    except Exception:
-                        pass
+                    plan_id = None
+                    if isinstance(diag_payload.get("plan_id"), str):
+                        plan_id = str(diag_payload.get("plan_id"))
+                    if not plan_id:
+                        plan_id = f"outer{master_run_index + 1}-commit{commits}"
+                    self._global_stats.on_plan_committed(
+                        plan=tuple(state.plan),
+                        delta_j=float(delta_j),
+                        flow_to_flights=flow_to_flights_map if flow_to_flights_map else None,
+                        entrants_by_flow=entrants_counts_map if entrants_counts_map else None,
+                        meta={
+                            "control_volume_id": ctrl,
+                            "window_bins": [int(wb[0]), int(wb[1])],
+                            "mode": mode,
+                            "objective": fin_obj,
+                            "components": fin_comp,
+                            "outer_index": int(master_run_index + 1),
+                            "plan_id": plan_id,
+                            "commits": int(commits),
+                            "committed_rates": rates_to_store,
+                            "rate_menu_lower": rate_menu_lower,
+                            "rate_menu_upper": rate_menu_upper,
+                            "delta_j": float(delta_j),
+                            "flow_ids": [str(fid) for fid in flow_ids],
+                            "timestamp": time.time(),
+                            "cand_nonzero_delays": cand_nonzero_delays,
+                            "cand_max_delay": cand_max_delay,
+                            "cand_spill": cand_spill,
+                        },
+                    )
                 if self.debug_logger is not None:
                     try:
                         self.debug_logger.event(
@@ -1704,7 +1716,31 @@ class MCTSAgent:
         )
 
         if self.logger is not None:
-            self.logger.event("run_end", {"commits": best_commits, **best_summary})
+            # Clarify the scope of the final objective reported at run_end
+            payload: Dict[str, Any] = {
+                "commits": best_commits,
+                "objective_scope": "plan_domain",
+                "objective_scope_desc": "Final plan objective over TVs/windows with committed regulations only",
+                **best_summary,
+            }
+            try:
+                # Compute system-wide objective for the final plan
+                sysf = self._compute_system_objective(best_state if best_state is not None else state)
+                sys_final_obj = sysf.get("system_objective")
+                if isinstance(sys_final_obj, (int, float)):
+                    # Reflect system-wide objectives in both the log payload and the returned summary
+                    best_summary["system_objective"] = float(sys_final_obj)
+                    if system_initial_objective is not None:
+                        best_summary["system_initial_objective"] = float(system_initial_objective)
+                    payload.update({
+                        "system_objective": float(sys_final_obj),
+                        "system_components": sysf.get("system_components"),
+                        "system_objective_scope": "all_tvs",
+                        "system_initial_objective": (float(system_initial_objective) if system_initial_objective is not None else None),
+                    })
+            except Exception:
+                pass
+            self.logger.event("run_end", payload)
 
         if self.debug_logger is not None:
             try:
@@ -1960,6 +1996,173 @@ class MCTSAgent:
             "spill_T": spill_T_val,
             "in_window_releases": inwin_total_val,
         }
+
+    # ------------------------------------------------------------------
+    def _compute_system_objective(self, state: PlanState) -> Dict[str, Any]:
+        """
+        Compute objective over ALL TVs in the indexer (global, not scoped).
+
+        Scheduling is applied only to flows that belong to the current plan's
+        regulated TVs/windows (if any). Unregulated TVs/windows contribute via
+        baseline occupancy (zero-delay) captured by the context.
+        """
+        flights_by_flow: Dict[str, List[Dict[str, Any]]] = {}
+        capacities_by_tv: Dict[str, np.ndarray] = {}
+        T = int(self.indexer.num_time_bins)
+
+        def _ensure_caps(tv: str) -> None:
+            if tv not in capacities_by_tv:
+                caps = self.rate_finder._build_capacities_for_tv(tv)
+                capacities_by_tv.update(caps)
+
+        # Include capacities for all TVs
+        for tv in getattr(self.indexer, "tv_id_to_idx", {}).keys():
+            _ensure_caps(str(tv))
+
+        # Build schedules only for plan domain (if any)
+        if state.plan:
+            # For each regulation, reconstruct flow_to_flights from inventory or candidates
+            for reg in state.plan:
+                tv = str(reg.control_volume_id)
+                t0, t1 = int(reg.window_bins[0]), int(reg.window_bins[1])
+                desc = self.inventory.get(tv, (t0, t1))
+                if desc is None:
+                    # Fallback to candidates stored in state metadata
+                    for c in state.metadata.get("hotspot_candidates", []) or []:
+                        if str(c.get("control_volume_id")) == tv:
+                            wb = c.get("window_bins") or []
+                            if int(wb[0]) == t0 and int(wb[1]) == t1:
+                                desc = type("_Tmp", (), {"metadata": c.get("metadata", {}), "mode": c.get("mode", "per_flow")})
+                                break
+                meta = getattr(desc, "metadata", {}) if desc is not None else {}
+                flow_to_flights: Mapping[str, Sequence[str]] = meta.get("flow_to_flights", {}) or {}
+
+                prefix = f"{tv}:{t0}-{t1}"
+                if isinstance(reg.committed_rates, dict):
+                    specs_map = {}
+                    # Only include flows listed in the regulation
+                    for f in reg.flow_ids:
+                        specs_map.update(self._specs_for_system(tv, (t0, t1), {f: flow_to_flights.get(f, [])}, prefix))
+                    for k, v in specs_map.items():
+                        flights_by_flow[k] = v
+                else:
+                    # Blanket: union all listed flows under a synthetic id
+                    union_map: Dict[str, Sequence[str]] = {"__blanket__": [fid for f in reg.flow_ids for fid in flow_to_flights.get(f, [])]}
+                    specs_map = self._specs_for_system(tv, (t0, t1), union_map, prefix)
+                    flights_by_flow[f"{prefix}:__blanket__"] = specs_map.get(f"{prefix}:__blanket__", [])
+        # Else: no plan schedules; flights_by_flow remains empty (baseline-only global)
+
+        # Build global context (tvs_of_interest = all TVs via capacities_by_tv)
+        context = build_score_context(
+            flights_by_flow,
+            indexer=self.indexer,
+            capacities_by_tv=capacities_by_tv,
+            target_cells=None,
+            ripple_cells=None,
+            flight_list=self.flight_list,
+            weights=ObjectiveWeights(),
+        )
+
+        # Assemble schedules
+        if state.plan and flights_by_flow:
+            n_f_t: Dict[str, List[int]] = {k: [int(x) for x in np.zeros(self.indexer.num_time_bins + 1, dtype=int)] for k in flights_by_flow.keys()}
+            bin_minutes = max(1, int(getattr(self.indexer, "time_bin_minutes", 60)))
+            for reg in state.plan:
+                tv = str(reg.control_volume_id)
+                t0, t1 = int(reg.window_bins[0]), int(reg.window_bins[1])
+                prefix = f"{tv}:{t0}-{t1}"
+                active = sorted(set(range(t0, max(t0 + 1, t1))))
+                if isinstance(reg.committed_rates, dict):
+                    for f, rate in reg.committed_rates.items():
+                        key = f"{prefix}:{f}"
+                        d = context.d_by_flow.get(key)
+                        if d is None:
+                            continue
+                        schedule = list(d.tolist())
+                        rate_val = float(rate)
+                        quota = 0 if not (rate_val > 0 and not np.isinf(rate_val)) else int(round(rate_val * bin_minutes / 60.0))
+                        ready = 0
+                        released = 0
+                        for t in active:
+                            t = int(t)
+                            if t < 0 or t >= self.indexer.num_time_bins:
+                                continue
+                            ready += int(d[t])
+                            available = max(0, ready - released)
+                            take = min(quota, available) if quota > 0 else 0
+                            schedule[t] = int(take)
+                            released += int(take)
+                        total_non_overflow = int(sum(d[: self.indexer.num_time_bins]))
+                        scheduled_non_overflow = int(sum(schedule[: self.indexer.num_time_bins]))
+                        base_overflow = int(d[self.indexer.num_time_bins]) if len(d) > self.indexer.num_time_bins else 0
+                        schedule[self.indexer.num_time_bins] = int(base_overflow + max(0, total_non_overflow - scheduled_non_overflow))
+                        n_f_t[key] = schedule
+                else:
+                    key = f"{prefix}:__blanket__"
+                    d = context.d_by_flow.get(key)
+                    if d is None:
+                        continue
+                    schedule = list(d.tolist())
+                    rate_val = float(reg.committed_rates) if reg.committed_rates is not None else float("inf")
+                    quota = 0 if not (rate_val > 0 and not np.isinf(rate_val)) else int(round(rate_val * bin_minutes / 60.0))
+                    ready = 0
+                    released = 0
+                    for t in active:
+                        t = int(t)
+                        if t < 0 or t >= self.indexer.num_time_bins:
+                            continue
+                        ready += int(d[t])
+                        available = max(0, ready - released)
+                        take = min(quota, available) if quota > 0 else 0
+                        schedule[t] = int(take)
+                        released += int(take)
+                    total_non_overflow = int(sum(d[: self.indexer.num_time_bins]))
+                    scheduled_non_overflow = int(sum(schedule[: self.indexer.num_time_bins]))
+                    base_overflow = int(d[self.indexer.num_time_bins]) if len(d) > self.indexer.num_time_bins else 0
+                    schedule[self.indexer.num_time_bins] = int(base_overflow + max(0, total_non_overflow - scheduled_non_overflow))
+                    n_f_t[key] = schedule
+        else:
+            n_f_t = {}
+
+        objective, components, artifacts = score_with_context(
+            n_f_t,
+            flights_by_flow=flights_by_flow,
+            capacities_by_tv=capacities_by_tv,
+            flight_list=self.flight_list,
+            context=context,
+        )
+
+        return {
+            "system_objective": float(objective),
+            "system_components": components,
+        }
+
+    # Helper for system objective: reuse entrants -> specs mapping
+    def _specs_for_system(self, comm_tv: str, window: Tuple[int, int], flow_to_flights: Mapping[str, Sequence[str]], flow_key_prefix: str) -> Dict[str, List[Dict[str, Any]]]:
+        T = int(self.indexer.num_time_bins)
+        t0, t1 = int(window[0]), int(window[1])
+        active = list(range(t0, max(t0 + 1, t1)))
+        reverse: Dict[str, str] = {}
+        for f, ids in flow_to_flights.items():
+            for fid in ids:
+                reverse[str(fid)] = str(f)
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        iter_fn = getattr(self.flight_list, "iter_hotspot_crossings", None)
+        if callable(iter_fn):
+            for fid, tv, entry_dt, t in iter_fn([comm_tv], active_windows={comm_tv: active}):  # type: ignore[misc]
+                flow = reverse.get(str(fid))
+                if flow is None:
+                    continue
+                rbin = max(0, min(T, int(t)))
+                key = f"{flow_key_prefix}:{flow}"
+                spec = {"flight_id": str(fid), "requested_bin": rbin}
+                if isinstance(entry_dt, datetime):
+                    spec["requested_dt"] = entry_dt
+                out.setdefault(key, []).append(spec)
+        for f in flow_to_flights.keys():
+            key = f"{flow_key_prefix}:{f}"
+            out.setdefault(key, [])
+        return out
 
 
 __all__ = ["MCTSAgent", "RunInfo"]
