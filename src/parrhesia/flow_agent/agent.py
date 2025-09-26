@@ -196,7 +196,7 @@ class MCTSAgent:
         debug_logger: Optional[SearchLogger] = None,
         cold_logger: Optional[SearchLogger] = None,
         max_regulations: Optional[int] = None,
-        max_regulation_count: Optional[int] = None,
+        max_inner_loop_commits_and_evals: Optional[int] = None,
         timer: Optional[Callable[[str], ContextManager[Any]]] = None,
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
         global_stats: Optional[GlobalStatsHook] = None,
@@ -214,15 +214,15 @@ class MCTSAgent:
         self.logger = logger
         self.debug_logger = debug_logger
         self.cold_logger = cold_logger
-        if max_regulation_count is None:
-            max_regulation_count = max_regulations
-        if max_regulation_count is None:
-            sanitized_reg_limit: Optional[int] = None
+        if max_inner_loop_commits_and_evals is None:
+            max_inner_loop_commits_and_evals = max_regulations
+        if max_inner_loop_commits_and_evals is None:
+            sanitized_inner_commit_limit: Optional[int] = None
         else:
-            sanitized_reg_limit = int(max(0, max_regulation_count))
-        self.max_regulation_count = sanitized_reg_limit
+            sanitized_inner_commit_limit = int(max(0, max_inner_loop_commits_and_evals))
+        self.max_inner_loop_commits_and_evals = sanitized_inner_commit_limit
         # Preserve legacy attribute name for downstream callers that may still reference it.
-        self.max_regulations = sanitized_reg_limit
+        self.max_regulations = sanitized_inner_commit_limit
         self._timer_factory = timer
         self._progress_cb = progress_cb
         self._global_stats = global_stats
@@ -745,13 +745,13 @@ class MCTSAgent:
             root_parallel_workers = 1
 
         commit_depth_limit = int(max(0, self.mcts_cfg.commit_depth))
-        configured_reg_limit = (
-            int(self.max_regulation_count)
-            if self.max_regulation_count is not None
+        configured_inner_commit_limit = (
+            int(self.max_inner_loop_commits_and_evals)
+            if self.max_inner_loop_commits_and_evals is not None
             else None
         )
         outer_loop_budget = (
-            int(max(0, configured_reg_limit)) if configured_reg_limit is not None else commit_depth_limit
+            int(max(0, configured_inner_commit_limit)) if configured_inner_commit_limit is not None else commit_depth_limit
         )
 
         master_start = time.perf_counter()
@@ -776,9 +776,9 @@ class MCTSAgent:
                     {
                         "num_candidates": len(candidates),
                         "commit_depth": int(self.mcts_cfg.commit_depth),
-                        "max_regulation_count": (
-                            int(self.max_regulation_count)
-                            if self.max_regulation_count is not None
+                        "max_inner_loop_commits_and_evals": (
+                            int(self.max_inner_loop_commits_and_evals)
+                            if self.max_inner_loop_commits_and_evals is not None
                             else None
                         ),
                         "max_sims": int(self.mcts_cfg.max_sims),
@@ -931,9 +931,9 @@ class MCTSAgent:
                         {
                             "outer_master_run_index": int(master_run_index + 1),
                             "commit_depth": int(self.mcts_cfg.commit_depth),
-                            "max_regulation_count": (
-                                int(self.max_regulation_count)
-                                if self.max_regulation_count is not None
+                            "max_inner_loop_commits_and_evals": (
+                                int(self.max_inner_loop_commits_and_evals)
+                                if self.max_inner_loop_commits_and_evals is not None
                                 else None
                             ),
                             "max_sims": int(self.mcts_cfg.max_sims),
@@ -953,9 +953,9 @@ class MCTSAgent:
                 {
                     "outer_commits": int(commits),
                     "outer_commit_depth": int(commit_depth_limit),
-                    "outer_max_regulation_count": (
-                        int(self.max_regulation_count)
-                        if self.max_regulation_count is not None
+                    "outer_max_inner_loop_commits_and_evals": (
+                        int(self.max_inner_loop_commits_and_evals)
+                        if self.max_inner_loop_commits_and_evals is not None
                         else None
                     ),
                     "outer_limit": int(outer_loop_budget),
@@ -1031,9 +1031,9 @@ class MCTSAgent:
                                 "outer_stop_info": outer_stop_info,
                                 "outer_commits": int(commits),
                                 "outer_commit_depth": int(commit_depth_limit),
-                                "outer_max_regulation_count": (
-                                    int(self.max_regulation_count)
-                                    if self.max_regulation_count is not None
+                                "outer_max_inner_loop_commits_and_evals": (
+                                    int(self.max_inner_loop_commits_and_evals)
+                                    if self.max_inner_loop_commits_and_evals is not None
                                     else None
                                 ),
                                 "outer_limit": int(outer_loop_budget),
@@ -1076,9 +1076,9 @@ class MCTSAgent:
                             "outer_stop_info": outer_stop_info,
                             "outer_commits": int(commits),
                             "outer_commit_depth": int(commit_depth_limit),
-                            "outer_max_regulation_count": (
-                                int(self.max_regulation_count)
-                                if self.max_regulation_count is not None
+                            "outer_max_inner_loop_commits_and_evals": (
+                                int(self.max_inner_loop_commits_and_evals)
+                                if self.max_inner_loop_commits_and_evals is not None
                                 else None
                             ),
                             "outer_limit": int(outer_loop_budget),
@@ -1270,9 +1270,9 @@ class MCTSAgent:
                     {
                         "outer_commits": int(commits),
                         "outer_commit_depth": int(commit_depth_limit),
-                        "outer_max_regulation_count": (
-                            int(self.max_regulation_count)
-                            if self.max_regulation_count is not None
+                        "outer_max_inner_loop_commits_and_evals": (
+                            int(self.max_inner_loop_commits_and_evals)
+                            if self.max_inner_loop_commits_and_evals is not None
                             else None
                         ),
                         "outer_limit": int(outer_loop_budget),
@@ -1483,9 +1483,9 @@ class MCTSAgent:
                             "outer_stop_info": outer_stop_info,
                             "outer_commits": int(commits),
                             "outer_commit_depth": int(commit_depth_limit),
-                            "outer_max_regulation_count": (
-                                int(self.max_regulation_count)
-                                if self.max_regulation_count is not None
+                            "outer_max_inner_loop_commits_and_evals": (
+                                int(self.max_inner_loop_commits_and_evals)
+                                if self.max_inner_loop_commits_and_evals is not None
                                 else None
                             ),
                             "outer_limit": int(outer_loop_budget),
@@ -1512,18 +1512,18 @@ class MCTSAgent:
 
                 run_idx += 1
 
-            if self.max_regulation_count is not None and commits >= self.max_regulation_count:
+            if self.max_inner_loop_commits_and_evals is not None and commits >= self.max_inner_loop_commits_and_evals:
                 if self.logger is not None:
                     self.logger.event(
-                        "regulation_limit_reached",
-                        {"limit": int(self.max_regulation_count), "outer_run": master_run_index + 1},
+                        "inner_commit_limit_reached",
+                        {"limit": int(self.max_inner_loop_commits_and_evals), "outer_run": master_run_index + 1},
                     )
                 if self.debug_logger is not None:
                     try:
                         self.debug_logger.event(
-                            "outer_stop_regulation_limit",
+                            "outer_stop_inner_commit_limit",
                             {
-                                "limit": int(self.max_regulation_count),
+                                "limit": int(self.max_inner_loop_commits_and_evals),
                                 "commits": int(commits),
                                 "outer_master_run_index": int(master_run_index + 1),
                             },
@@ -1533,10 +1533,10 @@ class MCTSAgent:
                 if self._global_stats is not None:
                     try:
                         self._global_stats.on_limit_hit(
-                            "regulation_limit_reached",
+                            "inner_commit_limit_reached",
                             {
                                 "outer_index": int(master_run_index + 1),
-                                "limit": int(self.max_regulation_count),
+                                "limit": int(self.max_inner_loop_commits_and_evals),
                                 "commits": int(commits),
                             },
                         )
@@ -1550,9 +1550,9 @@ class MCTSAgent:
 
             final_stop_reason = outer_stop_reason
             if final_stop_reason is None:
-                if configured_reg_limit is not None and commits >= configured_reg_limit:
-                    final_stop_reason = "regulation_limit_reached"
-                elif configured_reg_limit is None and commits >= commit_depth_limit:
+                if configured_inner_commit_limit is not None and commits >= configured_inner_commit_limit:
+                    final_stop_reason = "inner_commit_limit_reached"
+                elif configured_inner_commit_limit is None and commits >= commit_depth_limit:
                     final_stop_reason = "commit_depth_limit_reached"
                     if self._global_stats is not None:
                         try:
@@ -1576,9 +1576,9 @@ class MCTSAgent:
                     "outer_stop_info": final_stop_info,
                     "outer_commits": int(commits),
                     "outer_commit_depth": int(commit_depth_limit),
-                    "outer_max_regulation_count": (
-                        int(self.max_regulation_count)
-                        if self.max_regulation_count is not None
+                    "outer_max_inner_loop_commits_and_evals": (
+                        int(self.max_inner_loop_commits_and_evals)
+                        if self.max_inner_loop_commits_and_evals is not None
                         else None
                     ),
                     "outer_limit": int(outer_loop_budget),
@@ -1611,9 +1611,9 @@ class MCTSAgent:
                         "commits": int(commits),
                         "limit": int(outer_loop_budget),
                         "commit_depth": int(commit_depth_limit),
-                        "max_regulation_count": (
-                            int(self.max_regulation_count)
-                            if self.max_regulation_count is not None
+                        "max_inner_loop_commits_and_evals": (
+                            int(self.max_inner_loop_commits_and_evals)
+                            if self.max_inner_loop_commits_and_evals is not None
                             else None
                         ),
                         "total_delta_j": float(total_delta_j),
@@ -1704,9 +1704,9 @@ class MCTSAgent:
                 "outer_stop_info": best_stop_info,
                 "outer_commits": int(best_commits),
                 "outer_commit_depth": int(commit_depth_limit),
-                "outer_max_regulation_count": (
-                    int(self.max_regulation_count)
-                    if self.max_regulation_count is not None
+                "outer_max_inner_loop_commits_and_evals": (
+                    int(self.max_inner_loop_commits_and_evals)
+                    if self.max_inner_loop_commits_and_evals is not None
                     else None
                 ),
                 "outer_limit": int(outer_loop_budget),

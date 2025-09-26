@@ -1143,8 +1143,8 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         logger=logger,
         debug_logger=debug_logger,
         cold_logger=cold_logger,
-        # Allow up to three committed regulations for this demo run
-        max_regulation_count=3,
+        # Allow up to three committed regulations before forcing commits to move the outer loop forward
+        max_inner_loop_commits_and_evals=32, # the variable name could be misleading. It is the max number of commits before moving the outer loop forward
         timer=timed,
         progress_cb=_on_progress,
         early_stop_no_improvement=early_stop_no_improvement,
