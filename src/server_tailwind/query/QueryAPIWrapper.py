@@ -7,6 +7,7 @@ import math
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from fnmatch import fnmatchcase
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -72,6 +73,10 @@ class QueryAPIWrapper:
         # Cached helpers: origin/dest masks, tv/bin -> flights, per-flight entries, etc.
         self._origin_to_rows: Dict[str, np.ndarray] = {}
         self._destination_to_rows: Dict[str, np.ndarray] = {}
+        self._airports_by_field: Dict[str, Tuple[str, ...]] = {
+            "origin": self._collect_airports_for_field("origin"),
+            "destination": self._collect_airports_for_field("destination"),
+        }
         self._tv_bin_to_rows: Dict[int, Dict[int, np.ndarray]] = {}
         self._tv_time_mask_cache: Dict[Tuple[int, int, int, str], np.ndarray] = {}
         self._flight_entries_cache: Dict[str, np.ndarray] = {}
@@ -914,26 +919,105 @@ class QueryAPIWrapper:
         airport_value = node.get("airport")
         if airport_value is None:
             raise ValueError(f"'{node.get('type')}' requires an 'airport' field")
-        airports = (
-            [airport_value]
-            if isinstance(airport_value, str)
-            else list(airport_value)
-        )
-        rows = np.zeros(self.num_flights, dtype=bool)
-        for airport in airports:
-            airport_str = str(airport)
-            rows_for_airport = cache.get(airport_str)
-            if rows_for_airport is None:
-                indices: List[int] = []
-                for fid, idx in self._flight_row_lookup.items():
-                    meta = self._flight_meta.get(fid)
-                    if meta and meta.get(field) == airport_str:
-                        indices.append(idx)
-                rows_for_airport = np.array(indices, dtype=np.int32)
-                cache[airport_str] = rows_for_airport
-            if rows_for_airport.size:
-                rows[rows_for_airport] = True
+        include_patterns: List[str]
+        exclude_patterns: List[str]
+
+        if isinstance(airport_value, dict):
+            include_patterns = self._normalize_airport_patterns(airport_value.get("include"))
+            exclude_patterns = self._normalize_airport_patterns(airport_value.get("exclude"))
+            if not include_patterns and not exclude_patterns:
+                raise ValueError(
+                    "Airport filter dictionaries must specify 'include' and/or 'exclude' patterns"
+                )
+        else:
+            include_patterns = self._normalize_airport_patterns(airport_value)
+            exclude_patterns = []
+
+        if include_patterns:
+            rows = np.zeros(self.num_flights, dtype=bool)
+            for pattern in include_patterns:
+                indices = self._rows_for_airport_pattern(pattern, field=field, cache=cache)
+                if indices.size:
+                    rows[indices] = True
+        else:
+            rows = np.ones(self.num_flights, dtype=bool)
+
+        if exclude_patterns:
+            exclude_rows = np.zeros(self.num_flights, dtype=bool)
+            for pattern in exclude_patterns:
+                indices = self._rows_for_airport_pattern(pattern, field=field, cache=cache)
+                if indices.size:
+                    exclude_rows[indices] = True
+            rows &= ~exclude_rows
+
         return rows
+
+    def _rows_for_airport_pattern(
+        self, pattern: str, *, field: str, cache: Dict[str, np.ndarray]
+    ) -> np.ndarray:
+        pattern_str = str(pattern)
+        if not pattern_str:
+            return np.array([], dtype=np.int32)
+
+        if not self._pattern_has_wildcard(pattern_str):
+            return self._rows_for_airport_exact(pattern_str, field=field, cache=cache)
+
+        cached = cache.get(pattern_str)
+        if cached is not None:
+            return cached
+
+        indices: List[int] = []
+        for airport in self._airports_by_field.get(field, ()): 
+            if fnmatchcase(airport, pattern_str):
+                rows_for_airport = self._rows_for_airport_exact(
+                    airport, field=field, cache=cache
+                )
+                if rows_for_airport.size:
+                    indices.extend(rows_for_airport.tolist())
+        if indices:
+            result = np.unique(np.asarray(indices, dtype=np.int32))
+        else:
+            result = np.array([], dtype=np.int32)
+        cache[pattern_str] = result
+        return result
+
+    def _rows_for_airport_exact(
+        self, airport: str, *, field: str, cache: Dict[str, np.ndarray]
+    ) -> np.ndarray:
+        rows_for_airport = cache.get(airport)
+        if rows_for_airport is not None:
+            return rows_for_airport
+
+        airport_str = str(airport)
+        indices: List[int] = []
+        for fid, idx in self._flight_row_lookup.items():
+            meta = self._flight_meta.get(fid)
+            if meta and meta.get(field) == airport_str:
+                indices.append(idx)
+        rows_for_airport = np.array(indices, dtype=np.int32)
+        cache[airport_str] = rows_for_airport
+        return rows_for_airport
+
+    @staticmethod
+    def _pattern_has_wildcard(pattern: str) -> bool:
+        return any(char in pattern for char in "*?[]")
+
+    def _normalize_airport_patterns(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, Iterable) and not isinstance(value, dict):
+            return [str(item) for item in value]
+        raise ValueError("Airport filters must be a string, iterable of strings, or dict")
+
+    def _collect_airports_for_field(self, field: str) -> Tuple[str, ...]:
+        airports = {
+            str(meta.get(field))
+            for meta in self._flight_meta.values()
+            if isinstance(meta.get(field), str) and meta.get(field)
+        }
+        return tuple(sorted(airports))
 
     def _compare(self, lhs: float, op: str, rhs: float) -> bool:
         if op == "<":
