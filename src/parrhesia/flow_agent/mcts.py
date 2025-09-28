@@ -22,7 +22,6 @@ from .actions import (
     RemoveFlow,
     Stop,
 )
-from .logging import SearchLogger
 from .state import PlanState
 from .transition import CheapTransition
 from .rate_finder import RateFinder
@@ -100,8 +99,6 @@ class MCTS:
         rng: Optional[np.random.Generator] = None,
         timer: Optional[Callable[[str], ContextManager[Any]]] = None,
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
-        debug_logger: Optional[SearchLogger] = None,
-        cold_logger: Optional[SearchLogger] = None,
         commit_executor: Optional[Executor] = None,
     ) -> None:
         self.transition = transition
@@ -115,9 +112,7 @@ class MCTS:
         self._action_counts: Dict[str, int] = {}
         self._action_counts_by_stage: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._progress_cb = progress_cb
-        self._debug_logger = debug_logger
         self._current_sim: Optional[int] = None
-        self._cold_logger = cold_logger
         self._max_commits_path: int = 0
         self._last_run_stats: Dict[str, Any] = {}
         self._run_index: Optional[int] = None
@@ -171,7 +166,6 @@ class MCTS:
                 return
             self._pending_commit_jobs.pop(key, None)
             self._commit_eval_cache[key] = (rates, float(delta_j), info)
-            self._last_delta_j = float(delta_j)
 
     def _commit_future_callback(
         self,
@@ -206,6 +200,7 @@ class MCTS:
         sim_index: Optional[int] = None,
         step_index: Optional[int] = None,
     ) -> None:
+        # Logging disabled in simplified mode
         return
 
     def _log_cold_event(
@@ -392,37 +387,10 @@ class MCTS:
             z_hash = None
             if state.z_hat is not None:
                 arr = np.asarray(state.z_hat, dtype=float)
-                if not np.all(np.isfinite(arr)):
-                    self._log_debug_event(
-                        "invalid_z_hat",
-                        {
-                            "node_hash": node_hash,
-                            "nan_count": int(np.isnan(arr).sum()),
-                            "inf_count": int(np.isinf(arr).sum()),
-                        },
-                        sim_index=sim_index,
-                        step_index=step_index,
-                    )
                 try:
                     z_hash = self._short_hash(arr.tobytes())
                 except Exception:
                     z_hash = None
-
-            visit_payload: Dict[str, Any] = {
-                "stage": state.stage,
-                "node_hash": node_hash,
-                "existing": bool(node is not None),
-                "node_visits": int(node.N) if node is not None else 0,
-                "commits_used": commits_used,
-                "total_return": float(total_return),
-                "path_len": len(path),
-                "z_hash": z_hash,
-            }
-            if selected_flows:
-                visit_payload["selected_flows"] = list(selected_flows)
-            if candidate_flows and state.stage in {"select_flows", "confirm"}:
-                visit_payload["candidate_flows"] = list(candidate_flows)
-            self._log_debug_event("node_visit", visit_payload, sim_index=sim_index, step_index=step_index)
 
             if node is None:
                 node = self._create_node(state)
@@ -430,19 +398,8 @@ class MCTS:
                 self._dbg(f"[MCTS/expand] create_leaf node={key[:24]}… phi={float(node.phi):.3f} {self._state_brief(state)}")
                 v = -node.phi
                 self._dbg(f"[MCTS/simulate] leaf_bootstrap return={float(v):.3f} {self._state_brief(state)} path_len={len(path)}")
-                self._log_backup_path(path, v, sim_index=sim_index, step_index=step_index, reason="leaf_bootstrap")
-                self._backup(path, v, sim_index=sim_index, step_index=step_index, reason="leaf_bootstrap")
-                self._log_debug_event(
-                    "simulate_return",
-                    {
-                        "reason": "leaf_bootstrap",
-                        "value": float(v),
-                        "path_len": len(path),
-                        "node_hash": node_hash,
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
+        self._log_backup_path(path, v, sim_index=sim_index, step_index=step_index, reason="leaf_bootstrap")
+        self._backup(path, v, sim_index=sim_index, step_index=step_index, reason="leaf_bootstrap")
                 return v
 
             candidates = self._enumerate_actions(state)
@@ -493,30 +450,11 @@ class MCTS:
                 flow_noise_applied = True
             if noise_info is not None:
                 kind, eps, alpha = noise_info
-                self._log_debug_event(
-                    "dirichlet_noise",
-                    {
-                        "node_hash": node_hash,
-                        "kind": kind,
-                        "epsilon": float(eps),
-                        "alpha": float(alpha),
-                        "actions": len(priors),
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
             invalid_priors = {
                 self._sig_to_label(sig): float(p)
                 for sig, p in priors.items()
                 if not math.isfinite(float(p))
             }
-            if invalid_priors:
-                self._log_debug_event(
-                    "invalid_priors",
-                    {"node_hash": node_hash, "priors": invalid_priors},
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
             if override_priors:
                 for stale in list(node.P.keys()):
                     if stale not in priors:
@@ -534,7 +472,6 @@ class MCTS:
                     node.children[sig] = "?"
                     node.edges[sig] = node.edges.get(sig, EdgeStats())
                     # Count expansion of a new child as one action
-                    self._inc_action("expand", sim_index=sim_index, step_index=step_index)
                     self._dbg(
                         f"[MCTS/expand]   + child {self._sig_to_label(sig)} P={float(priors.get(sig, 0.0)):.3f} children_now={len(node.children)}"
                     )
@@ -542,48 +479,11 @@ class MCTS:
                 else:
                     break
 
-            children_snapshot: List[Dict[str, Any]] = []
-            for sig, child_key in node.children.items():
-                est = node.edges.get(sig)
-                child_hash = self._short_hash(child_key) if isinstance(child_key, str) and child_key not in {"?"} else None
-                children_snapshot.append(
-                    {
-                        "sig": self._sig_to_json(sig),
-                        "action": self._sig_to_label(sig),
-                        "label": self._sig_to_label(sig),
-                        "child_hash": child_hash,
-                        "P": float(node.P.get(sig, 0.0)),
-                        "N": int(est.N if est else 0),
-                        "Q": float(est.Q if est else 0.0),
-                    }
-                )
-
             if not node.children:
                 v = -node.phi
                 self._dbg(f"[MCTS/select] no_children -> terminal bootstrap={float(v):.3f} {self._state_brief(state)}")
-                self._log_debug_event(
-                    "no_children_terminal",
-                    {
-                        "node_hash": node_hash,
-                        "stage": state.stage,
-                        "value": float(v),
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
                 self._log_backup_path(path, v, sim_index=sim_index, step_index=step_index, reason="no_children")
                 self._backup(path, v, sim_index=sim_index, step_index=step_index, reason="no_children")
-                self._log_debug_event(
-                    "simulate_return",
-                    {
-                        "reason": "no_children",
-                        "value": float(v),
-                        "path_len": len(path),
-                        "node_hash": node_hash,
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
                 return v
 
             viable: List[Tuple[Tuple, EdgeStats]] = []
@@ -597,31 +497,8 @@ class MCTS:
                 self._dbg(
                     f"[MCTS/select] no_viable_moves -> bootstrap={float(v):.3f} commits_used={commits_used}/{commit_depth} {self._state_brief(state)}"
                 )
-                self._log_debug_event(
-                    "no_viable_moves",
-                    {
-                        "node_hash": node_hash,
-                        "stage": state.stage,
-                        "value": float(v),
-                        "commits_used": commits_used,
-                        "commit_depth": commit_depth,
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
                 self._log_backup_path(path, v, sim_index=sim_index, step_index=step_index, reason="no_viable_moves")
                 self._backup(path, v, sim_index=sim_index, step_index=step_index, reason="no_viable_moves")
-                self._log_debug_event(
-                    "simulate_return",
-                    {
-                        "reason": "no_viable_moves",
-                        "value": float(v),
-                        "path_len": len(path),
-                        "node_hash": node_hash,
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
                 return v
 
             sqrtN = math.sqrt(max(1, node.N))
@@ -672,102 +549,11 @@ class MCTS:
             tie_candidates = [rec for rec in selection_records if abs(float(rec.get("score", 0.0)) - float(best_score)) <= 1e-12]
             tie_break_applied = len(tie_candidates) > 1
 
-            if state.stage == "confirm":
-                commit_sig = self._signature_for_action(state, CommitRegulation())
-                back_sig = self._signature_for_action(state, Back())
-                stop_sig = self._signature_for_action(state, Stop())
-                confirm_payload = {
-                    "node_hash": node_hash,
-                    "node_N": int(node.N),
-                    "child_count": len(node.children),
-                    "created_this_sim": created_flag,
-                    "z_hash": z_hash,
-                    "edges": {},
-                    "priors": {},
-                }
-                for label, sig in (("commit", commit_sig), ("back", back_sig), ("stop", stop_sig)):
-                    est_edge = node.edges.get(sig)
-                    confirm_payload["edges"][label] = {
-                        "P": float(node.P.get(sig, 0.0)),
-                        "N": int(est_edge.N if est_edge else 0),
-                        "Q": float(est_edge.Q if est_edge else 0.0),
-                    }
-                    confirm_payload["priors"][label] = float(priors.get(sig, node.P.get(sig, 0.0)))
-                self._log_debug_event("confirm_snapshot", confirm_payload, sim_index=sim_index, step_index=step_index)
-
-                # Cold Feet specific: log Q and U for commit/back/stop at confirm
-                def _calc_u(sig: Tuple) -> Dict[str, float]:
-                    est_c = node.edges.get(sig)
-                    P_c = float(node.P.get(sig, 0.0))
-                    N_edge = int(est_c.N if est_c else 0)
-                    U_c = float(self.cfg.c_puct) * P_c * (sqrtN / (1.0 + N_edge))
-                    Q_c = float(est_c.Q if est_c else 0.0)
-                    return {"P": P_c, "Q": Q_c, "U": float(U_c), "N": N_edge}
-
-                cold_payload = {
-                    "node_hash": node_hash,
-                    "node_N": int(node.N),
-                    "sqrtN": float(sqrtN),
-                    "created_this_sim": created_flag,
-                    "z_hash": z_hash,
-                    "actions": {
-                        "commit": _calc_u(commit_sig),
-                        "back": _calc_u(back_sig),
-                        "stop": _calc_u(stop_sig),
-                    },
-                }
-                self._log_cold_event("confirm_q_u", cold_payload, sim_index=sim_index, step_index=step_index)
-
-                # Also record which action was actually chosen at confirm
-                confirm_taken_payload = {
-                    "node_hash": node_hash,
-                    "node_N": int(node.N),
-                    "sqrtN": float(sqrtN),
-                    "created_this_sim": created_flag,
-                    "z_hash": z_hash,
-                    "chosen": {
-                        "sig": self._sig_to_json(best_sig),
-                        "label": self._sig_to_label(best_sig),
-                        "Q": float(est_sel.Q),
-                        "U": float(U_best),
-                        "score": float(best_score),
-                    },
-                    "viable_count": len(viable),
-                    "path_len": len(path),
-                }
-                self._log_cold_event("confirm_action_taken", confirm_taken_payload, sim_index=sim_index, step_index=step_index)
-
-            selection_payload = {
-                "stage": state.stage,
-                "node_hash": node_hash,
-                "node_N": int(node.N),
-                "created_this_sim": created_flag,
-                "sqrtN": float(sqrtN),
-                "records": selection_records,
-                "children": children_snapshot,
-                "chosen": {
-                    "sig": self._sig_to_json(best_sig),
-                    "label": self._sig_to_label(best_sig),
-                    "Q": float(est_sel.Q),
-                    "U": float(U_best),
-                    "score": float(best_score),
-                    "tie_break": {
-                        "applied": bool(tie_break_applied),
-                        "strategy": ("lexicographic" if tie_break_applied else "none"),
-                        "tied_count": int(len(tie_candidates)),
-                    },
-                },
-                "viable_count": len(viable),
-                "path_len": len(path),
-            }
-            self._log_debug_event("selection_snapshot", selection_payload, sim_index=sim_index, step_index=step_index)
-
             self._dbg(
                 f"[MCTS/select] pick {self._sig_to_label(best_sig)} U={float(best_score):.3f} Q={float(est_sel.Q):.3f} P={float(node.P.get(best_sig, 0.0)):.3f} N_edge={int(est_sel.N)} node_N={int(node.N)} children={len(node.children)} {self._state_brief(state)}"
             )
 
             # Count selection of the best action
-            self._inc_action("select", sim_index=sim_index, step_index=step_index)
             action = self._action_from_signature(state, best_sig)
 
             r_base = 0.0
@@ -777,30 +563,8 @@ class MCTS:
                     self._dbg(
                         f"[MCTS/simulate] commit_blocked budget commits_used={commits_used}/{commit_depth} -> bootstrap={float(v):.3f}"
                     )
-                    self._log_debug_event(
-                        "commit_blocked_quota",
-                        {
-                            "node_hash": node_hash,
-                            "value": float(v),
-                            "commits_used": commits_used,
-                            "commit_depth": commit_depth,
-                        },
-                        sim_index=sim_index,
-                        step_index=step_index,
-                    )
-                    self._log_backup_path(path, v, sim_index=sim_index, step_index=step_index, reason="commit_blocked")
-                    self._backup(path, v, sim_index=sim_index, step_index=step_index, reason="commit_blocked")
-                    self._log_debug_event(
-                        "simulate_return",
-                        {
-                            "reason": "commit_blocked",
-                            "value": float(v),
-                            "path_len": len(path),
-                            "node_hash": node_hash,
-                        },
-                        sim_index=sim_index,
-                        step_index=step_index,
-                    )
+            self._log_backup_path(path, v, sim_index=sim_index, step_index=step_index, reason="commit_blocked")
+            self._backup(path, v, sim_index=sim_index, step_index=step_index, reason="commit_blocked")
                     return v
                 self._dbg(
                     f"[MCTS/simulate] evaluate_commit flows={len(getattr(getattr(state, 'hotspot_context', None), 'selected_flow_ids', []) or [])} {self._state_brief(state)}"
@@ -823,7 +587,6 @@ class MCTS:
             state_before = state
 
             # Count environment/state transition as one action
-            self._inc_action("step", sim_index=sim_index, step_index=step_index)
             next_state, is_commit, is_terminal = self.transition.step(state, action)
             child_key = next_state.canonical_key()
             node.children[best_sig] = child_key
@@ -855,31 +618,6 @@ class MCTS:
                     next_z_hash = None
 
             future_commits = commits_used + (1 if is_commit else 0)
-            self._log_debug_event(
-                "step_result",
-                {
-                    "node_hash": node_hash,
-                    "stage": state.stage,
-                    "action_sig": self._sig_to_json(best_sig),
-                    "action_label": self._sig_to_label(best_sig),
-                    "is_commit": bool(is_commit),
-                    "is_terminal": bool(is_terminal),
-                    "r_base": float(r_base),
-                    "phi_s": float(phi_s),
-                    "phi_sp": float(phi_sp),
-                    "delta_phi": float(delta_phi),
-                    "reward": float(r_shaped),
-                    "total_return": float(total_return),
-                    "child_hash": self._short_hash(child_key),
-                    "commits_used_after": future_commits,
-                    "selected_flows_before": list(selected_flows),
-                    "selected_flows_after": list(next_selected),
-                    "next_z_hash": next_z_hash,
-                },
-                sim_index=sim_index,
-                step_index=step_index,
-            )
-
             path.append((key, best_sig))
             state = next_state
             if is_commit:
@@ -892,7 +630,6 @@ class MCTS:
 
             prev_visit_depth = visited_keys.get(child_key)
             if prev_visit_depth is not None:
-                loop_hash = self._short_hash(child_key)
                 self._dbg(
                     "[MCTS/simulate] cycle_detected node=%s depth=%s path_len=%s return=%.3f"
                     % (child_key[:24], int(prev_visit_depth), len(path), float(total_return))
@@ -911,42 +648,18 @@ class MCTS:
                     step_index=step_index,
                     reason="cycle",
                 )
-                self._log_debug_event(
-                    "simulate_return",
-                    {
-                        "reason": "cycle",
-                        "value": float(total_return),
-                        "path_len": len(path),
-                        "node_hash": loop_hash,
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
                 return total_return
 
             visited_keys[child_key] = len(path)
 
             if is_terminal or commits_used >= commit_depth:
                 leaf_key = state.canonical_key()
-                leaf_hash = self._short_hash(leaf_key)
                 leaf_v = -self._phi(state)
                 total_return += leaf_v
                 self._dbg(
                     f"[MCTS/simulate] terminal_or_budget commits_used={commits_used}/{commit_depth} leaf_bootstrap={float(leaf_v):.3f} return={float(total_return):.3f} path_len={len(path)}"
                 )
                 reason = "terminal"
-                self._log_debug_event(
-                    "terminal_leaf",
-                    {
-                        "node_hash": leaf_hash,
-                        "reason": reason,
-                        "leaf_value": float(leaf_v),
-                        "total_return": float(total_return),
-                        "commits_used": commits_used,
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
                 self._log_backup_path(
                     path,
                     total_return,
@@ -960,17 +673,6 @@ class MCTS:
                     sim_index=sim_index,
                     step_index=step_index,
                     reason="terminal_or_budget",
-                )
-                self._log_debug_event(
-                    "simulate_return",
-                    {
-                        "reason": "terminal_or_budget",
-                        "value": float(total_return),
-                        "path_len": len(path),
-                        "node_hash": leaf_hash,
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
                 )
                 return total_return
 
@@ -1040,22 +742,6 @@ class MCTS:
             ctx_confirm = state.hotspot_context
             if not self._commit_is_banned(state):
                 actions.append(CommitRegulation())
-            else:
-                if ctx_confirm is not None:
-                    try:
-                        self._log_debug_event(
-                            "commit_action_pruned",
-                            {
-                                "control_volume_id": str(ctx_confirm.control_volume_id),
-                                "window_bins": [
-                                    int(ctx_confirm.window_bins[0]),
-                                    int(ctx_confirm.window_bins[1]),
-                                ],
-                                "selected_flows": list(ctx_confirm.selected_flow_ids),
-                            },
-                        )
-                    except Exception:
-                        pass
             actions.append(Back())
             actions.append(Stop())
             return actions
@@ -1230,16 +916,6 @@ class MCTS:
                 "banned_regulation": True,
                 "reason": "duplicate_in_plan",
             }
-            self._log_debug_event(
-                "commit_eval_duplicate_in_plan",
-                {
-                    "flows": len(ctx.selected_flow_ids),
-                    "control_volume_id": str(ctx.control_volume_id),
-                    "window_bins": [window_norm[0], window_norm[1]],
-                },
-                sim_index=sim_index,
-                step_index=step_index,
-            )
             commit_action = CommitRegulation(
                 committed_rates={},
                 diagnostics={"rate_finder": info, "banned_regulation": True},
@@ -1254,16 +930,6 @@ class MCTS:
                 "banned_regulation": True,
                 "reason": "banned_regulation",
             }
-            self._log_debug_event(
-                "commit_eval_banned",
-                {
-                    "flows": len(ctx.selected_flow_ids),
-                    "control_volume_id": str(ctx.control_volume_id),
-                    "window_bins": [int(ctx.window_bins[0]), int(ctx.window_bins[1])],
-                },
-                sim_index=sim_index,
-                step_index=step_index,
-            )
             commit_action = CommitRegulation(
                 committed_rates={},
                 diagnostics={"rate_finder": info, "banned_regulation": True},
@@ -1467,17 +1133,7 @@ class MCTS:
                     "sig": self._sig_to_json(sig),
                 }
             )
-        self._log_debug_event(
-            "backup_path",
-            {
-                "value": float(value),
-                "reason": reason,
-                "path_len": len(path),
-                "path": entries,
-            },
-            sim_index=sim_index,
-            step_index=step_index,
-        )
+        return
 
     # ------------------------------- Backup --------------------------------
     def _backup(
@@ -1490,9 +1146,7 @@ class MCTS:
         reason: str = "",
     ) -> None:
         # Count a single backpropagation pass as one action regardless of path length
-        self._inc_action("backup", sim_index=sim_index, step_index=step_index)
         v = float(value)
-        updates: List[Dict[str, Any]] = []
         for depth, (node_key, sig) in enumerate(path):
             node = self.nodes.get(node_key)
             if node is None:
@@ -1507,30 +1161,6 @@ class MCTS:
             est.N += 1
             est.W += v
             est.Q = est.W / max(1, est.N)
-            updates.append(
-                {
-                    "depth": depth,
-                    "node_hash": self._short_hash(node_key),
-                    "action": self._sig_to_label(sig),
-                    "action_sig": self._sig_to_json(sig),
-                    "sig": self._sig_to_json(sig),
-                    "node_N": int(node.N),
-                    "node_Q": float(node.Q),
-                    "edge_N": int(est.N),
-                    "edge_Q": float(est.Q),
-                }
-            )
-        if updates:
-            self._log_debug_event(
-                "backup_update",
-                {
-                    "value": v,
-                    "reason": reason,
-                    "updates": updates,
-                },
-                sim_index=sim_index,
-                step_index=step_index,
-            )
         if getattr(self.cfg, "debug_prints", False):
             try:
                 root_key = path[0][0] if path else None

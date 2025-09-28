@@ -59,8 +59,6 @@ class MCTSAgent:
         rate_finder_cfg: Optional[RateFinderConfig] = None,
         discovery_cfg: Optional[HotspotDiscoveryConfig] = None,
         logger: Optional[SearchLogger] = None,
-        debug_logger: Optional[SearchLogger] = None,
-        cold_logger: Optional[SearchLogger] = None,
         max_regulations: Optional[int] = None,
         max_inner_loop_commits_and_evals: Optional[int] = None,
         timer: Optional[Callable[[str], ContextManager[Any]]] = None,
@@ -315,13 +313,9 @@ class MCTSAgent:
                             else None
                         ),
                         "max_sims": None,
-                        "max_time_s": float(self.mcts_cfg.max_time_s),
+                        "max_time_s": None,
                         "commit_eval_limit": None,
-                        "max_actions": (
-                            int(self.mcts_cfg.max_actions)
-                            if getattr(self.mcts_cfg, "max_actions", None) not in (None, 0)
-                            else None
-                        ),
+                        "max_actions": None,
                         "outer_max_runs": (
                             int(self.outer_max_runs)
                             if self.outer_max_runs is not None
@@ -470,13 +464,9 @@ class MCTSAgent:
                                 else None
                             ),
                             "max_sims": None,
-                            "max_time_s": float(self.mcts_cfg.max_time_s),
-                            "commit_eval_limit": None,
-                            "max_actions": (
-                                int(self.mcts_cfg.max_actions)
-                                if getattr(self.mcts_cfg, "max_actions", None) not in (None, 0)
-                                else None
-                            ),
+                        "max_time_s": None,
+                        "commit_eval_limit": None,
+                        "max_actions": None,
                         },
                     )
                 except Exception:

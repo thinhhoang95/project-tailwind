@@ -310,10 +310,6 @@ class RateFinder:
         # Adaptive pass control
         passes_to_use = 1 if bool(self.config.use_adaptive_grid) else int(self.config.passes)
 
-        # Evaluation call budgeting
-        rate_grid_len = len(rate_grid)
-        flow_count = len(context_flow_ids)
-
         if mode == "per_flow":
             best_rates: Dict[str, float] = {fid: math.inf for fid in context_flow_ids}
             history_out: Dict[str, Dict[str, float]] = {fid: {} for fid in context_flow_ids}
@@ -359,7 +355,6 @@ class RateFinder:
                                     baseline_obj=baseline_obj,
                                 )
                             eval_calls += 1
-                            pass
                         self._notify_candidate_scored(
                             signature=signature,
                             objective=result.objective,
@@ -454,7 +449,6 @@ class RateFinder:
                                 baseline_obj=baseline_obj,
                             )
                         eval_calls += 1
-                        pass
                     self._notify_candidate_scored(
                         signature=signature,
                         objective=result.objective,
