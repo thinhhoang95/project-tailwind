@@ -41,16 +41,6 @@ class MCTSConfig:
     widen_batch_size: int = 2
     # Budgets
     commit_depth: int = 1 # controlled externally
-    max_sims: int = 36 # controlled externally
-    max_time_s: float = 10.0
-    commit_eval_limit: int = 3 # controlled externally
-    # Global action budget across the search run. When set, the search stops
-    # once this many low-level actions (selection, expansion, step, backup) are performed.
-    # None or 0 disables this budget.
-    max_actions: Optional[int] = None # controlled externally
-    # Number of root-parallel workers for ensemble MCTS. When greater than 1,
-    # the agent may launch multiple independent searches and merge the results.
-    root_parallel_workers: int = 1
     # Priors
     priors_temperature: float = 8.0 # higher = more uniform over the actions such as RemoveFlow, AddFlow, etc.
     root_dirichlet_epsilon: float = 0.25
@@ -59,7 +49,6 @@ class MCTSConfig:
     hotspot_dirichlet_alpha: float = 0.4
     flow_dirichlet_epsilon: float = 0.3
     flow_dirichlet_alpha: float = 0.4
-    min_unique_commit_evals: int = 0
     # Shaping
     phi_scale: float = 1.0
     # RNG
@@ -121,32 +110,23 @@ class MCTS:
         self.rng = rng or np.random.default_rng(int(self.cfg.seed))
         self.nodes: Dict[str, TreeNode] = {}
         self._commit_eval_cache: Dict[Tuple, Tuple[Dict[str, float] | int, float, Dict[str, Any]]] = {}
-        self._commit_calls = 0
         self._best_commit: Optional[Tuple[CommitRegulation, float]] = None  # (action, deltaJ)
         self._timer_factory = timer
         self._action_counts: Dict[str, int] = {}
         self._action_counts_by_stage: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._progress_cb = progress_cb
-        self._last_delta_j: Optional[float] = None
         self._debug_logger = debug_logger
         self._current_sim: Optional[int] = None
         self._cold_logger = cold_logger
         self._max_commits_path: int = 0
         self._last_run_stats: Dict[str, Any] = {}
         self._run_index: Optional[int] = None
-        # Global action budget tracking
-        self._actions_done: int = 0
-        self._action_budget: Optional[int] = (None if getattr(self.cfg, "max_actions", None) in (None, 0)
-                                              else int(self.cfg.max_actions))
         self._root_noise_applied_run: bool = False
         self._flow_noise_nodes_run: Set[str] = set()
         self._hotspot_noise_nodes_run: Set[str] = set()
         self._commit_executor = commit_executor
         self._commit_lock = threading.Lock()
         self._pending_commit_jobs: Dict[Tuple, Future] = {}
-
-    class _ActionBudgetExhausted(Exception):
-        pass
 
     def _pending_commit_count(self) -> int:
         with self._commit_lock:
@@ -191,18 +171,7 @@ class MCTS:
                 return
             self._pending_commit_jobs.pop(key, None)
             self._commit_eval_cache[key] = (rates, float(delta_j), info)
-            self._commit_calls += 1
             self._last_delta_j = float(delta_j)
-        self._log_debug_event(
-            "commit_eval_async_complete",
-            {
-                "cache_size": len(self._commit_eval_cache),
-                "delta_j": float(delta_j),
-                "reason": reason,
-            },
-            sim_index=sim_index,
-            step_index=step_index,
-        )
 
     def _commit_future_callback(
         self,
@@ -237,20 +206,7 @@ class MCTS:
         sim_index: Optional[int] = None,
         step_index: Optional[int] = None,
     ) -> None:
-        logger = self._debug_logger
-        if logger is None:
-            return
-        row = dict(payload or {})
-        if sim_index is None:
-            sim_index = self._current_sim
-        if sim_index is not None:
-            row.setdefault("sim", int(sim_index))
-        if step_index is not None:
-            row.setdefault("step", int(step_index))
-        try:
-            logger.event(kind, row)
-        except Exception:
-            pass
+        return
 
     def _log_cold_event(
         self,
@@ -260,22 +216,7 @@ class MCTS:
         sim_index: Optional[int] = None,
         step_index: Optional[int] = None,
     ) -> None:
-        logger = self._cold_logger
-        if logger is None:
-            return
-        row = dict(payload or {})
-        if self._run_index is not None:
-            row.setdefault("run_index", int(self._run_index))
-        if sim_index is None:
-            sim_index = self._current_sim
-        if sim_index is not None:
-            row.setdefault("sim", int(sim_index))
-        if step_index is not None:
-            row.setdefault("step", int(step_index))
-        try:
-            logger.event(kind, row)
-        except Exception:
-            pass
+        return
 
     @staticmethod
     def _short_hash(value: Optional[bytes | str], length: int = 12) -> Optional[str]:
@@ -401,271 +342,26 @@ class MCTS:
         entry["min_reward"] = min(entry["min_reward"], float(reward)) if math.isfinite(entry["min_reward"]) else float(reward)
         entry["max_reward"] = max(entry["max_reward"], float(reward)) if math.isfinite(entry["max_reward"]) else float(reward)
 
-    def _inc_action(self, kind: str, *, sim_index: Optional[int] = None, step_index: Optional[int] = None) -> None:
-        # Increment global low-level action counter and enforce budget if configured
-        self._actions_done += 1
-        if self._action_budget is not None and self._actions_done >= self._action_budget:
-            self._log_debug_event(
-                "action_budget_exhausted",
-                {"kind": kind, "actions_done": int(self._actions_done), "max_actions": int(self._action_budget)},
-                sim_index=sim_index,
-                step_index=step_index,
-            )
-            raise MCTS._ActionBudgetExhausted()
-
     # ------------------------------- Public API ---------------------------
-    def run(self, root: PlanState, *, max_sims: Optional[int] = None, commit_depth: Optional[int] = None, run_index: Optional[int] = None) -> CommitRegulation:
-        sims = int(max_sims if max_sims is not None else self.cfg.max_sims)
+    def run(self, root: PlanState, *, commit_depth: Optional[int] = None, run_index: Optional[int] = None) -> CommitRegulation:
         depth_limit = int(commit_depth if commit_depth is not None else self.cfg.commit_depth)
-        self._commit_calls = 0
         self._best_commit = None
         self._action_counts.clear()
         self._action_counts_by_stage.clear()
-        self._last_delta_j = None
         self._max_commits_path = 0
         self._last_run_stats = {}
         self._run_index = run_index
         self._root_noise_applied_run = False
         self._flow_noise_nodes_run = set()
         self._hotspot_noise_nodes_run = set()
-        # Reset global action counter and budget view for this run
-        self._actions_done = 0
-        self._action_budget = (None if getattr(self.cfg, "max_actions", None) in (None, 0)
-                               else int(self.cfg.max_actions))
-
-        t_start = time.perf_counter()
-        t_end = t_start + float(self.cfg.max_time_s)
 
         root_hash = self._short_hash(root.canonical_key())
-        self._log_debug_event(
-            "search_run_start",
-            {
-                "root_hash": root_hash,
-                "max_sims": sims,
-                "commit_depth": depth_limit,
-                "time_budget_s": float(self.cfg.max_time_s),
-            },
-        )
+        self._dbg(f"[MCTS] run start: depth={depth_limit} {self._state_brief(root)}")
 
-        self._dbg(f"[MCTS] run start: sims={sims} depth={depth_limit} {self._state_brief(root)}")
-        self._log_cold_event(
-            "cold_run_start",
-            {
-                "root_hash": root_hash,
-                "max_sims": sims,
-                "commit_depth": depth_limit,
-                "time_budget_s": float(self.cfg.max_time_s),
-            },
-        )
-
-        simulations_run = 0
-        stop_reason = "max_sims_exhausted"
-        stop_info: Dict[str, Any] = {}
-        for i in range(sims):
-            now = time.perf_counter()
-            if now > t_end:
-                self._log_debug_event(
-                    "sim_time_budget_exhausted",
-                    {
-                        "index": i + 1,
-                        "elapsed_s": now - t_start,
-                        "time_budget_s": float(self.cfg.max_time_s),
-                    },
-                )
-                stop_reason = "time_budget_exhausted"
-                stop_info = {"index": i + 1, "elapsed_s": now - t_start, "time_budget_s": float(self.cfg.max_time_s)}
-                break
-            self._current_sim = i + 1
-            self._log_debug_event(
-                "sim_start",
-                {
-                    "index": i + 1,
-                    "max_sims": sims,
-                    "nodes": len(self.nodes),
-                    "root_hash": root_hash,
-                },
-                sim_index=i + 1,
-            )
-            self._dbg(f"[MCTS] simulate[{i+1}/{sims}] start nodes={len(self.nodes)} {self._state_brief(root)}")
-            # If action budget is already exhausted, stop before starting the next simulation
-            if self._action_budget is not None and self._actions_done >= self._action_budget:
-                self._log_debug_event(
-                    "sim_action_budget_exhausted_pre",
-                    {"index": i + 1, "actions_done": int(self._actions_done), "max_actions": int(self._action_budget)},
-                )
-                stop_reason = "action_budget_exhausted_pre"
-                stop_info = {"index": i + 1, "actions_done": int(self._actions_done), "max_actions": int(self._action_budget)}
-                break
-            try:
-                last_ret = self._simulate(root, depth_limit, sim_index=i + 1)
-            except MCTS._ActionBudgetExhausted:
-                elapsed = time.perf_counter() - t_start
-                self._log_debug_event(
-                    "sim_action_budget_exhausted",
-                    {
-                        "index": i + 1,
-                        "elapsed_s": elapsed,
-                        "actions_done": int(self._actions_done),
-                        "max_actions": int(self._action_budget) if self._action_budget is not None else None,
-                    },
-                    sim_index=i + 1,
-                )
-                stop_reason = "action_budget_exhausted_mid"
-                stop_info = {
-                    "index": i + 1,
-                    "elapsed_s": elapsed,
-                    "actions_done": int(self._actions_done),
-                    "max_actions": int(self._action_budget) if self._action_budget is not None else None,
-                }
-                # Best effort progress callback before exiting
-                if self._progress_cb is not None:
-                    try:
-                        root_key = root.canonical_key()
-                        root_node = self.nodes.get(root_key)
-                        root_children = 0
-                        root_top: List[Tuple] = []
-                        if root_node is not None:
-                            root_children = len(root_node.children)
-                            tmp: List[Tuple] = []
-                            for sig, est in root_node.edges.items():
-                                p = float(root_node.P.get(sig, 0.0))
-                                tmp.append((sig, int(est.N), float(est.Q), p))
-                            tmp.sort(key=lambda x: (-x[1], -x[2]))
-                            root_top = tmp
-                        payload = {
-                            "sims_done": i,
-                            "sims_total": sims,
-                            "elapsed_s": now - t_start,
-                            "eta_s": max(0.0, t_end - now),
-                            "nodes": len(self.nodes),
-                            "root_visits": (root_node.N if root_node is not None else 0),
-                            "root_children": root_children,
-                            "root_top": root_top,
-                            "root_plan_state": self._state_brief(root),
-                            "all_action_stats": self.get_action_stats(),
-                            "commit_evals": self._commit_calls,
-                            "best_delta_j": (self._best_commit[1] if self._best_commit is not None else None),
-                            "last_delta_j": self._last_delta_j,
-                            "last_return": None,
-                            "action_counts": dict(self._action_counts),
-                            "actions_done": int(self._actions_done),
-                            "max_actions": int(self._action_budget) if self._action_budget is not None else None,
-                        }
-                        self._progress_cb(payload)
-                    except Exception:
-                        pass
-                break
-            elapsed = time.perf_counter() - t_start
-            self._dbg(
-                f"[MCTS] simulate[{i+1}/{sims}] end   return={float(last_ret):.3f} best_dJ={(self._best_commit[1] if self._best_commit is not None else None)} nodes={len(self.nodes)}"
-            )
-            self._log_debug_event(
-                "sim_end",
-                {
-                    "index": i + 1,
-                    "return": float(last_ret),
-                    "best_delta_j": (self._best_commit[1] if self._best_commit is not None else None),
-                    "nodes": len(self.nodes),
-                    "elapsed_s": elapsed,
-                },
-                sim_index=i + 1,
-            )
-            simulations_run += 1
-            self._current_sim = None
-            # Progress callback (best-effort, non-fatal)
-            if self._progress_cb is not None:
-                try:
-                        root_key = root.canonical_key()
-                        root_node = self.nodes.get(root_key)
-                        root_children = 0
-                        root_top: List[Tuple] = []
-                        if root_node is not None:
-                            root_children = len(root_node.children)
-                            tmp: List[Tuple] = []
-                            for sig, est in root_node.edges.items():
-                                p = float(root_node.P.get(sig, 0.0))
-                                tmp.append((sig, int(est.N), float(est.Q), p))
-                            tmp.sort(key=lambda x: (-x[1], -x[2]))
-                            root_top = tmp
-                        payload = {
-                            "sims_done": i + 1,
-                            "sims_total": sims,
-                            "elapsed_s": now - t_start,
-                            "eta_s": max(0.0, t_end - now),
-                            "nodes": len(self.nodes),
-                            "root_visits": (root_node.N if root_node is not None else 0),
-                            "root_children": root_children,
-                            "root_top": root_top,
-                            "root_plan_state": self._state_brief(root),
-                            "all_action_stats": self.get_action_stats(),
-                            "commit_evals": self._commit_calls,
-                            "best_delta_j": (self._best_commit[1] if self._best_commit is not None else None),
-                            "last_delta_j": self._last_delta_j,
-                            "last_return": float(last_ret),
-                            "action_counts": dict(self._action_counts),
-                            "actions_done": int(self._actions_done),
-                            "max_actions": int(self._action_budget) if self._action_budget is not None else None,
-                        }
-                        self._progress_cb(payload)
-                except Exception:
-                    pass
-
-        # Compute final stop metadata and emit end-of-run record
-        elapsed_total = time.perf_counter() - t_start
-        # If no commit was evaluated at all, mark explicitly (the outer agent will handle the exception)
-        if self._best_commit is None:
-            stop_info = {**stop_info, "underlying": stop_reason} if stop_info else {"underlying": stop_reason}
-            stop_reason = "no_commit_evaluated"
-
-        self._log_debug_event(
-            "search_run_end",
-            {
-                "simulations": simulations_run,
-                "sims_target": sims,
-                "stop_reason": stop_reason,
-                "stop_info": stop_info or None,
-                "elapsed_s": elapsed_total,
-                "best_delta_j": (self._best_commit[1] if self._best_commit is not None else None),
-                "last_delta_j": self._last_delta_j,
-                "nodes": len(self.nodes),
-                "actions_done": int(self._actions_done),
-                "max_actions": int(self._action_budget) if self._action_budget is not None else None,
-                "commit_eval_limit": int(self.cfg.commit_eval_limit),
-                "commit_calls": int(self._commit_calls),
-                "commit_depth": depth_limit,
-                "action_counts": dict(self._action_counts),
-            },
-        )
-
-        # Cold feet end-of-run summary
-        self._log_cold_event(
-            "cold_run_end",
-            {
-                "stop_reason": stop_reason,
-                "stop_info": stop_info or None,
-                "elapsed_s": elapsed_total,
-                "commit_calls": int(self._commit_calls),
-                "actions_done": int(self._actions_done),
-                "max_actions": int(self._action_budget) if self._action_budget is not None else None,
-                "max_commits_path": int(getattr(self, "_max_commits_path", 0)),
-            },
-        )
-
-        # Store last-run stats for outer consumer
-        self._last_run_stats = {
-            "run_index": int(self._run_index) if self._run_index is not None else None,
-            "stop_reason": stop_reason,
-            "stop_info": stop_info or None,
-            "elapsed_s": elapsed_total,
-            "commit_calls": int(self._commit_calls),
-            "actions_done": int(self._actions_done),
-            "max_actions": int(self._action_budget) if self._action_budget is not None else None,
-            "max_commits_path": int(getattr(self, "_max_commits_path", 0)),
-            "commit_cache_size": int(len(self._commit_eval_cache)),
-        }
+        self._simulate(root, depth_limit, sim_index=1)
 
         if self._best_commit is None:
-            raise RuntimeError("MCTS did not evaluate any commit; increase sims or adjust state")
+            raise RuntimeError("MCTS did not evaluate any commit")
         return self._best_commit[0]
 
     @property
@@ -732,31 +428,8 @@ class MCTS:
                 node = self._create_node(state)
                 created_nodes.add(key)
                 self._dbg(f"[MCTS/expand] create_leaf node={key[:24]}… phi={float(node.phi):.3f} {self._state_brief(state)}")
-                self._log_debug_event(
-                    "node_created",
-                    {
-                        "node_hash": node_hash,
-                        "stage": state.stage,
-                        "phi": float(node.phi),
-                        "selected_flows": list(selected_flows),
-                        "z_hash": z_hash,
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
                 v = -node.phi
                 self._dbg(f"[MCTS/simulate] leaf_bootstrap return={float(v):.3f} {self._state_brief(state)} path_len={len(path)}")
-                self._log_debug_event(
-                    "leaf_bootstrap",
-                    {
-                        "node_hash": node_hash,
-                        "value": float(v),
-                        "phi": float(node.phi),
-                        "path_len": len(path),
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
                 self._log_backup_path(path, v, sim_index=sim_index, step_index=step_index, reason="leaf_bootstrap")
                 self._backup(path, v, sim_index=sim_index, step_index=step_index, reason="leaf_bootstrap")
                 self._log_debug_event(
@@ -854,19 +527,6 @@ class MCTS:
             m_allow = int(self.cfg.k0 + self.cfg.k1 * (node.N ** self.cfg.alpha))
             m_allow = max(1, m_allow)
             self._dbg(f"[MCTS/expand] node={key[:24]}… allow={m_allow} priors={len(priors)} children_before={len(node.children)} {self._state_brief(state)}")
-            self._log_debug_event(
-                "expand_overview",
-                {
-                    "node_hash": node_hash,
-                    "stage": state.stage,
-                    "priors_count": len(priors),
-                    "children_before": len(node.children),
-                    "m_allow": m_allow,
-                    "node_visits": int(node.N),
-                },
-                sim_index=sim_index,
-                step_index=step_index,
-            )
             while len(node.children) < m_allow and len(node.children) < len(priors):
                 for sig, _ in sorted(priors.items(), key=lambda kv: (-kv[1], kv[0])):
                     if sig in node.children:
@@ -988,40 +648,11 @@ class MCTS:
                 if score > best_score or (score == best_score and (best_sig is None or sig < best_sig)):
                     best_score = score
                     best_sig = sig
-            if selection_records and len(self._commit_eval_cache) < int(self.cfg.min_unique_commit_evals):
-                weights = np.array([max(float(rec.get("P", 0.0)), 0.0) for rec in selection_records], dtype=float)
-                if not np.all(np.isfinite(weights)) or float(weights.sum()) <= 0.0:
-                    weights = np.ones(len(selection_records), dtype=float)
-                total_w = float(weights.sum())
-                if total_w > 0.0:
-                    weights /= total_w
-                idx = int(self.rng.choice(len(selection_records), p=weights))
-                chosen = selection_records[idx]
-                chosen_sig = chosen.get("sig_tuple")
-                if isinstance(chosen_sig, tuple):
-                    best_sig = chosen_sig
-                else:
-                    best_sig = viable[idx][0]
-                best_score = float(chosen.get("score", best_score))
-                self._log_debug_event(
-                    "forced_explore_action",
-                    {
-                        "node_hash": node_hash,
-                        "stage": state.stage,
-                        "selected": self._sig_to_label(best_sig),
-                        "reason": "min_unique_commit_evals",
-                        "min_target": int(self.cfg.min_unique_commit_evals),
-                        "cache_size": len(self._commit_eval_cache),
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
             assert best_sig is not None
             forced_back = False
             if (
                 best_sig is not None
                 and best_sig[0] == "commit"
-                and len(self._commit_eval_cache) < int(self.cfg.min_unique_commit_evals)
             ):
                 ctx_commit = state.hotspot_context
                 if ctx_commit is not None:
@@ -1032,18 +663,6 @@ class MCTS:
                             best_sig = back_sig
                             best_score = float(viable_map[back_sig].Q if hasattr(viable_map[back_sig], "Q") else 0.0)
                             forced_back = True
-                            self._log_debug_event(
-                                "forced_backtrack_for_unique_commit",
-                                {
-                                    "node_hash": node_hash,
-                                    "stage": state.stage,
-                                    "cache_size": len(self._commit_eval_cache),
-                                    "min_target": int(self.cfg.min_unique_commit_evals),
-                                    "signature": list(signature),
-                                },
-                                sim_index=sim_index,
-                                step_index=step_index,
-                            )
             est_sel = node.edges.get(best_sig, EdgeStats())
             created_flag = key in created_nodes
 
@@ -1183,32 +802,11 @@ class MCTS:
                         step_index=step_index,
                     )
                     return v
-                self._log_debug_event(
-                    "commit_eval_start",
-                    {
-                        "node_hash": node_hash,
-                        "selected_flows": len(selected_flows),
-                        "commit_calls": int(self._commit_calls),
-                        "commit_eval_limit": int(self.cfg.commit_eval_limit),
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
                 self._dbg(
                     f"[MCTS/simulate] evaluate_commit flows={len(getattr(getattr(state, 'hotspot_context', None), 'selected_flow_ids', []) or [])} {self._state_brief(state)}"
                 )
                 commit_action, delta_j = self._evaluate_commit(state, sim_index=sim_index, step_index=step_index)
-                self._dbg(f"[MCTS/simulate] evaluate_commit_done ΔJ={float(delta_j):.3f} calls={int(self._commit_calls)}")
-                self._log_debug_event(
-                    "commit_eval_done",
-                    {
-                        "node_hash": node_hash,
-                        "delta_j": float(delta_j),
-                        "commit_calls": int(self._commit_calls),
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
+                self._dbg(f"[MCTS/simulate] evaluate_commit_done ΔJ={float(delta_j):.3f}")
                 action = commit_action
                 r_base = -float(delta_j)
                 diag_payload = commit_action.diagnostics or {}
@@ -1299,18 +897,6 @@ class MCTS:
                     "[MCTS/simulate] cycle_detected node=%s depth=%s path_len=%s return=%.3f"
                     % (child_key[:24], int(prev_visit_depth), len(path), float(total_return))
                 )
-                self._log_debug_event(
-                    "cycle_detected",
-                    {
-                        "node_hash": loop_hash,
-                        "first_visit_depth": int(prev_visit_depth),
-                        "path_len": len(path),
-                        "value": float(total_return),
-                        "commits_used": commits_used,
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
                 self._log_backup_path(
                     path,
                     total_return,
@@ -1348,7 +934,7 @@ class MCTS:
                 self._dbg(
                     f"[MCTS/simulate] terminal_or_budget commits_used={commits_used}/{commit_depth} leaf_bootstrap={float(leaf_v):.3f} return={float(total_return):.3f} path_len={len(path)}"
                 )
-                reason = "terminal" if is_terminal else "commit_budget"
+                reason = "terminal"
                 self._log_debug_event(
                     "terminal_leaf",
                     {
@@ -1357,7 +943,6 @@ class MCTS:
                         "leaf_value": float(leaf_v),
                         "total_return": float(total_return),
                         "commits_used": commits_used,
-                        "commit_depth": commit_depth,
                     },
                     sim_index=sim_index,
                     step_index=step_index,
@@ -1699,42 +1284,12 @@ class MCTS:
             tuple(int(b) for b in ctx.window_bins),
             tuple(sorted(flows.keys())),
         )
-        cached: Optional[Tuple[Dict[str, float] | int, float, Dict[str, Any]]]
-        future: Optional[Future]
-        with self._commit_lock:
-            cached = self._commit_eval_cache.get(base_key)
-            future = self._pending_commit_jobs.get(base_key)
-
-        if cached is None and future is not None and future.done():
-            self._finalize_commit_future(base_key, future, reason="reuse", sim_index=sim_index, step_index=step_index)
-            with self._commit_lock:
-                cached = self._commit_eval_cache.get(base_key)
-                future = self._pending_commit_jobs.get(base_key)
+        cached = self._commit_eval_cache.get(base_key)
+        future = self._pending_commit_jobs.get(base_key)
 
         if cached is not None:
             rates, delta_j, info = cached
-            self._log_debug_event(
-                "commit_eval_cached",
-                {
-                    "flows": len(ctx.selected_flow_ids),
-                    "delta_j": float(delta_j),
-                },
-                sim_index=sim_index,
-                step_index=step_index,
-            )
-            if len(self._commit_eval_cache) < int(self.cfg.min_unique_commit_evals):
-                self._seed_extra_commit_eval(state, ctx, flows, sim_index=sim_index, step_index=step_index)
         elif future is not None:
-            self._log_debug_event(
-                "commit_eval_pending",
-                {
-                    "flows": len(ctx.selected_flow_ids),
-                    "commit_calls": int(self._commit_calls),
-                    "pending": self._pending_commit_count(),
-                },
-                sim_index=sim_index,
-                step_index=step_index,
-            )
             pending_diag = {
                 "control_volume_id": str(ctx.control_volume_id),
                 "window_bins": [window_norm[0], window_norm[1]],
@@ -1747,20 +1302,7 @@ class MCTS:
             )
             return commit_action, 0.0
         else:
-            outstanding = self._commit_calls + self._pending_commit_count()
-            if outstanding >= int(self.cfg.commit_eval_limit):
-                rates, delta_j, info = ({}, 0.0, {"reason": "eval_budget_exhausted"})
-                self._log_debug_event(
-                    "commit_eval_budget_exhausted",
-                    {
-                        "commit_calls": int(self._commit_calls),
-                        "commit_eval_limit": int(self.cfg.commit_eval_limit),
-                        "flows": len(ctx.selected_flow_ids),
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
-            elif self._commit_executor is not None:
+            if self._commit_executor is not None:
                 job_state = state.copy()
                 window_tuple = tuple(int(b) for b in ctx.window_bins)
                 mode_value = "per_flow" if ctx.mode == "per_flow" else "blanket"
@@ -1782,15 +1324,6 @@ class MCTS:
                         step_index=step_index,
                     )
                 )
-                self._log_debug_event(
-                    "commit_eval_async_submitted",
-                    {
-                        "flows": len(ctx.selected_flow_ids),
-                        "pending": self._pending_commit_count(),
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
                 pending_diag = {
                     "control_volume_id": str(ctx.control_volume_id),
                     "window_bins": [window_norm[0], window_norm[1]],
@@ -1811,22 +1344,8 @@ class MCTS:
                         flows=flows,
                         mode="per_flow" if ctx.mode == "per_flow" else "blanket",
                     )
-                self._commit_calls += 1
-                self._last_delta_j = float(delta_j)
                 with self._commit_lock:
                     self._commit_eval_cache[base_key] = (rates, delta_j, info)
-                self._log_debug_event(
-                    "commit_eval_result",
-                    {
-                        "commit_calls": int(self._commit_calls),
-                        "delta_j": float(delta_j),
-                        "flows": len(ctx.selected_flow_ids),
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
-                if len(self._commit_eval_cache) < int(self.cfg.min_unique_commit_evals):
-                    self._seed_extra_commit_eval(state, ctx, flows, sim_index=sim_index, step_index=step_index)
 
         # Sanitize committed rates for serialization and canonicalization
         sanitized: Dict[str, int] | int | None
@@ -1860,116 +1379,7 @@ class MCTS:
         sim_index: Optional[int] = None,
         step_index: Optional[int] = None,
     ) -> None:
-        try:
-            target = int(self.cfg.min_unique_commit_evals)
-        except Exception:
-            target = 0
-        if target <= 0 or len(self._commit_eval_cache) >= target:
-            return
-        if self._commit_calls >= int(self.cfg.commit_eval_limit):
-            return
-        candidate_ids = []
-        try:
-            candidate_ids = [str(fid) for fid in getattr(ctx, "candidate_flow_ids", [])]
-        except Exception:
-            candidate_ids = []
-        if not candidate_ids:
-            return
-        try:
-            flow_to_flights = (getattr(ctx, "metadata", {}) or {}).get("flow_to_flights", {}) or {}
-        except Exception:
-            flow_to_flights = {}
-        base_ids = set(str(fid) for fid in base_flows.keys())
-        attempts = 0
-        while len(self._commit_eval_cache) < target and attempts < len(candidate_ids) + 2:
-            attempts += 1
-            alt_ids = set(base_ids)
-            available = [fid for fid in candidate_ids if fid not in alt_ids]
-            if available:
-                alt_ids.add(str(self.rng.choice(available)))
-            elif len(candidate_ids) >= 2:
-                sample_size = min(len(candidate_ids), max(2, len(base_ids)))
-                alt_ids = set(str(x) for x in self.rng.choice(candidate_ids, size=sample_size, replace=False))
-            else:
-                break
-            new_signature = tuple(sorted(alt_ids))
-            new_key = (
-                state.canonical_key(),
-                str(getattr(ctx, "control_volume_id", "")),
-                tuple(int(b) for b in getattr(ctx, "window_bins", (0, 0))),
-                new_signature,
-            )
-            with self._commit_lock:
-                key_in_cache = new_key in self._commit_eval_cache
-                key_pending = new_key in self._pending_commit_jobs
-            if key_in_cache or key_pending:
-                continue
-            alt_flows: Dict[str, Tuple[str, ...]] = {}
-            for fid in alt_ids:
-                flights = flow_to_flights.get(fid, ())
-                alt_flows[str(fid)] = tuple(str(x) for x in flights)
-            outstanding = self._commit_calls + self._pending_commit_count()
-            if outstanding >= int(self.cfg.commit_eval_limit):
-                break
-            mode_value = "per_flow" if getattr(ctx, "mode", "per_flow") == "per_flow" else "blanket"
-            window_tuple = tuple(int(b) for b in getattr(ctx, "window_bins", (0, 0)))
-            if self._commit_executor is not None:
-                job_state = state.copy()
-                future_job = self._commit_executor.submit(
-                    self._commit_eval_job,
-                    job_state,
-                    str(getattr(ctx, "control_volume_id", "")),
-                    window_tuple,
-                    alt_flows,
-                    mode_value,
-                )
-                with self._commit_lock:
-                    self._pending_commit_jobs[new_key] = future_job
-                future_job.add_done_callback(
-                    self._commit_future_callback(
-                        new_key,
-                        reason="seed",
-                        sim_index=sim_index,
-                        step_index=step_index,
-                    )
-                )
-                self._log_debug_event(
-                    "seed_commit_eval_scheduled",
-                    {
-                        "flows": len(alt_flows),
-                        "pending": self._pending_commit_count(),
-                        "min_target": target,
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
-            else:
-                try:
-                    with self._timed("mcts.rate_finder.find_rates"):
-                        rates, delta_j, info = self.rate_finder.find_rates(
-                            plan_state=state,
-                            control_volume_id=str(getattr(ctx, "control_volume_id", "")),
-                            window_bins=window_tuple,
-                            flows=alt_flows,
-                            mode=mode_value,
-                        )
-                except Exception:
-                    continue
-                self._commit_calls += 1
-                with self._commit_lock:
-                    self._commit_eval_cache[new_key] = (rates, delta_j, info)
-                self._log_debug_event(
-                    "seed_commit_eval",
-                    {
-                        "flows": len(alt_flows),
-                        "cache_size": len(self._commit_eval_cache),
-                        "min_target": target,
-                    },
-                    sim_index=sim_index,
-                    step_index=step_index,
-                )
-                if self._commit_calls >= int(self.cfg.commit_eval_limit):
-                    break
+        return
 
     # --------------------------- Signatures/decoding -----------------------
     def _signature_for_action(self, state: PlanState, action: Action) -> Tuple:

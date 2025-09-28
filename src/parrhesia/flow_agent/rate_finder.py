@@ -84,7 +84,6 @@ class RateFinderConfig:
     )
     passes: int = 2
     epsilon: float = 1e-3
-    max_eval_calls: int = 256
     cache_size: int = 256
     objective_weights: Optional[Dict[str, float]] = None
     use_adaptive_grid: bool = False
@@ -314,7 +313,6 @@ class RateFinder:
         # Evaluation call budgeting
         rate_grid_len = len(rate_grid)
         flow_count = len(context_flow_ids)
-        eval_call_limit = min(int(self.config.max_eval_calls), int(flow_count) * (int(rate_grid_len) + 3))
 
         if mode == "per_flow":
             best_rates: Dict[str, float] = {fid: math.inf for fid in context_flow_ids}
@@ -361,8 +359,7 @@ class RateFinder:
                                     baseline_obj=baseline_obj,
                                 )
                             eval_calls += 1
-                            if eval_calls >= eval_call_limit:
-                                stopped_early = True
+                            pass
                         self._notify_candidate_scored(
                             signature=signature,
                             objective=result.objective,
@@ -457,8 +454,7 @@ class RateFinder:
                                 baseline_obj=baseline_obj,
                             )
                         eval_calls += 1
-                        if eval_calls >= eval_call_limit:
-                            stopped_early = True
+                        pass
                     self._notify_candidate_scored(
                         signature=signature,
                         objective=result.objective,

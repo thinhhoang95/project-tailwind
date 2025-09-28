@@ -713,8 +713,6 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         console.print(f"[yellow]Failed to instrument commit attempts:[/yellow] {_exc}")
 
     # Configure agent budgets small to keep runtime reasonable
-    # Force a single persistent tree (Statement 2) by running a single root worker
-    parallel_workers = 1
     mcts_cfg = MCTSConfig(
         max_sims=8192,
         commit_depth=512,
@@ -722,7 +720,6 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         max_actions=None,
         seed=69420,
         debug_prints=False,
-        root_parallel_workers=int(parallel_workers),
         flow_dirichlet_epsilon = 0.4,
         flow_dirichlet_alpha = 0.5
     )
@@ -730,9 +727,6 @@ def initiate_agent(tmp_path: Path) -> Optional[tuple]:
         action_budget_msg = "∞"
     else:
         action_budget_msg = str(int(mcts_cfg.max_actions))
-    console.print(
-        f"[runner] Ensemble MCTS enabled with {int(parallel_workers)} worker(s); action budget set to {action_budget_msg}"
-    )
     # Force full scorer for consistency investigation (can be toggled via env)
     os.environ.setdefault("RATE_FINDER_FAST_SCORER", "0")
     # Add warning panel about fast scorer being disabled

@@ -123,22 +123,27 @@ with self._timed("agent.final_objective"):
     final_summary = self._compute_final_objective(state)
 ```
 
+## Other observations
 
-# Implications
+- Contrary to conventional MCTS in game-playing, there is no roll-out phase in the current implementation. It is **MCTS with leaf evaluation (no rollout)**.
+
+- Consider recomputing hotspot inventory (and carrying forward “assigned delay” effects) inside a simulation so that deeper lookahead becomes meaningful.
+
+# Implications and Proposed Changes
 
 1. In the whole two step search framework, at any moment, the agent will only attempt to locally optimize the situation to **dissipate the exceedances at the selected hotspot as control volumes for each flows**. There is no global cohesion or coherence between regulations.
 
-> We might need to adjust where the reward will appear and how it needs to backpropagate. The new approach is 
+    > We might need to adjust where the reward will appear and how it needs to backpropagate. Currenty, as detailed in the document `docs/flow_agent/fixes/dot_five_fixes/three_kinds_of_scopes.md`, the current code base relies on different kind of objective functions at different parts of the code. This is wrong, and inconsistent. In the new approach, we will only use **one and only one global objective function** for consistency. Nevertheless, for computational efficiency, we might rely on smaller **delta-views** to update the global objectives, but **regardless of how it is computed, only the global objective should be used**.
+    >
+    > We will also need to rework on the back-propagation strategy: the general idea is that the agent will receive absolutely no reward until the very final step of evaluating the whole plan. Before: it receives a reward signal at every regulation commit, but no reward at the end of the "episode". The MCTS happens within regulations, at the end of the whole plan. In the new approach, we will make MCTS backpropagate at the end of the episode. This is more faithful to MCTS, and more correct.
 
 2. There is no explicit mechanism that “prevents flights that already had their delay assigned from getting another round of delay assignment” between inner commits. The agent stores regulations and only computes a global schedule/objective at the end (and during commit evaluations), but it doesn’t persist “assigned delay flags” back into the candidate discovery or mutate the inventory between commits.
 
     > Between two outer loop iterations, based on the partial plan so far, we will need to recompute the hotspot inventory, redetect the hotspots. The hotspots could change (some might get extinguished, others may light up). The flights got assigned delays, so the flow component fundamentally changes to. It's like a different problem after each regulation is committed. The current code currently handles recomputing the hotspot inventory, as well as preventing the flights that already had their delay assigned from getting another round of delay assignment.
+    >
+    > As a result, the new approach should correctly recompute the hotspots, (and as a result, new flows), it's like solving the new problem after the environment has evolved.
 
-3. 
-
-# Some code house-keeping
-
-The current implementation also contains some residual code from Ensemble MCTS (but now deprecated). We will also need 
+3. The current implementation also does not allow the agent to "return to earlier regulation planning states to continue discovery from there". Once a regulation is committed, it is locked in, and the only point for the MCTS to return to after the end of one episode is the beginning, at another root (which is an empty regulation plan).
 
 # Instructions
 
