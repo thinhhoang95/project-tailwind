@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import geopandas as gpd
 import numpy as np
@@ -17,6 +16,7 @@ if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 # Core data structures
+from project_tailwind.impact_eval.distance_computation import haversine_vectorized
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.optimize.eval.flight_list import FlightList
 from project_tailwind.optimize.eval.network_evaluator import NetworkEvaluator
@@ -26,6 +26,12 @@ from parrhesia.flow_agent.hotspot_discovery import (
     HotspotInventory,
     HotspotDiscoveryConfig,
 )
+
+# Flow regeneration engine
+from parrhesia.api.flows import compute_flows
+from parrhesia.api.resources import set_global_resources
+from parrhesia.flow_agent35.regen.engine import propose_regulations_for_hotspot
+from parrhesia.flow_agent35.regen.exceedance import compute_hotspot_exceedance
 
 
 # Time Profiling helpers ===
@@ -167,13 +173,230 @@ def pick_top_hotspot(inventory: HotspotInventory, *, threshold: float = 0.0) -> 
     return payload
 
 
+def _timebins_from_window(window_bins: Iterable[int]) -> List[int]:
+    wb = list(int(b) for b in window_bins)
+    if not wb:
+        return []
+    if len(wb) == 1:
+        return [wb[0]]
+    start = wb[0]
+    end_exclusive = wb[1]
+    if end_exclusive <= start:
+        end_exclusive = start + 1
+    return list(range(int(start), int(end_exclusive)))
+
+
+def _capacities_per_bin(
+    evaluator: NetworkEvaluator,
+    indexer: TVTWIndexer,
+) -> Dict[str, np.ndarray]:
+    per_hour = getattr(evaluator, "hourly_capacity_by_tv", {}) or {}
+    bins_per_hour = int(indexer.rolling_window_size())
+    T = int(indexer.num_time_bins)
+    capacities: Dict[str, np.ndarray] = {}
+    for tv_id in indexer.tv_id_to_idx.keys():
+        arr = np.zeros(T, dtype=np.float64)
+        hours = per_hour.get(tv_id, {}) or {}
+        for h, cap in hours.items():
+            try:
+                hour = int(h)
+            except Exception:
+                continue
+            start = hour * bins_per_hour
+            if start >= T:
+                continue
+            end = min(start + bins_per_hour, T)
+            arr[start:end] = float(cap)
+        capacities[str(tv_id)] = arr
+    return capacities
+
+
+def _tv_centroids(
+    gdf: gpd.GeoDataFrame,
+    indexer: TVTWIndexer,
+) -> Dict[str, Tuple[float, float]]:
+    try:
+        geo = gdf.to_crs(epsg=4326) if gdf.crs and "4326" not in str(gdf.crs) else gdf
+    except Exception:
+        geo = gdf
+    tv_ids = set(str(tv) for tv in indexer.tv_id_to_idx.keys())
+    centroids: Dict[str, Tuple[float, float]] = {}
+    for _, row in geo.iterrows():
+        tv_id = row.get("traffic_volume_id")
+        if tv_id is None:
+            continue
+        tv_key = str(tv_id)
+        if tv_key not in tv_ids:
+            continue
+        geom = row.get("geometry")
+        if geom is None or geom.is_empty:
+            continue
+        try:
+            c = geom.centroid
+            centroids[tv_key] = (float(c.y), float(c.x))
+        except Exception:
+            continue
+    return centroids
+
+
+def _travel_minutes_from_centroids(
+    centroids: Mapping[str, Tuple[float, float]],
+    *,
+    speed_kts: float = 475.0,
+) -> Dict[str, Dict[str, float]]:
+    if not centroids:
+        return {}
+    ids = sorted(centroids.keys())
+    lat_arr = np.asarray([centroids[i][0] for i in ids], dtype=np.float64)
+    lon_arr = np.asarray([centroids[i][1] for i in ids], dtype=np.float64)
+    dist_nm = haversine_vectorized(lat_arr[:, None], lon_arr[:, None], lat_arr[None, :], lon_arr[None, :])
+    minutes = (dist_nm / float(speed_kts)) * 60.0
+    out: Dict[str, Dict[str, float]] = {}
+    for i, src in enumerate(ids):
+        out[src] = {ids[j]: float(minutes[i, j]) for j in range(len(ids))}
+    return out
+
+
+def _lookup_flow_payload(flows_payload: Mapping[str, Any]) -> Dict[int, Mapping[str, Any]]:
+    lookup: Dict[int, Mapping[str, Any]] = {}
+    for flow in flows_payload.get("flows", []) or []:
+        try:
+            fid = int(flow.get("flow_id"))
+        except Exception:
+            continue
+        lookup[fid] = flow
+    return lookup
+
+
+def _build_flow_summary(
+    proposal,
+    *,
+    hotspot_payload: Mapping[str, Any],
+    flows_payload: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    window_bins = list(hotspot_payload.get("window_bins", []))
+    timebins_h = _timebins_from_window(window_bins)
+    start = timebins_h[0] if timebins_h else 0
+    end_exclusive = timebins_h[-1] + 1 if timebins_h else 0
+    meta = hotspot_payload.get("metadata", {}) or {}
+    flow_to_flights = meta.get("flow_to_flights", {}) or {}
+    proxies = meta.get("flow_proxies", {}) or {}
+    payload_lookup = _lookup_flow_payload(flows_payload)
+    summary: List[Dict[str, Any]] = []
+    for flow in proposal.flows_info:
+        fid = int(flow.get("flow_id"))
+        fid_key = str(fid)
+        payload_entry = payload_lookup.get(fid, {})
+        demand = payload_entry.get("demand") or []
+        entrants = 0.0
+        if demand and end_exclusive > start:
+            entrants = float(sum(float(demand[t]) for t in range(start, min(end_exclusive, len(demand)))))
+        elif proxies.get(fid_key):
+            entrants = float(sum(float(x) for x in proxies[fid_key]))
+        flights = flow_to_flights.get(fid_key) or []
+        summary.append(
+            {
+                "flow_id": fid,
+                "control_tv_id": flow.get("control_tv_id"),
+                "baseline_rate_per_hour": float(flow.get("r0_i", 0.0)),
+                "allowed_rate_per_hour": float(flow.get("R_i", 0.0)),
+                "assigned_cut_per_hour": float(flow.get("lambda_cut_i", 0.0)),
+                "entrants_in_window": entrants,
+                "num_flights": len(flights),
+            }
+        )
+    summary.sort(key=lambda item: item["flow_id"])
+    return summary
+
+
+def _proposal_to_dict(
+    proposal,
+    *,
+    hotspot_payload: Mapping[str, Any],
+    flows_payload: Mapping[str, Any],
+    exceedance_stats: Mapping[str, Any],
+) -> Dict[str, Any]:
+    flows = _build_flow_summary(proposal, hotspot_payload=hotspot_payload, flows_payload=flows_payload)
+    diag = dict(proposal.diagnostics)
+    diag.setdefault("D_peak", float(exceedance_stats.get("D_peak", 0.0)))
+    diag.setdefault("D_sum", float(exceedance_stats.get("D_total", 0.0)))
+    diag.setdefault("window_bins_input", list(hotspot_payload.get("window_bins", [])))
+    result = {
+        "hotspot_id": proposal.hotspot_id,
+        "control_volume_id": proposal.controlled_volume,
+        "window_bins": [int(proposal.window.start_bin), int(proposal.window.end_bin)],
+        "flows": flows,
+        "predicted_improvement": {
+            "delta_deficit_per_hour": float(proposal.predicted_improvement.delta_deficit_per_hour),
+            "delta_objective_score": float(proposal.predicted_improvement.delta_objective_score),
+        },
+        "diagnostics": diag,
+    }
+    return result
+
+
 def propose_one_regulation(
     *,
     hotspot_payload: Dict[str, Any],
     evaluator: NetworkEvaluator,
     indexer: TVTWIndexer,
 ) -> Dict[str, Any]:
-    pass # TODO: implement this
+    control_tv = str(hotspot_payload.get("control_volume_id"))
+    if not control_tv:
+        raise ValueError("hotspot payload missing control volume id")
+    window_bins = hotspot_payload.get("window_bins") or []
+    timebins_h = _timebins_from_window(window_bins)
+    if not timebins_h:
+        raise ValueError("hotspot payload missing time window bins")
+
+    flight_list = getattr(evaluator, "flight_list", None)
+    if flight_list is None:
+        raise ValueError("network evaluator missing flight_list reference")
+
+    # Prepare shared inputs
+    capacities_by_tv = _capacities_per_bin(evaluator, indexer)
+    centroids = _tv_centroids(evaluator.traffic_volumes_gdf, indexer)
+    travel_minutes_map = _travel_minutes_from_centroids(centroids)
+
+    # Flow payload via API (reuse in-memory artifacts)
+    set_global_resources(indexer, flight_list)
+    direction_opts = {"mode": "coord_cosine", "tv_centroids": centroids} if centroids else {"mode": "coord_cosine"}
+    flows_payload = compute_flows(tvs=[control_tv], timebins=timebins_h, direction_opts=direction_opts)
+
+    # Flow-to-flights metadata from hotspot discovery (string keys)
+    meta = hotspot_payload.get("metadata", {}) or {}
+    flow_to_flights_in = meta.get("flow_to_flights", {}) or {}
+    flow_to_flights: Dict[str, Sequence[str]] = {
+        str(k): tuple(v or []) for k, v in flow_to_flights_in.items()
+    }
+
+    proposals = propose_regulations_for_hotspot(
+        indexer=indexer,
+        flight_list=flight_list,
+        capacities_by_tv=capacities_by_tv,
+        travel_minutes_map=travel_minutes_map,
+        hotspot_tv=control_tv,
+        timebins_h=timebins_h,
+        flows_payload=flows_payload,
+        flow_to_flights=flow_to_flights,
+    )
+    if not proposals:
+        raise RuntimeError("regen engine returned no proposals")
+
+    best = proposals[0]
+    exceedance_stats = compute_hotspot_exceedance(
+        indexer=indexer,
+        flight_list=flight_list,
+        capacities_by_tv=capacities_by_tv,
+        hotspot_tv=control_tv,
+        timebins_h=timebins_h,
+    )
+    return _proposal_to_dict(
+        best,
+        hotspot_payload=hotspot_payload,
+        flows_payload=flows_payload,
+        exceedance_stats=exceedance_stats,
+    )
 
 
 def main() -> None:
