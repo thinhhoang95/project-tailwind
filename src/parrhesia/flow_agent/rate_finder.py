@@ -833,6 +833,7 @@ class RateFinder:
             pass
 
         if use_fast:
+            raise NotImplementedError("Fast scorer is currently not supported because it is very buggy. It is out of commission for now.")
             # Build occ_by_tv for the single control TV using base caches + schedule sum
             T = int(self._indexer.num_time_bins)
             sched_sum = np.zeros(T, dtype=np.int64)
@@ -878,6 +879,8 @@ class RateFinder:
             except Exception:
                 pass
         else:
+            # If we don't use a fast scorer, we use the same scorer in `safespill_objective`
+            # which is the same as objective.py used by the API endpoints
             with self._timed("rate_finder.score_with_context.candidate"):
                 objective, components, artifacts = score_with_context(
                     schedule,

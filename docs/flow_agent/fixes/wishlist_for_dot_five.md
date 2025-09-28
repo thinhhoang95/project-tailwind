@@ -1,0 +1,6 @@
+
+- There is no explicit mechanism that “prevents flights that already had their delay assigned from getting another round of delay assignment” between inner commits. The agent stores regulations and only computes a global schedule/objective at the end (and during commit evaluations), but it doesn’t persist “assigned delay flags” back into the candidate discovery or mutate the inventory between commits.
+
+Between two outer loop iterations, based on the partial plan so far, we will need to recompute the hotspot inventory, redetect the hotspots. The hotspots could change (some might get extinguished, others may light up). The flights got assigned delays, so the flow component fundamentally changes to. It's like a different problem after each regulation is committed. The current code currently handles recomputing the hotspot inventory, as well as preventing the flights that already had their delay assigned from getting another round of delay assignment.
+
+The committed regulation cannot be modified or deleted. In the second outer loop, we will create another regulation to append to the plan. The inner loop starts again, another hotspot will be selected, and the MCTS process will start again...
