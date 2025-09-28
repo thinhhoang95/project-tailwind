@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import geopandas as gpd
@@ -32,6 +33,8 @@ from parrhesia.api.flows import compute_flows
 from parrhesia.api.resources import set_global_resources
 from parrhesia.flow_agent35.regen.engine import propose_regulations_for_hotspot
 from parrhesia.flow_agent35.regen.exceedance import compute_hotspot_exceedance
+from parrhesia.flow_agent35.regen.rates import compute_e_target
+from parrhesia.flow_agent35.regen.types import RegenConfig
 
 
 # Time Profiling helpers ===
@@ -309,6 +312,116 @@ def _build_flow_summary(
     return summary
 
 
+def _build_naive_regulation(
+    *,
+    hotspot_payload: Mapping[str, Any],
+    flows_payload: Mapping[str, Any],
+    evaluator: NetworkEvaluator,
+    indexer: TVTWIndexer,
+) -> Optional[Dict[str, Any]]:
+    flows = list(flows_payload.get("flows", []) or [])
+    if not flows:
+        return None
+
+    window_bins = list(hotspot_payload.get("window_bins", []) or [])
+    timebins_h = _timebins_from_window(window_bins)
+    if not timebins_h:
+        return None
+
+    start_bin = min(timebins_h)
+    end_bin = max(timebins_h)
+
+    def _entrants(flow: Mapping[str, Any]) -> float:
+        demand = list(flow.get("demand", []) or [])
+        if not demand:
+            return 0.0
+        upper = min(len(demand), end_bin + 1)
+        lower = max(0, start_bin)
+        if upper <= lower:
+            return 0.0
+        return float(sum(float(demand[i]) for i in range(lower, upper)))
+
+    best_flow = max(flows, key=_entrants, default=None)
+    if not best_flow:
+        return None
+
+    entrants = _entrants(best_flow)
+    if entrants <= 0.0:
+        return None
+
+    demand = list(best_flow.get("demand", []) or [])
+    upper = min(len(demand), end_bin + 1)
+    lower = max(0, start_bin)
+    window_slice = demand[lower:upper] if upper > lower else []
+    if window_slice:
+        baseline = max(float(x) for x in window_slice)
+        avg_window = float(sum(float(x) for x in window_slice)) / float(len(window_slice))
+        baseline = max(baseline, avg_window)
+    else:
+        baseline = entrants
+    cut = max(1, int(round(baseline * 0.3)))
+    allowed = max(0, int(round(baseline)) - cut)
+
+    flow_info = {
+        "flow_id": int(best_flow.get("flow_id", 0)),
+        "control_tv_id": best_flow.get("controlled_volume")
+        or str(hotspot_payload.get("control_volume_id")),
+        "lambda_cut_i": int(cut),
+        "r0_i": float(baseline),
+        "R_i": int(allowed),
+    }
+
+    capacities_by_tv = _capacities_per_bin(evaluator, indexer)
+    flight_list = getattr(evaluator, "flight_list", None)
+    exceedance_stats: Mapping[str, Any]
+    e_target = 0.0
+    if flight_list is not None:
+        exceedance_stats = compute_hotspot_exceedance(
+            indexer=indexer,
+            flight_list=flight_list,
+            capacities_by_tv=capacities_by_tv,
+            hotspot_tv=str(hotspot_payload.get("control_volume_id")),
+            timebins_h=timebins_h,
+        )
+        e_target = float(
+            compute_e_target(
+                exceedance_stats.get("D_vec", ()),
+                mode="q95",
+                fallback_to_peak=True,
+            )
+        )
+    else:
+        exceedance_stats = {}
+
+    if e_target <= 0.0:
+        e_target = float(entrants)
+
+    proposal = SimpleNamespace(
+        hotspot_id=str(hotspot_payload.get("control_volume_id")),
+        controlled_volume=str(flow_info["control_tv_id"]),
+        window=SimpleNamespace(start_bin=int(start_bin), end_bin=int(end_bin)),
+        flows_info=[flow_info],
+        predicted_improvement=SimpleNamespace(
+            delta_deficit_per_hour=float(-cut),
+            delta_objective_score=float(cut),
+        ),
+        diagnostics={
+            "heuristic_regulation": True,
+            "entrants_window": float(entrants),
+            "baseline_rate_window": float(baseline),
+            "cut_assigned": int(cut),
+            "E_target": float(e_target),
+        },
+    )
+
+    return _proposal_to_dict(
+        proposal,
+        hotspot_payload=hotspot_payload,
+        flows_payload=flows_payload,
+        exceedance_stats=exceedance_stats,
+    )
+
+
 def _proposal_to_dict(
     proposal,
     *,
@@ -370,17 +483,47 @@ def propose_one_regulation(
         str(k): tuple(v or []) for k, v in flow_to_flights_in.items()
     }
 
-    proposals = propose_regulations_for_hotspot(
-        indexer=indexer,
-        flight_list=flight_list,
-        capacities_by_tv=capacities_by_tv,
-        travel_minutes_map=travel_minutes_map,
-        hotspot_tv=control_tv,
-        timebins_h=timebins_h,
-        flows_payload=flows_payload,
-        flow_to_flights=flow_to_flights,
-    )
+    try:
+        proposals = propose_regulations_for_hotspot(
+            indexer=indexer,
+            flight_list=flight_list,
+            capacities_by_tv=capacities_by_tv,
+            travel_minutes_map=travel_minutes_map,
+            hotspot_tv=control_tv,
+            timebins_h=timebins_h,
+            flows_payload=flows_payload,
+            flow_to_flights=flow_to_flights,
+        )
+    except ValueError as exc:
+        print(f"[regen] Primary proposal attempt failed: {exc}. Retrying with relaxed config...")
+        fallback_cfg = RegenConfig(
+            g_min=-1.0,
+            rho_max=10.0,
+            slack_min=-1.0,
+            distinct_controls_required=False,
+            raise_on_edge_cases=False,
+        )
+        proposals = propose_regulations_for_hotspot(
+            indexer=indexer,
+            flight_list=flight_list,
+            capacities_by_tv=capacities_by_tv,
+            travel_minutes_map=travel_minutes_map,
+            hotspot_tv=control_tv,
+            timebins_h=timebins_h,
+            flows_payload=flows_payload,
+            flow_to_flights=flow_to_flights,
+            config=fallback_cfg,
+        )
     if not proposals:
+        print("[regen] Fallback config returned no proposals; constructing heuristic regulation.")
+        heuristic = _build_naive_regulation(
+            hotspot_payload=hotspot_payload,
+            flows_payload=flows_payload,
+            evaluator=evaluator,
+            indexer=indexer,
+        )
+        if heuristic is not None:
+            return heuristic
         raise RuntimeError("regen engine returned no proposals")
 
     best = proposals[0]

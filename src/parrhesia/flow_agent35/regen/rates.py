@@ -9,9 +9,11 @@ from .types import Bundle, RateCut
 
 
 def compute_e_target(D_vec: Sequence[float], *, mode: str = "q95", fallback_to_peak: bool = True) -> float:
-    if not D_vec:
+    if D_vec is None:
         return 0.0
     arr = np.asarray(D_vec, dtype=np.float64)
+    if arr.size == 0:
+        return 0.0
     if mode == "q95":
         e_target = float(np.quantile(arr, 0.95))
     elif mode == "peak":

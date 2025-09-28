@@ -398,8 +398,20 @@ class MCTS:
                 self._dbg(f"[MCTS/expand] create_leaf node={key[:24]}… phi={float(node.phi):.3f} {self._state_brief(state)}")
                 v = -node.phi
                 self._dbg(f"[MCTS/simulate] leaf_bootstrap return={float(v):.3f} {self._state_brief(state)} path_len={len(path)}")
-        self._log_backup_path(path, v, sim_index=sim_index, step_index=step_index, reason="leaf_bootstrap")
-        self._backup(path, v, sim_index=sim_index, step_index=step_index, reason="leaf_bootstrap")
+                self._log_backup_path(
+                    path,
+                    v,
+                    sim_index=sim_index,
+                    step_index=step_index,
+                    reason="leaf_bootstrap",
+                )
+                self._backup(
+                    path,
+                    v,
+                    sim_index=sim_index,
+                    step_index=step_index,
+                    reason="leaf_bootstrap",
+                )
                 return v
 
             candidates = self._enumerate_actions(state)
@@ -563,8 +575,20 @@ class MCTS:
                     self._dbg(
                         f"[MCTS/simulate] commit_blocked budget commits_used={commits_used}/{commit_depth} -> bootstrap={float(v):.3f}"
                     )
-            self._log_backup_path(path, v, sim_index=sim_index, step_index=step_index, reason="commit_blocked")
-            self._backup(path, v, sim_index=sim_index, step_index=step_index, reason="commit_blocked")
+                    self._log_backup_path(
+                        path,
+                        v,
+                        sim_index=sim_index,
+                        step_index=step_index,
+                        reason="commit_blocked",
+                    )
+                    self._backup(
+                        path,
+                        v,
+                        sim_index=sim_index,
+                        step_index=step_index,
+                        reason="commit_blocked",
+                    )
                     return v
                 self._dbg(
                     f"[MCTS/simulate] evaluate_commit flows={len(getattr(getattr(state, 'hotspot_context', None), 'selected_flow_ids', []) or [])} {self._state_brief(state)}"
