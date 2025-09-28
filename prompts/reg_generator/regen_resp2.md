@@ -108,7 +108,7 @@ def rolling_window_size(self) -> int:
   - `convert_occupancy_to_entrance=True|False`, `dwell_minutes: Optional[float]`, `alpha_occupancy_to_entrance: float=1.0` (when no dwell)
   - `local_search_steps=(±1, ±2)`, `max_variants_per_bundle=8`
   - `diversity_alpha=0.2`, `k_proposals=5`
-  - `max_bundle_size=3`
+  - `max_bundle_size=5`
   - `distinct_controls_required=True`
   - `autotrim_from_ctrl_to_hotspot=False`
   - `raise_on_edge_cases=True`
@@ -154,7 +154,7 @@ def rolling_window_size(self) -> int:
     - `S_i = w1*gH + w2*gH_v_tilde + w3*v_tilde + w4*Slack_G15 + w5*Slack_G30 − w6*ρ + w7*coverage_i`, clamp to `max(0, S_i)`.
 
 - `bundles.py`
-  - `build_candidate_bundles(scored: List[FlowScore], max_bundle_size=3, distinct_controls_required=True) -> List[Bundle]`
+  - `build_candidate_bundles(scored: List[FlowScore], max_bundle_size=5, distinct_controls_required=True) -> List[Bundle]`
     - Top-1, top-2, top-3 by `score`, skipping combinations with duplicate `control_tv_id` if required.
   - Optional: Use deterministic dedup key: frozenset of `flow_id`s.
 
@@ -227,7 +227,7 @@ def rolling_window_size(self) -> int:
 - If feature extractor must recompute τ signs, propagate warnings; do not silently ignore.
 
 ### Configuration defaults (exactly as spec)
-- g_min=0.1, rho_max=0.7, slack_min=2 flights
+- g_min=0.1, rho_max=0.7, slack_min=0 flights (disable slack_min for now)
 - Window margin=0.25 hour each side, min window=1 hour
 - E_target=D_q95; fallback D_peak if D_q95=0
 - Local search: ±1 and ±2 flights/h per selected flow; ≤8 variants
@@ -282,3 +282,6 @@ proposals = propose_regulations_for_hotspot(
   - Caller supplies `capacities_by_tv` consistent with `flight_list` and `indexer`.
   - Caller supplies `flows_payload` or `flow_to_flights`; otherwise, regen cannot proceed and will raise.
   - Day-bound windows only; multi-day windows would require additional handling and are out of scope unless requested.
+
+# Acceptance Criteria
+- The implementation is successful if after integration in `examples/regen/regen_test_bench.py`, we could see one regulation output. 
