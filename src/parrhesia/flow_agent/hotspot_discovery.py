@@ -1,3 +1,32 @@
+""" HOTSPOT DISCOVERY AND FLOW EXTRACTION INVENTORY
+### Overall Purpose
+
+The primary goal of this file is to identify and characterize "hotspots" in air traffic. A hotspot is defined as a specific air traffic control volume that is congested during a particular time window. The code analyzes flight data to find these congested segments, groups the flights causing the congestion into logical "flows," and packages this information for use by other parts of the system, likely for planning traffic management solutions.
+
+### Main Classes
+
+1.  **`HotspotInventory`**: This is the main class that orchestrates the discovery process.
+    *   **`__init__(self, evaluator, flight_list, indexer)`**: It's initialized with a `NetworkEvaluator` (to find over-capacity sectors), a `FlightList` (containing all flight data), and a `TVTWIndexer` (for time/space indexing).
+    *   **`build_from_segments(...)`**: This is the key public method. It takes configuration parameters like thresholds and limits. It gets congested segments from the evaluator, ranks them by severity, and then for each one, it builds a `HotspotDescriptor` object that contains detailed information about the flows of flights contributing to the congestion.
+    *   **`_build_descriptor(...)`**: An internal method that does the heavy lifting. For a given hotspot (a control volume and time window), it finds all the flights involved, clusters them into flows using `build_global_flows` (184:191), filters and selects the most significant flows, and computes statistics about them.
+    *   **`to_candidate_payloads(...)`**: A static method to convert the discovered `HotspotDescriptor` objects into a list of dictionaries, which is a serializable format suitable for APIs or saving to files.
+
+2.  **`HotspotDescriptor`**: A dataclass that serves as a structured container for all information about a single hotspot. It holds:
+    *   The ID of the control volume.
+    *   The start and end time bins of the congestion window.
+    *   A tuple of `candidate_flow_ids` which are the groups of flights involved.
+    *   A `hotspot_prior` which is a severity score, based on the number of flights in the window.
+    *   `metadata` which contains the detailed breakdown of which flights belong to which flow (`flow_to_flights`) and other metrics.
+
+3.  **`HotspotDiscoveryConfig`**: A simple dataclass holding configuration parameters that control the hotspot discovery process, such as:
+    *   `threshold`: The minimum severity for a segment to be considered a hotspot.
+    *   `top_hotspots`: The maximum number of hotspots to identify.
+    *   `top_flows`: The maximum number of flows to identify within each hotspot.
+    *   `max_flights_per_flow`: The maximum number of flights to include in any single flow.
+
+In summary, the `HotspotInventory` class uses flight and network data to discover congested areas, and for each one, it creates a detailed `HotspotDescriptor` that breaks down the congestion into manageable flight groups, ready for further analysis or optimization.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
