@@ -10,6 +10,7 @@ from typing import Dict, Any, Optional
 from .airspace.airspace_api_wrapper import AirspaceAPIWrapper
 from .deepflow.flows_api_wrapper import FlowsWrapper
 from .CountAPIWrapper import CountAPIWrapper
+from .regen.regen_api_wrapper import RegenAPIWrapper
 from .core.resources import get_resources
 from parrhesia.api.base_evaluation import compute_base_evaluation
 from parrhesia.api.automatic_rate_adjustment import compute_automatic_rate_adjustment
@@ -33,6 +34,7 @@ if parr_res is not None:
 airspace_wrapper = AirspaceAPIWrapper()
 flows_wrapper = FlowsWrapper()
 count_wrapper = CountAPIWrapper()
+regen_wrapper = RegenAPIWrapper()
 
 # Auth utilities (kept separate so endpoints remain pure)
 from .auth import (
@@ -508,6 +510,34 @@ async def regulation_plan_simulation(request: Dict[str, Any], current_user: dict
             include_excess_vector=include_excess_vector,
         )
         return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/propose_regulations")
+async def post_propose_regulations(request: Dict[str, Any], current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+    """Generate top-k regulation proposals for a hotspot time window."""
+    if not isinstance(request, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+    tv = request.get("traffic_volume_id")
+    if not isinstance(tv, str) or not tv.strip():
+        raise HTTPException(status_code=400, detail="'traffic_volume_id' is required")
+
+    time_window = request.get("time_window")
+    if not isinstance(time_window, str) or not time_window.strip():
+        raise HTTPException(status_code=400, detail="'time_window' is required")
+
+    top_k = request.get("top_k_regulations")
+
+    try:
+        return await regen_wrapper.propose_regulations(
+            traffic_volume_id=tv,
+            time_window=time_window,
+            top_k_regulations=top_k,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
