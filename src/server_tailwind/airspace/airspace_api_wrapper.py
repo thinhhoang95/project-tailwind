@@ -1080,6 +1080,47 @@ class AirspaceAPIWrapper:
                         arr[start:end] = float(c)
                 cap_by_tv[tv_id] = arr
 
+            # Compute post-regulation capacity exceedance (J_cap) and total delay minutes (J_delay)
+            j_cap_total = 0.0
+            z_max_roll = 0.0
+            for tv_id, row in tv_items:
+                cap_arr = cap_by_tv.get(tv_id)
+                if cap_arr is None or cap_arr.size == 0:
+                    continue
+                pr = post_roll[row, :]
+                valid = cap_arr >= 0.0
+                if not np.any(valid):
+                    continue
+                exceed = pr - cap_arr
+                exceed = np.where(valid, exceed, 0.0)
+                pos = np.maximum(exceed, 0.0)
+                j_cap_total += float(np.sum(pos, dtype=np.float64))
+                try:
+                    z_max_roll = max(z_max_roll, float(np.max(pos)))
+                except Exception:
+                    pass
+
+            delay_stats_local = plan_result.get("delay_stats", {}) or {}
+            j_delay_min = float(delay_stats_local.get("total_delay_seconds", 0.0)) / 60.0
+
+            # Rolling-hour objective (network-level) with weights; keep hourly (legacy) separately
+            # Defaults mirror PlanEvaluator defaults
+            default_weights = {"alpha": 1.0, "beta": 2.0, "gamma": 0.1, "delta": 25.0}
+            if weights:
+                try:
+                    w = {**default_weights, **weights}
+                except Exception:
+                    w = default_weights
+            else:
+                w = default_weights
+            num_regs = len(network_plan.regulations)
+            objective_new = (
+                float(w["alpha"]) * float(j_cap_total)
+                + float(w["beta"]) * float(z_max_roll)
+                + float(w["gamma"]) * float(j_delay_min)
+                + float(w["delta"]) * float(num_regs)
+            )
+
             # 7) Build per-TV active window mask from the plan and also the UNION mask across all TVs
             tv_to_active_mask = {tv: np.zeros(bins_per_tv, dtype=bool) for tv, _ in tv_items}
             union_active_mask = np.zeros(bins_per_tv, dtype=bool)
@@ -1089,8 +1130,8 @@ class AirspaceAPIWrapper:
                 if not loc or loc not in tv_to_active_mask:
                     continue
                 mask = tv_to_active_mask[loc]
-                for w in wins:
-                    wi = int(w)
+                for win in wins:
+                    wi = int(win)
                     if 0 <= wi < bins_per_tv:
                         mask[wi] = True
                         union_active_mask[wi] = True
@@ -1209,8 +1250,21 @@ class AirspaceAPIWrapper:
             result_payload = {
                 "delays_by_flight": plan_result.get("delays_by_flight", {}),
                 "delay_stats": plan_result.get("delay_stats", {}),
-                "objective": plan_result.get("objective", 0.0),
-                "objective_components": plan_result.get("objective_components", {}),
+                # New rolling-hour objective (network-level)
+                "objective": float(objective_new),
+                "objective_components": {
+                    "J_cap": float(j_cap_total),
+                    "J_delay": float(j_delay_min),
+                    "z_max": float(z_max_roll),
+                    "num_regs": float(num_regs),
+                    "alpha": float(w["alpha"]),
+                    "beta": float(w["beta"]),
+                    "gamma": float(w["gamma"]),
+                    "delta": float(w["delta"]),
+                },
+                # Preserve hourly objective as legacy
+                "legacy_objective": float(plan_result.get("objective", 0.0)),
+                "legacy_objective_components": plan_result.get("objective_components", {}),
                 "pre_flight_context": pre_flight_context,
                 # New key with changed TVs only
                 "rolling_changed_tvs": rolling_changed_tvs,
