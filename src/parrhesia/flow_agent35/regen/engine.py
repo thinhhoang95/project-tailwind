@@ -72,12 +72,76 @@ def _build_target_cells(hotspot_tv: str, timebins_h: Sequence[int]) -> List[Tupl
     return [(str(hotspot_tv), int(b)) for b in timebins_h]
 
 
-def _build_tv_filter(hotspot_tv: str, bundles: Sequence[Bundle]) -> List[str]:
+def _tvs_traversed_by_flows(*, flights_by_flow: Mapping[int, Sequence[Mapping[str, Any]]], flight_list: Any, indexer) -> List[str]:
+    """Return all TV ids traversed by at least one flight among the provided flows.
+
+    Decodes each flight's occupancy intervals via ``tvtw_index`` -> (tv_row, bin)
+    using the indexer's number of time bins per TV and the flight list's
+    ``idx_to_tv_id`` mapping.
+    """
+    tvs: set[str] = set()
+    if not flights_by_flow:
+        return []
+    # Prefer mapping from the flight_list; fall back to indexer if available
+    idx_to_tv_id = getattr(flight_list, "idx_to_tv_id", None) or getattr(indexer, "idx_to_tv_id", None) or {}
+    try:
+        bins_per_tv = int(getattr(indexer, "num_time_bins"))
+    except Exception:
+        # Conservative fallback; if unknown, we cannot decode tvtw -> tv
+        bins_per_tv = None  # type: ignore
+    fm = getattr(flight_list, "flight_metadata", {}) or {}
+    for _flow_id, specs in flights_by_flow.items():
+        for sp in (specs or ()):  # each spec is a mapping with 'flight_id'
+            fid = sp.get("flight_id") if isinstance(sp, dict) else None
+            if fid is None:
+                continue
+            meta = fm.get(str(fid)) or {}
+            intervals = meta.get("occupancy_intervals") or []
+            for iv in intervals:
+                tvtw_raw = iv.get("tvtw_index") if isinstance(iv, dict) else None
+                if tvtw_raw is None:
+                    continue
+                try:
+                    tvtw_idx = int(tvtw_raw)
+                except Exception:
+                    continue
+                if bins_per_tv is None or bins_per_tv <= 0:
+                    # Without bins_per_tv we cannot decode; skip safely
+                    continue
+                tv_row = int(tvtw_idx) // int(bins_per_tv)
+                tv_id = idx_to_tv_id.get(int(tv_row)) if isinstance(idx_to_tv_id, dict) else None
+                if tv_id is not None:
+                    tvs.add(str(tv_id))
+    return sorted(tvs)
+
+
+def _build_tv_filter(
+    hotspot_tv: str,
+    bundles: Sequence[Bundle],
+    *,
+    flights_by_flow: Mapping[int, Sequence[Mapping[str, Any]]],
+    flight_list: Any,
+    indexer,
+) -> List[str]:
+    """TVs used for objective evaluation.
+
+    Includes:
+      - the hotspot itself,
+      - all control TVs of flows in the candidate bundles,
+      - and all TVs traversed by at least one flight of those flows (network impact).
+    """
     tvs = {str(hotspot_tv)}
     for bundle in bundles:
         for fs in bundle.flows:
             if fs.control_tv_id:
                 tvs.add(str(fs.control_tv_id))
+    # Add all TVs traversed by flights of the flows under consideration
+    traversed = _tvs_traversed_by_flows(
+        flights_by_flow=flights_by_flow,
+        flight_list=flight_list,
+        indexer=indexer,
+    )
+    tvs.update(traversed)
     return sorted(tvs)
 
 
@@ -119,7 +183,12 @@ def propose_regulations_for_hotspot(
         timebins_h=timebins_seq,
         caches=extractor.caches,
     )
+    # D_vec only contains the exceedance for the hotspot TV and the designated timebins
     D_vec = exceedance_stats.get("D_vec", np.zeros(1, dtype=float))
+    # Cut target E_target
+    # TV scope: hotspot TV only.
+    # Time scope: exactly the provided timebins_h for the hotspot.
+    # Flow scope: aggregated rolling occupancy at the hotspot (not flow-specific); exceedance is per-bin (rolling occupancy − hourly capacity); optionally converted from occupancy to entrance.
     E_target_occ = compute_e_target(D_vec, mode=cfg.e_target_mode, fallback_to_peak=cfg.fallback_to_peak)
     if cfg.convert_occupancy_to_entrance:
         E_target = occupancy_to_entrance(
@@ -171,8 +240,18 @@ def propose_regulations_for_hotspot(
             raise ValueError("No candidate bundles constructed")
         return []
 
+    # Optional: add two shoulder timebins to cover the "dumping" effect from unreleased flights in the queue, not used for now
+    # timebins_seq_with_shoulder = timebins_seq + [timebins_seq[-1] + 1, timebins_seq[-1] + 2] # add two shoulder timebins to cover the "dumping" effect from unreleased flights in the queue
+    
     target_cells = _build_target_cells(hotspot_tv, timebins_seq)
-    tv_filter = _build_tv_filter(hotspot_tv, bundles)
+    tv_filter = _build_tv_filter(
+        hotspot_tv,
+        bundles,
+        flights_by_flow=flights_by_flow,
+        flight_list=flight_list,
+        indexer=indexer,
+    )
+    # The context only includes the hotspot in tv_filter
     context = build_local_context(
         indexer=indexer,
         flight_list=flight_list,

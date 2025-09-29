@@ -117,7 +117,7 @@ def score_with_context(
     J_share = _compute_J_share(n_by_flow, context.d_by_flow, context.weights.theta_share) if context.weights.theta_share > 0 else 0.0
     J_spill = _compute_J_spill(n_by_flow, context.weights.eta_spill) if context.weights.eta_spill > 0 else 0.0
 
-    J_total = J_cap + J_delay + J_reg + J_tv + J_share + J_spill
+    J_total = 100.0 * J_cap + J_delay + J_reg + J_tv + J_share + J_spill
 
     components: Dict[str, float] = {
         "J_cap": float(J_cap),

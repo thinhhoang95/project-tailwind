@@ -45,13 +45,13 @@ class RegenConfig:
     convert_occupancy_to_entrance: bool = False
     dwell_minutes: Optional[float] = None
     alpha_occupancy_to_entrance: float = 1.0
-    local_search_steps: Tuple[int, ...] = (-2, -1, 1, 2) # None # (-2, -1, 1, 2)
+    local_search_steps: Tuple[int, ...] = None # (-2, -1, 1, 2)
     # When enabled, local search explores percentage adjustments around the target allowed rate
     # using deltas measured as a percentage of the original baseline rate r0_i.
-    local_search_use_percent: bool = False
+    local_search_use_percent: bool = True
     local_search_percent_lower: float = 0.05  # 5%
-    local_search_percent_upper: float = 0.8  # 50%
-    local_search_percent_step: float = 0.05   # 5% increments
+    local_search_percent_upper: float = 0.95  # 50%
+    local_search_percent_step: float = 0.1  # 5% increments
     max_variants_per_bundle: int = 64
     diversity_alpha: float = 0.2
     k_proposals: int = 4

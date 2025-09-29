@@ -34,11 +34,12 @@ def compute_hotspot_exceedance(
     row_map = getattr(flight_list, "tv_id_to_idx", {})
     if str(hotspot_tv) not in row_map:
         raise KeyError(f"Hotspot TV {hotspot_tv} not present in flight list")
+    # We only compute the exceedance for the hotspot TV
     row = int(row_map[str(hotspot_tv)])
     occ_row = rolling_occ[row]
     cap_row = hourly_capacity_matrix[row]
     timebins = [int(b) for b in timebins_h]
-    D_vec: list[float] = []
+    D_vec: list[float] = [] # D_vec only contains the exceedance for the hotspot TV and the designated timebins
     for b in timebins:
         if b < 0 or b >= occ_row.shape[0]:
             continue
