@@ -474,6 +474,7 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
 - `include_excess_vector`: If true, returns the full post-regulation excess vector; otherwise returns compact stats.
 - Hours/bins with no capacity are skipped when computing busy-ness.
 - Ranking metric: `max(pre_rolling_count - hourly_capacity)` over the union mask of active regulation windows.
+- `objective_components` now reports the true cost terms `{J_cap, J_delay}` computed from post-regulation rolling occupancy and total delay minutes; the previous breakdown remains under `legacy_objective_components` for one release while `objective` stays unchanged.
 
 **Response:**
 ```json
@@ -492,6 +493,10 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
   },
   "objective": 12.0,
   "objective_components": {
+    "J_cap": 1234.5,
+    "J_delay": 432.0
+  },
+  "legacy_objective_components": {
     "z_sum": 10.0,
     "z_max": 5.0,
     "delay_min": 5.0,
@@ -1123,6 +1128,7 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
 - `include_excess_vector`: If true, returns the full post-regulation excess vector; otherwise returns compact stats.
 - Hours/bins with no capacity are skipped when computing busy-ness.
 - Ranking metric: `max(pre_rolling_count - hourly_capacity)` over the union mask of active regulation windows.
+- `objective_components` now reports the true cost terms `{J_cap, J_delay}` computed from post-regulation rolling occupancy and total delay minutes; the previous breakdown remains under `legacy_objective_components` for one release while `objective` stays unchanged.
 
 **Response:**
 ```json
@@ -1141,6 +1147,10 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
   },
   "objective": 12.0,
   "objective_components": {
+    "J_cap": 1234.5,
+    "J_delay": 432.0
+  },
+  "legacy_objective_components": {
     "z_sum": 10.0,
     "z_max": 5.0,
     "delay_min": 5.0,
