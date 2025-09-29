@@ -20,11 +20,37 @@ def build_candidate_bundles(
     *,
     max_bundle_size: int = 5,
     distinct_controls_required: bool = True,
+    allow_score_shift: bool = True,
 ) -> List[Bundle]:
     """Build candidate bundles of top-scoring flows."""
 
     bundles: List[Bundle] = []
-    sorted_flows = [fs for fs in scored if fs.score > 0.0]
+
+    if allow_score_shift:
+        print('[regen/bundles] Warning: score shift is enabled')
+        sorted_flows = [fs for fs in scored if fs.score > 0.0]
+        if not sorted_flows and scored:
+            min_score = min(float(fs.score) for fs in scored)
+            if min_score < 0.0:
+                shift = -min_score
+                shifted = [
+                    FlowScore(
+                        flow_id=fs.flow_id,
+                        control_tv_id=fs.control_tv_id,
+                        score=float(fs.score) + shift,
+                        diagnostics=fs.diagnostics,
+                        num_flights=fs.num_flights,
+                    )
+                    for fs in scored
+                ]
+            else:
+                shifted = list(scored)
+            sorted_flows = [fs for fs in shifted if fs.score > 0.0]
+            if not sorted_flows:
+                sorted_flows = shifted
+    else:
+        sorted_flows = [fs for fs in scored if fs.score > 0.0]
+
     if not sorted_flows:
         return bundles
     limit = min(len(sorted_flows), max_bundle_size, 3)

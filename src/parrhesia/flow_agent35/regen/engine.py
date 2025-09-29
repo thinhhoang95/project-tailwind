@@ -208,6 +208,10 @@ def propose_regulations_for_hotspot(
             base_cuts,
             steps=cfg.local_search_steps,
             max_variants=cfg.max_variants_per_bundle,
+            use_percent=cfg.local_search_use_percent,
+            percent_lower=cfg.local_search_percent_lower,
+            percent_upper=cfg.local_search_percent_upper,
+            percent_step=cfg.local_search_percent_step,
         )
         best_variant: Optional[Tuple[BundleVariant, PredictedImprovement, Dict[str, Any]]] = None
         for rates in variants:
@@ -218,7 +222,14 @@ def propose_regulations_for_hotspot(
                 indexer=indexer,
                 window=window,
             )
-            score_before, score_after, occ_before, occ_after = score_pair(
+            (
+                score_before,
+                score_after,
+                occ_before,
+                occ_after,
+                components_before,
+                components_after,
+            ) = score_pair(
                 baseline_schedule,
                 regulated_schedule,
                 flights_by_flow=flights_by_flow,
@@ -243,6 +254,8 @@ def propose_regulations_for_hotspot(
             diagnostics = {
                 "score_before": float(score_before),
                 "score_after": float(score_after),
+                "score_components_before": components_before,
+                "score_components_after": components_after,
                 "weights_used": dict(bundle.weights_by_flow),
                 "E_target": float(E_target),
                 "E_target_occupancy": float(E_target_occ),
@@ -282,7 +295,7 @@ def propose_regulations_for_hotspot(
         for fs in bundle_variant.bundle.flows:
             diag_map = {
                 "gH": fs.diagnostics.gH,
-                "gH_v_tilde": fs.diagnostics.gH_v_tilde,
+                # "gH_v_tilde": fs.diagnostics.gH_v_tilde,
                 "v_tilde": fs.diagnostics.v_tilde,
                 "rho": fs.diagnostics.rho,
                 "slack15": fs.diagnostics.slack15,
@@ -295,6 +308,7 @@ def propose_regulations_for_hotspot(
                 "tGl": fs.diagnostics.tGl,
                 "tGu": fs.diagnostics.tGu,
                 "bins_count": fs.diagnostics.bins_count,
+                "num_flights": fs.num_flights,
                 "weight": float(weights_dict.get(fs.flow_id, 0.0)),
             }
             per_flow_diag[int(fs.flow_id)] = diag_map
@@ -313,19 +327,18 @@ def propose_regulations_for_hotspot(
                     "R_i": int(rc.allowed_rate_R),
                     "r0_i": float(rc.baseline_rate_r0),
                     "lambda_cut_i": int(rc.cut_per_hour_lambda),
+                    "num_flights": info.get("num_flights", 0),
                 }
             )
         flows_info.sort(key=lambda item: item["flow_id"])
-        proposal_diag = {
-            "E_target": diag.get("E_target"),
-            "E_target_occupancy": diag.get("E_target_occupancy"),
-            "per_flow": per_flow_diag,
-            "weights_used": weights_dict,
-            "diversity_penalty": diag.get("diversity_penalty"),
-            "score_before": diag.get("score_before"),
-            "score_after": diag.get("score_after"),
-            "ranking_score": float(final_score),
-        }
+        proposal_diag = dict(diag)
+        proposal_diag.update(
+            {
+                "per_flow": per_flow_diag,
+                "weights_used": weights_dict,
+                "ranking_score": float(final_score),
+            }
+        )
         ctrl_volume = next((fs.control_tv_id for fs in bundle_variant.bundle.flows if fs.control_tv_id), hotspot_tv)
         proposals.append(
             Proposal(

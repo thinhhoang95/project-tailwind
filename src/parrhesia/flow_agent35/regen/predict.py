@@ -92,10 +92,17 @@ def score_pair(
     capacities_by_tv: Mapping[str, np.ndarray],
     flight_list,
     context: ScoreContext,
-) -> Tuple[float, float, Mapping[str, np.ndarray], Mapping[str, np.ndarray]]:
+) -> Tuple[
+    float,
+    float,
+    Mapping[str, np.ndarray],
+    Mapping[str, np.ndarray],
+    Dict[str, float],
+    Dict[str, float],
+]:
     """Score before and after schedules with the safe-spill objective."""
 
-    score_before, _, artifacts_before = score_with_context(
+    score_before, components_before, artifacts_before = score_with_context(
         baseline,
         flights_by_flow=flights_by_flow,
         capacities_by_tv=capacities_by_tv,
@@ -103,7 +110,7 @@ def score_pair(
         context=context,
         audit_exceedances=True,
     )
-    score_after, _, artifacts_after = score_with_context(
+    score_after, components_after, artifacts_after = score_with_context(
         regulated,
         flights_by_flow=flights_by_flow,
         capacities_by_tv=capacities_by_tv,
@@ -113,7 +120,14 @@ def score_pair(
     )
     occ_before = artifacts_before.get("occupancy", {})
     occ_after = artifacts_after.get("occupancy", {})
-    return float(score_before), float(score_after), occ_before, occ_after
+    return (
+        float(score_before),
+        float(score_after),
+        occ_before,
+        occ_after,
+        dict(components_before),
+        dict(components_after),
+    )
 
 
 def compute_delta_deficit_per_hour(

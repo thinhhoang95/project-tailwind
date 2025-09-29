@@ -68,17 +68,22 @@ def score_flows(
         slack45 = float(getattr(feat, "Slack_G45", 0.0) or 0.0)
         score_val = (
             weights.w1 * float(feat.gH)
-            + weights.w2 * float(feat.gH_v_tilde)
-            + weights.w3 * float(feat.v_tilde)
-            + weights.w4 * slack15
-            + weights.w5 * slack30
-            - weights.w6 * float(feat.rho)
-            + weights.w7 * cov
+            # + weights.w2 * float(feat.gH_v_tilde)
+            + weights.w2 * float(feat.v_tilde)
+            + weights.w3 * slack15
+            + weights.w4 * slack30
+            - weights.w5 * float(feat.rho)
+            + weights.w6 * cov
         )
-        score_val = max(0.0, float(score_val))
+
+        # Choose one of the following: clamp to 0 or use the raw score
+        # If slack is very negative (we allow negative slack for robustness), then clamping to 0 will be too restrictive
+        # score_val = max(0.0, float(score_val)) 
+        score_val = float(score_val)
+
         diagnostics = FlowDiagnostics(
             gH=float(feat.gH),
-            gH_v_tilde=float(feat.gH_v_tilde),
+            # gH_v_tilde=float(feat.gH_v_tilde),
             v_tilde=float(feat.v_tilde),
             rho=float(feat.rho),
             slack15=slack15,
@@ -91,6 +96,7 @@ def score_flows(
             tGl=int(feat.tGl),
             tGu=int(feat.tGu),
             bins_count=int(feat.bins_count),
+            num_flights=int(getattr(feat, "num_flights", 0)),
         )
         scores.append(
             FlowScore(
@@ -98,6 +104,7 @@ def score_flows(
                 control_tv_id=str(feat.control_tv_id) if feat.control_tv_id is not None else None,
                 score=score_val,
                 diagnostics=diagnostics,
+                num_flights=int(getattr(feat, "num_flights", 0)),
             )
         )
     scores.sort(key=lambda fs: fs.score, reverse=True)

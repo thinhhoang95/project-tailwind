@@ -34,7 +34,7 @@ class FlowFeatures:
     gH_avg: float              # average of per-bin g_H over period (over bins where t_G is valid)
     gH: float                  # derived at period level: xGH / (xGH + DH)
     v_tilde: float             # sum of per-bin ṽ over period
-    gH_v_tilde: float          # derived at period level: gH (derived) * v_tilde (sum)
+    #  gH_v_tilde: float          # derived at period level: gH (derived) * v_tilde (sum)
 
     # Slack sums and global-argmin row indices per Δ ∈ {0, 15, 30, 45} minutes
     Slack_G0: float
@@ -59,6 +59,7 @@ class FlowFeatures:
 
     # Auxiliary counts
     bins_count: int
+    num_flights: int
 
 
 class FlowFeaturesExtractor:
@@ -349,7 +350,7 @@ class FlowFeaturesExtractor:
                 "DH": 0.0,
                 "gH_sum": 0.0,
                 "v_tilde": 0.0,
-                "gH_v_tilde_sum": 0.0,  # per-bin product sum (optional)
+                # "gH_v_tilde_sum": 0.0,  # per-bin product sum (optional)
                 "rho": 0.0,
             }
 
@@ -487,7 +488,7 @@ class FlowFeaturesExtractor:
                     tG,
                     tau,
                     self.S_mat,
-                    S0=self.params.S0,
+                    # S0=self.params.S0,
                     xG=xG,
                     S0_mode=self.params.S0_mode,
                     verbose_debug=False,
@@ -503,7 +504,7 @@ class FlowFeaturesExtractor:
                 acc["DH"] += float(DH)
                 acc["gH_sum"] += float(gH)
                 acc["v_tilde"] += float(v_tilde)
-                acc["gH_v_tilde_sum"] += float(gH) * float(v_tilde)
+                # acc["gH_v_tilde_sum"] += float(gH) * float(v_tilde)
                 acc["rho"] += float(rho)
 
         # Build outputs with derived and average variants
@@ -514,6 +515,21 @@ class FlowFeaturesExtractor:
             d_sum = float(acc["DH"]) 
             g_sum = float(acc["gH_sum"]) 
             v_sum = float(acc["v_tilde"]) 
+
+            flights_meta = getattr(self, "_flights_by_flow", {}).get(int(fid)) or ()
+            if flights_meta:
+                unique_flights = set()
+                for meta in flights_meta:
+                    if isinstance(meta, Mapping):
+                        fid_val = meta.get("flight_id")
+                    else:
+                        fid_val = meta
+                    if not fid_val:
+                        continue
+                    unique_flights.add(str(fid_val))
+                num_flights = len(unique_flights)
+            else:
+                num_flights = 0
 
             # Derived gH = xGH / (xGH + DH) with eps guard
             denom = x_sum + d_sum
@@ -554,7 +570,7 @@ class FlowFeaturesExtractor:
                 gH_avg=g_avg,
                 gH=g_derived,
                 v_tilde=v_sum,
-                gH_v_tilde=float(g_derived * v_sum),
+                # gH_v_tilde=float(g_derived * v_sum),
                 Slack_G0=slack0,
                 Slack_G0_row=(int(r0) if r0 is not None else None),
                 Slack_G0_occ=(float(occ0) if occ0 is not None else None),
@@ -573,6 +589,7 @@ class FlowFeaturesExtractor:
                 Slack_G45_cap=(float(cap45) if cap45 is not None else None),
                 rho=float(acc["rho"]),
                 bins_count=bins_count,
+                num_flights=int(num_flights),
             )
 
         return out

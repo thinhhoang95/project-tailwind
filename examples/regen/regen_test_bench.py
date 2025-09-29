@@ -66,6 +66,11 @@ def _report_timings():
         print(f"{name:<{width}}  total {sec*1000:8.1f} ms  avg {avg*1000:7.1f} ms  calls {calls:5d}  share {share:5.1%}")
 # End profiling helpers ===
 
+leiden_params = {
+    "threshold": 0.64,
+    "resolution": 1.0,
+    "seed": 0,
+}
 
 def _pick_existing_path(candidates: List[Path]) -> Optional[Path]:
     for p in candidates:
@@ -157,7 +162,7 @@ def pick_top_hotspot(inventory: HotspotInventory, *, threshold: float = 0.0) -> 
         top_flows=cfg.top_flows,
         min_flights_per_flow=cfg.min_flights_per_flow,
         max_flights_per_flow=cfg.max_flights_per_flow,
-        leiden_params={"threshold": 0.64, "resolution": 1.0, "seed": 0},
+        leiden_params=leiden_params,
         direction_opts=cfg.direction_opts,
     )
     if not descs:
@@ -305,121 +310,11 @@ def _build_flow_summary(
                 "allowed_rate_per_hour": float(flow.get("R_i", 0.0)),
                 "assigned_cut_per_hour": float(flow.get("lambda_cut_i", 0.0)),
                 "entrants_in_window": entrants,
-                "num_flights": len(flights),
+                "num_flights": int(flow.get("num_flights", len(flights))),
             }
         )
     summary.sort(key=lambda item: item["flow_id"])
     return summary
-
-
-def _build_naive_regulation(
-    *,
-    hotspot_payload: Mapping[str, Any],
-    flows_payload: Mapping[str, Any],
-    evaluator: NetworkEvaluator,
-    indexer: TVTWIndexer,
-) -> Optional[Dict[str, Any]]:
-    flows = list(flows_payload.get("flows", []) or [])
-    if not flows:
-        return None
-
-    window_bins = list(hotspot_payload.get("window_bins", []) or [])
-    timebins_h = _timebins_from_window(window_bins)
-    if not timebins_h:
-        return None
-
-    start_bin = min(timebins_h)
-    end_bin = max(timebins_h)
-
-    def _entrants(flow: Mapping[str, Any]) -> float:
-        demand = list(flow.get("demand", []) or [])
-        if not demand:
-            return 0.0
-        upper = min(len(demand), end_bin + 1)
-        lower = max(0, start_bin)
-        if upper <= lower:
-            return 0.0
-        return float(sum(float(demand[i]) for i in range(lower, upper)))
-
-    best_flow = max(flows, key=_entrants, default=None)
-    if not best_flow:
-        return None
-
-    entrants = _entrants(best_flow)
-    if entrants <= 0.0:
-        return None
-
-    demand = list(best_flow.get("demand", []) or [])
-    upper = min(len(demand), end_bin + 1)
-    lower = max(0, start_bin)
-    window_slice = demand[lower:upper] if upper > lower else []
-    if window_slice:
-        baseline = max(float(x) for x in window_slice)
-        avg_window = float(sum(float(x) for x in window_slice)) / float(len(window_slice))
-        baseline = max(baseline, avg_window)
-    else:
-        baseline = entrants
-    cut = max(1, int(round(baseline * 0.3)))
-    allowed = max(0, int(round(baseline)) - cut)
-
-    flow_info = {
-        "flow_id": int(best_flow.get("flow_id", 0)),
-        "control_tv_id": best_flow.get("controlled_volume")
-        or str(hotspot_payload.get("control_volume_id")),
-        "lambda_cut_i": int(cut),
-        "r0_i": float(baseline),
-        "R_i": int(allowed),
-    }
-
-    capacities_by_tv = _capacities_per_bin(evaluator, indexer)
-    flight_list = getattr(evaluator, "flight_list", None)
-    exceedance_stats: Mapping[str, Any]
-    e_target = 0.0
-    if flight_list is not None:
-        exceedance_stats = compute_hotspot_exceedance(
-            indexer=indexer,
-            flight_list=flight_list,
-            capacities_by_tv=capacities_by_tv,
-            hotspot_tv=str(hotspot_payload.get("control_volume_id")),
-            timebins_h=timebins_h,
-        )
-        e_target = float(
-            compute_e_target(
-                exceedance_stats.get("D_vec", ()),
-                mode="q95",
-                fallback_to_peak=True,
-            )
-        )
-    else:
-        exceedance_stats = {}
-
-    if e_target <= 0.0:
-        e_target = float(entrants)
-
-    proposal = SimpleNamespace(
-        hotspot_id=str(hotspot_payload.get("control_volume_id")),
-        controlled_volume=str(flow_info["control_tv_id"]),
-        window=SimpleNamespace(start_bin=int(start_bin), end_bin=int(end_bin)),
-        flows_info=[flow_info],
-        predicted_improvement=SimpleNamespace(
-            delta_deficit_per_hour=float(-cut),
-            delta_objective_score=float(cut),
-        ),
-        diagnostics={
-            "heuristic_regulation": True,
-            "entrants_window": float(entrants),
-            "baseline_rate_window": float(baseline),
-            "cut_assigned": int(cut),
-            "E_target": float(e_target),
-        },
-    )
-
-    return _proposal_to_dict(
-        proposal,
-        hotspot_payload=hotspot_payload,
-        flows_payload=flows_payload,
-        exceedance_stats=exceedance_stats,
-    )
 
 
 def _proposal_to_dict(
@@ -474,7 +369,7 @@ def propose_one_regulation(
     # Flow payload via API (reuse in-memory artifacts)
     set_global_resources(indexer, flight_list)
     direction_opts = {"mode": "coord_cosine", "tv_centroids": centroids} if centroids else {"mode": "coord_cosine"}
-    flows_payload = compute_flows(tvs=[control_tv], timebins=timebins_h, direction_opts=direction_opts)
+    flows_payload = compute_flows(tvs=[control_tv], timebins=timebins_h, direction_opts=direction_opts, threshold=leiden_params["threshold"], resolution=leiden_params["resolution"])
 
     # Flow-to-flights metadata from hotspot discovery (string keys)
     meta = hotspot_payload.get("metadata", {}) or {}
@@ -497,11 +392,11 @@ def propose_one_regulation(
     except ValueError as exc:
         print(f"[regen] Primary proposal attempt failed: {exc}. Retrying with relaxed config...")
         fallback_cfg = RegenConfig(
-            g_min=-1.0,
+            g_min=-float("inf"),
             rho_max=10.0,
-            slack_min=-1.0,
+            slack_min=-float("inf"),
             distinct_controls_required=False,
-            raise_on_edge_cases=False,
+            raise_on_edge_cases=True,
         )
         proposals = propose_regulations_for_hotspot(
             indexer=indexer,
@@ -515,16 +410,7 @@ def propose_one_regulation(
             config=fallback_cfg,
         )
     if not proposals:
-        print("[regen] Fallback config returned no proposals; constructing heuristic regulation.")
-        heuristic = _build_naive_regulation(
-            hotspot_payload=hotspot_payload,
-            flows_payload=flows_payload,
-            evaluator=evaluator,
-            indexer=indexer,
-        )
-        if heuristic is not None:
-            return heuristic
-        raise RuntimeError("regen engine returned no proposals")
+        raise RuntimeError("regen engine returned no proposals even with relaxed config")
 
     best = proposals[0]
     exceedance_stats = compute_hotspot_exceedance(
@@ -567,15 +453,67 @@ def main() -> None:
     print("[regen] Proposing one regulation (per-flow) ...")
     proposal = propose_one_regulation(hotspot_payload=top, evaluator=evaluator, indexer=indexer)
 
-    # Print concise summary
-    flow = proposal["flows"][0]
+    # Print proposal summary with rich formatting
+    from rich.console import Console
+    from rich.table import Table
+    
+    console = Console()
+    
+    # Header info
     diag = proposal["diagnostics"]
-    print(
-        "[regen] Proposal → TV=\n"
-        f"  {proposal['control_volume_id']} bins={proposal['window_bins'][0]}-{proposal['window_bins'][1]}\n"
-        f"  flow={flow['flow_id']} r0={flow['baseline_rate_per_hour']:.1f}/h → R={flow['allowed_rate_per_hour']:.1f}/h (Δ={flow['assigned_cut_per_hour']:.0f}/h)\n"
-        f"  entrants={flow['entrants_in_window']:.0f} flights={flow['num_flights']} E_target={diag['E_target']:.1f} (D_peak={diag['D_peak']:.1f}, D_sum={diag['D_sum']:.1f})"
-    )
+    improvement = proposal.get("predicted_improvement", {})
+    components_before = diag.get("score_components_before", {}) or {}
+    components_after = diag.get("score_components_after", {}) or {}
+    console.print(f"\n[bold green][regen] Proposal Summary[/bold green]")
+    console.print(f"Control Volume: [cyan]{proposal['control_volume_id']}[/cyan]")
+    console.print(f"Window Bins: [cyan]{proposal['window_bins'][0]}-{proposal['window_bins'][1]}[/cyan]")
+    console.print(f"Target Exceedance to Remove: [yellow]{diag['E_target']:.1f}[/yellow] (D_peak={diag['D_peak']:.1f}, D_sum={diag['D_sum']:.1f})")
+    delta_obj = float(improvement.get("delta_objective_score", 0.0))
+    console.print(f"Predicted Objective Improvement: [yellow]{delta_obj:.3f}[/yellow]")
+
+    if components_before or components_after:
+        comp_table = Table(title="Objective Components")
+        comp_table.add_column("Component", style="cyan")
+        comp_table.add_column("Baseline", justify="right", style="magenta")
+        comp_table.add_column("Regulated", justify="right", style="green")
+        comp_table.add_column("Delta", justify="right", style="yellow")
+
+        component_keys = sorted(set(components_before.keys()) | set(components_after.keys()))
+        for key in component_keys:
+            before_val = float(components_before.get(key, 0.0))
+            after_val = float(components_after.get(key, 0.0))
+            delta_val = after_val - before_val
+            comp_table.add_row(
+                key,
+                f"{before_val:.3f}",
+                f"{after_val:.3f}",
+                f"{delta_val:+.3f}",
+            )
+
+        console.print(comp_table)
+    
+    # Flows table
+    table = Table(title="Flow Regulations")
+    table.add_column("Flow ID", style="cyan", no_wrap=True)
+    table.add_column("Control TV", style="magenta")
+    table.add_column("Baseline Rate\n(per hour)", justify="right", style="green")
+    table.add_column("Allowed Rate\n(per hour)", justify="right", style="yellow")
+    table.add_column("Cut\n(per hour)", justify="right", style="red")
+    table.add_column("Entrants in\nWindow", justify="right")
+    table.add_column("Num\nFlights", justify="right")
+    
+    for flow in proposal["flows"]:
+        table.add_row(
+            str(flow['flow_id']),
+            str(flow['control_tv_id']),
+            f"{flow['baseline_rate_per_hour']:.1f}",
+            f"{flow['allowed_rate_per_hour']:.1f}",
+            f"{flow['assigned_cut_per_hour']:.0f}",
+            f"{flow['entrants_in_window']:.0f}",
+            str(flow['num_flights'])
+        )
+    
+    console.print(table)
 
     # Optional: write to disk next to artifacts
     out_dir = REPO_ROOT / "agent_runs" / "runs"

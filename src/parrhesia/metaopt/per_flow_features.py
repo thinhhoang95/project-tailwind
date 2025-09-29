@@ -147,16 +147,58 @@ def price_contrib_v_tilde(
     bins_per_hour: Optional[int] = None,
 ) -> float:
     """
-    Contribution-weighted price ṽ_{G→H} using overload-addressable shares ω:
-      - Primary: P_{s*}(t*) · ω_{s*,G|H}
-      - Secondary ripple: κ · Σ_{s≠s*, touched} P_s(t* + τ_{G,s} − τ_{G,s*}) · ω_{s,G|H}
+    Main Formula for v_tilde
 
-    Where ω_{s,G|H} = min(1, x_{s,G} / (D_s + eps)), with
-      - x_{s,G} = xG(t_G + τ_{G,s})
-      - D_s = max(0, -slack[s, t]) at the aligned hotspot time for row s
+    The value v_tilde_{G → H} is composed of a primary term (for the hotspot sector itself) and a secondary ripple term (for other sectors affected by the flow).
 
-    Vectorized over rows, restricted to rows present in τ map.
+    Let s* be the hotspot sector and t* be the hotspot time bin. The formula is:
+
+    v_tilde_{G → H} = [P_s(t) · ω_s,G|H] + [κ · Σ_{s in touched by G, s ≠ s} P_s(t_hot(s)) · ω_s,G|H]
+    Primary Term Secondary Ripple Term
+
+    Here's what each component means:
+
+    P_s(t): The unit price at a sector s and time t. This is non-zero when there is congestion (an "overload").
+
+    Formula for Price P_s(t)
+
+    The formula for the price at a specific sector s and time bin t is:
+
+    P_s(t) = (w_sum + w_max · θ_s,t) · 1{hourly_excess_bool[s,t]}
+
+    ω_s,G|H: The "addressable share," which measures how much the flow G contributes to the congestion at sector s. We'll look at this in more detail below.
+
+    κ: A parameter that weights the secondary ripple effect.
+
+    t_hot(s): The time at sector s that is aligned with the hotspot event at t. It's calculated as t_hot(s) = t + τ_G,s - τ_G,s*, where τ_G,s is the travel time for flow G to sector s.
+
+    Addressable Share (ω)
+
+    The addressable share ω is key to understanding v_tilde. It's defined as:
+
+    ω_s,G|H = min(1, x_s,G / (D_s + ε))
+
+    x_s,G: The demand from flow G at sector s at the hotspot-aligned time, t_hot(s). It represents the amount of traffic the flow is sending through that sector at that time. This is xG[t_hot(s)] in the code.
+
+    D_s: The demand exceedance (i.e., congestion) at sector s. It's the amount by which demand exceeds capacity. It's calculated as D_s = max(0, occupancy - capacity), which is equivalent to max(0, -slack). This is D_s_vec in the code.
+
+    ε: A small constant (eps) to prevent division by zero.
+
+    The code for calculating ω is at 195:201:src/parrhesia/metaopt/per_flow_features.py.
+
+    Intuition
+
+    In simple terms, v_tilde is high if a flow sends a significant amount of traffic to sectors that are already heavily congested.
+
+    The addressable share ω will be close to 1 if the flow's demand (x_s,G) is a large fraction of the congestion (D_s).
+
+    The price P is high for congested sectors.
+
+    The total v_tilde is a sum of price * share. The primary term captures the direct impact on the hotspot, and the secondary term captures the ripple effects on other sectors the flow passes through.
+
+    In src/parrhesia/metaopt/feats/flow_features.py, the per-bin v_tilde values are calculated and then summed up over the entire hotspot period to get the final v_tilde feature for a flow.
     """
+    
     V, T = hourly_excess_bool.shape
     tau, touched, t_idx_hot, t_idx_ctl = _aligned_indices(
         hotspot_row, hotspot_bin, t_G, tau_row_to_bins, V, T
@@ -632,11 +674,11 @@ def slack_penalty(
     t_G: int,
     tau_row_to_bins: Mapping[int, int],
     slack_per_bin_matrix: np.ndarray,
-    S0: float,
+    S0: Optional[float] = None,
     *,
     xG: Optional[np.ndarray] = None,
     S0_mode: str = "x_at_argmin",
-    verbose_debug: bool = False,
+    verbose_debug: bool = True,
     idx_to_tv_id: Optional[Mapping[int, str]] = None,
     rolling_occ_by_bin: Optional[np.ndarray] = None,
     hourly_capacity_matrix: Optional[np.ndarray] = None,
@@ -658,9 +700,20 @@ def slack_penalty(
     - When rolling-hour occupancy and hourly capacity matrices are provided, per-row
       slack is derived as (capacity − occupancy) at the aligned time; otherwise the
       cached slack_per_bin_matrix is used.
+
+    Caveats:
+    1. You could have S_eff = 0 for x_at_argmin mode
+    - Slack selection is over “touched” rows only, i.e., rows present in τ for the flow. But it does not require the flow to have volume at that aligned time.
+    - So a flow can “touch” a TV, yet at the argmin-slack aligned time t̂ its flow-level demand xG[t̂] is 0. With S0_mode="x_at_argmin", that makes S0=0 → ρ=0 by design. This is why you see a TVTW selected for slack while the contribution is zero.
+
     """
     # Compute aligned indices and per-row slack at t_G + τ, then Slack_G(t_G)
     # Restrict to rows touched by the flow (present in τ), to align with ṽ components
+
+    if S0_mode != "constant" and (S0 != None or S0 != 0.0):
+        import warnings 
+        warnings.warn(f"[per_flow_features/slack_penalty] S0_mode is not 'constant' but S0 is not None or 0.0. S0 will be ignored. S0_mode: {S0_mode}, S0: {S0}")
+
     V, T = slack_per_bin_matrix.shape
     tau = np.zeros(int(V), dtype=np.int32)
     touched = np.zeros(int(V), dtype=np.bool_)
@@ -704,7 +757,7 @@ def slack_penalty(
     s = float(slack_slice[int(local_idx)])
 
     # Decide normalization S0 according to mode
-    S0_eff = float(S0)
+    S0_eff = float(S0) if S0 is not None else 0.0
     mode = str(S0_mode or "").strip().lower()
     if mode == "x_at_control":
         if xG is not None and xG.size > 0:
@@ -713,8 +766,10 @@ def slack_penalty(
     elif mode == "x_at_argmin":
         if xG is not None and xG.size > 0:
             # Guard index against xG length
+            # print(f"[per_flow_features/slack_penalty] xG.size: {xG.size}, t_hat: {t_hat}")
             if 0 <= int(t_hat) < int(xG.size):
-                S0_eff = float(xG[int(t_hat)])
+                S0_eff = float(xG[int(t_hat)]) 
+                # print(f"[per_flow_features/slack_penalty] S0_eff: {S0_eff}")
     else:
         # mode == "constant" or unrecognized → keep provided S0
         pass
@@ -737,9 +792,10 @@ def slack_penalty(
                 table.add_row("argmin TV", f"{tv_name} (row {int(r_hat)})")
                 table.add_row("t̂", str(int(t_hat)))
                 table.add_row("Slack_G", f"{float(s):.4f}")
-                table.add_row("Result", "S0_eff<=0 → rho=0.0")
+                table.add_row("S0_eff", f"{float(S0_eff):.4f}")
                 console.print(table)
             except Exception:
+                print(f"[per_flow_features/slack_penalty] Error in slack_penalty: {e}")
                 pass
         return 0.0
 

@@ -23,13 +23,12 @@ __all__ = [
 class FlowScoreWeights:
     """Weights for the linear flow scoring function."""
 
-    w1: float = 1.0
-    w2: float = 0.5
-    w3: float = 0.25
-    w4: float = 0.25
-    w5: float = 0.15
-    w6: float = 0.5
-    w7: float = 0.1
+    w1: float = 10.0 # gH: xG / (xG + DH)
+    w2: float = 10.0 # v_tilde
+    w3: float = 0.0 # slack15
+    w4: float = 0.0 # slack30
+    w5: float = 0.25 # rho
+    w6: float = 0.1 # coverage
 
 
 @dataclass(frozen=True)
@@ -46,10 +45,16 @@ class RegenConfig:
     convert_occupancy_to_entrance: bool = False
     dwell_minutes: Optional[float] = None
     alpha_occupancy_to_entrance: float = 1.0
-    local_search_steps: Tuple[int, ...] = (-2, -1, 1, 2)
-    max_variants_per_bundle: int = 8
+    local_search_steps: Tuple[int, ...] = (-2, -1, 1, 2) # None # (-2, -1, 1, 2)
+    # When enabled, local search explores percentage adjustments around the target allowed rate
+    # using deltas measured as a percentage of the original baseline rate r0_i.
+    local_search_use_percent: bool = False
+    local_search_percent_lower: float = 0.05  # 5%
+    local_search_percent_upper: float = 0.8  # 50%
+    local_search_percent_step: float = 0.05   # 5% increments
+    max_variants_per_bundle: int = 64
     diversity_alpha: float = 0.2
-    k_proposals: int = 5
+    k_proposals: int = 4
     max_bundle_size: int = 5
     distinct_controls_required: bool = True
     autotrim_from_ctrl_to_hotspot: bool = False
@@ -61,7 +66,7 @@ class FlowDiagnostics:
     """Diagnostics summarising per-flow metrics used for scoring."""
 
     gH: float
-    gH_v_tilde: float
+    # gH_v_tilde: float
     v_tilde: float
     rho: float
     slack15: float
@@ -74,6 +79,7 @@ class FlowDiagnostics:
     tGl: int
     tGu: int
     bins_count: int
+    num_flights: int
 
 
 @dataclass(frozen=True)
@@ -84,6 +90,7 @@ class FlowScore:
     control_tv_id: Optional[str]
     score: float
     diagnostics: FlowDiagnostics
+    num_flights: int
 
 
 @dataclass(frozen=True)
