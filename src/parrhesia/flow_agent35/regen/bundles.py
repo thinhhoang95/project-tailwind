@@ -53,7 +53,7 @@ def build_candidate_bundles(
 
     if not sorted_flows:
         return bundles
-    limit = min(len(sorted_flows), max_bundle_size, 3)
+    limit = min(len(sorted_flows), max_bundle_size)
     for size in range(1, limit + 1):
         subset = sorted_flows[:size]
         if distinct_controls_required and size > 1:

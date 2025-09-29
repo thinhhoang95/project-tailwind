@@ -54,8 +54,8 @@ class RegenConfig:
     local_search_percent_step: float = 0.1  # 5% increments
     max_variants_per_bundle: int = 64
     diversity_alpha: float = 0.2
-    k_proposals: int = 4
-    max_bundle_size: int = 5
+    k_proposals: int = 6
+    max_bundle_size: int = 6
     distinct_controls_required: bool = True
     autotrim_from_ctrl_to_hotspot: bool = False
     raise_on_edge_cases: bool = True

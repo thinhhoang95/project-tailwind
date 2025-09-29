@@ -343,12 +343,13 @@ def _proposal_to_dict(
     return result
 
 
-def propose_one_regulation(
+def propose_regulations(
     *,
     hotspot_payload: Dict[str, Any],
     evaluator: NetworkEvaluator,
     indexer: TVTWIndexer,
-) -> Dict[str, Any]:
+    top_k: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     control_tv = str(hotspot_payload.get("control_volume_id"))
     if not control_tv:
         raise ValueError("hotspot payload missing control volume id")
@@ -412,7 +413,6 @@ def propose_one_regulation(
     if not proposals:
         raise RuntimeError("regen engine returned no proposals even with relaxed config")
 
-    best = proposals[0]
     exceedance_stats = compute_hotspot_exceedance(
         indexer=indexer,
         flight_list=flight_list,
@@ -420,12 +420,38 @@ def propose_one_regulation(
         hotspot_tv=control_tv,
         timebins_h=timebins_h,
     )
-    return _proposal_to_dict(
-        best,
+    proposals_to_emit: List[Dict[str, Any]] = []
+    for idx, proposal in enumerate(proposals):
+        if top_k is not None and idx >= int(top_k):
+            break
+        proposals_to_emit.append(
+            _proposal_to_dict(
+                proposal,
+                hotspot_payload=hotspot_payload,
+                flows_payload=flows_payload,
+                exceedance_stats=exceedance_stats,
+            )
+        )
+
+    if not proposals_to_emit:
+        raise RuntimeError("Requested top_k resulted in zero proposals being returned")
+
+    return proposals_to_emit
+
+
+def propose_top_regulations(
+    *,
+    hotspot_payload: Dict[str, Any],
+    evaluator: NetworkEvaluator,
+    indexer: TVTWIndexer,
+    top_k: int = 8,
+) -> Dict[str, Any]:
+    return propose_regulations(
         hotspot_payload=hotspot_payload,
-        flows_payload=flows_payload,
-        exceedance_stats=exceedance_stats,
-    )
+        evaluator=evaluator,
+        indexer=indexer,
+        top_k=top_k,
+    )[0]
 
 
 def main() -> None:
@@ -450,81 +476,90 @@ def main() -> None:
     win = top.get("window_bins")
     print(f"[regen] Top hotspot: TV={ctrl} window={win}")
 
-    print("[regen] Proposing one regulation (per-flow) ...")
-    proposal = propose_one_regulation(hotspot_payload=top, evaluator=evaluator, indexer=indexer)
+    print("[regen] Proposing regulations (per-flow) ...")
+    proposals = propose_regulations(hotspot_payload=top, evaluator=evaluator, indexer=indexer)
+    print(f"[regen] Retrieved {len(proposals)} regulation candidate(s).")
 
     # Print proposal summary with rich formatting
     from rich.console import Console
     from rich.table import Table
-    
+
     console = Console()
-    
-    # Header info
-    diag = proposal["diagnostics"]
-    improvement = proposal.get("predicted_improvement", {})
-    components_before = diag.get("score_components_before", {}) or {}
-    components_after = diag.get("score_components_after", {}) or {}
-    console.print(f"\n[bold green][regen] Proposal Summary[/bold green]")
-    console.print(f"Control Volume: [cyan]{proposal['control_volume_id']}[/cyan]")
-    console.print(f"Window Bins: [cyan]{proposal['window_bins'][0]}-{proposal['window_bins'][1]}[/cyan]")
-    console.print(f"Target Exceedance to Remove: [yellow]{diag['E_target']:.1f}[/yellow] (D_peak={diag['D_peak']:.1f}, D_sum={diag['D_sum']:.1f})")
-    delta_obj = float(improvement.get("delta_objective_score", 0.0))
-    console.print(f"Predicted Objective Improvement: [yellow]{delta_obj:.3f}[/yellow]")
 
-    if components_before or components_after:
-        comp_table = Table(title="Objective Components")
-        comp_table.add_column("Component", style="cyan")
-        comp_table.add_column("Baseline", justify="right", style="magenta")
-        comp_table.add_column("Regulated", justify="right", style="green")
-        comp_table.add_column("Delta", justify="right", style="yellow")
+    for rank, proposal in enumerate(proposals, start=1):
+        # Header info mirrors previous single-proposal view
+        diag = proposal["diagnostics"]
+        improvement = proposal.get("predicted_improvement", {})
+        components_before = diag.get("score_components_before", {}) or {}
+        components_after = diag.get("score_components_after", {}) or {}
+        console.print(f"\n[bold green][regen] Proposal Summary #{rank}[/bold green]")
+        console.print(f"Control Volume: [cyan]{proposal['control_volume_id']}[/cyan]")
+        console.print(
+            f"Window Bins: [cyan]{proposal['window_bins'][0]}-{proposal['window_bins'][1]}[/cyan]"
+        )
+        console.print(
+            f"Target Exceedance to Remove: [yellow]{diag['E_target']:.1f}[/yellow] "
+            f"(D_peak={diag['D_peak']:.1f}, D_sum={diag['D_sum']:.1f})"
+        )
+        delta_obj = float(improvement.get("delta_objective_score", 0.0))
+        console.print(f"Predicted Objective Improvement: [yellow]{delta_obj:.3f}[/yellow]")
 
-        component_keys = sorted(set(components_before.keys()) | set(components_after.keys()))
-        for key in component_keys:
-            before_val = float(components_before.get(key, 0.0))
-            after_val = float(components_after.get(key, 0.0))
-            delta_val = after_val - before_val
-            comp_table.add_row(
-                key,
-                f"{before_val:.3f}",
-                f"{after_val:.3f}",
-                f"{delta_val:+.3f}",
+        if components_before or components_after:
+            comp_table = Table(title="Objective Components")
+            comp_table.add_column("Component", style="cyan")
+            comp_table.add_column("Baseline", justify="right", style="magenta")
+            comp_table.add_column("Regulated", justify="right", style="green")
+            comp_table.add_column("Delta", justify="right", style="yellow")
+
+            component_keys = sorted(set(components_before.keys()) | set(components_after.keys()))
+            for key in component_keys:
+                before_val = float(components_before.get(key, 0.0))
+                after_val = float(components_after.get(key, 0.0))
+                delta_val = after_val - before_val
+                comp_table.add_row(
+                    key,
+                    f"{before_val:.3f}",
+                    f"{after_val:.3f}",
+                    f"{delta_val:+.3f}",
+                )
+
+            console.print(comp_table)
+
+        # Flows table per proposal
+        table = Table(title="Flow Regulations")
+        table.add_column("Flow ID", style="cyan", no_wrap=True)
+        table.add_column("Control TV", style="magenta")
+        table.add_column("Baseline Rate\n(per hour)", justify="right", style="green")
+        table.add_column("Allowed Rate\n(per hour)", justify="right", style="yellow")
+        table.add_column("Cut\n(per hour)", justify="right", style="red")
+        table.add_column("Entrants in\nWindow", justify="right")
+        table.add_column("Num\nFlights", justify="right")
+
+        for flow in proposal["flows"]:
+            table.add_row(
+                str(flow["flow_id"]),
+                str(flow["control_tv_id"]),
+                f"{flow['baseline_rate_per_hour']:.1f}",
+                f"{flow['allowed_rate_per_hour']:.1f}",
+                f"{flow['assigned_cut_per_hour']:.0f}",
+                f"{flow['entrants_in_window']:.0f}",
+                str(flow["num_flights"]),
             )
 
-        console.print(comp_table)
-    
-    # Flows table
-    table = Table(title="Flow Regulations")
-    table.add_column("Flow ID", style="cyan", no_wrap=True)
-    table.add_column("Control TV", style="magenta")
-    table.add_column("Baseline Rate\n(per hour)", justify="right", style="green")
-    table.add_column("Allowed Rate\n(per hour)", justify="right", style="yellow")
-    table.add_column("Cut\n(per hour)", justify="right", style="red")
-    table.add_column("Entrants in\nWindow", justify="right")
-    table.add_column("Num\nFlights", justify="right")
-    
-    for flow in proposal["flows"]:
-        table.add_row(
-            str(flow['flow_id']),
-            str(flow['control_tv_id']),
-            f"{flow['baseline_rate_per_hour']:.1f}",
-            f"{flow['allowed_rate_per_hour']:.1f}",
-            f"{flow['assigned_cut_per_hour']:.0f}",
-            f"{flow['entrants_in_window']:.0f}",
-            str(flow['num_flights'])
-        )
-    
-    console.print(table)
+        console.print(table)
 
     # Optional: write to disk next to artifacts
     out_dir = REPO_ROOT / "agent_runs" / "runs"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "regen_proposal.json"
+    output_payload = {
+        "top_hotspot": top,
+        "proposals": proposals,
+    }
     with out_path.open("w", encoding="utf-8") as fh:
-        json.dump(proposal, fh, indent=2)
-    print(f"[regen] Proposal saved: {out_path}")
+        json.dump(output_payload, fh, indent=2)
+    print(f"[regen] Saved {len(proposals)} proposal(s): {out_path}")
 
 
 if __name__ == "__main__":
     main()
-
-
