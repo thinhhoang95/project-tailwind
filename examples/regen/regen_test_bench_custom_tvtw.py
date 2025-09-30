@@ -29,6 +29,7 @@ from parrhesia.flow_agent35.regen.engine import propose_regulations_for_hotspot
 from parrhesia.flow_agent35.regen.exceedance import compute_hotspot_exceedance
 from parrhesia.flow_agent35.regen.rates import compute_e_target
 from parrhesia.flow_agent35.regen.types import RegenConfig
+from parrhesia.optim.capacity import normalize_capacities
 
 
 # Time Profiling helpers ===
@@ -153,15 +154,23 @@ def _timebins_from_window(window_bins: Iterable[int]) -> List[int]:
         end_exclusive = start + 1
     return list(range(int(start), int(end_exclusive)))
 
-
-def _capacities_per_bin(
+# INSTRUCTIONS FOR CODING AGENTS AND DEVELOPERS: This function could be a source of inconsistency
+# since it replicates regen_api_wrapper's _build_capacities_by_tv function
+# If the objective function seem very high, one common culprit is the normalization of missing capacity values
+def _build_capacities_by_tv(
     evaluator: NetworkEvaluator,
     indexer: TVTWIndexer,
 ) -> Dict[str, np.ndarray]:
-    per_hour = getattr(evaluator, "hourly_capacity_by_tv", {}) or {}
-    bins_per_hour = int(indexer.rolling_window_size())
+    """
+    Build per-bin capacities for each traffic volume and normalize them,
+    mirroring the approach used by the server-side wrapper.
+    """
     T = int(indexer.num_time_bins)
-    capacities: Dict[str, np.ndarray] = {}
+    bins_per_hour = int(indexer.rolling_window_size())
+
+    # Construct raw per-bin capacities from evaluator's hourly map
+    per_hour = getattr(evaluator, "hourly_capacity_by_tv", {}) or {}
+    raw_capacities: Dict[str, np.ndarray] = {}
     for tv_id in indexer.tv_id_to_idx.keys():
         arr = np.zeros(T, dtype=np.float64)
         hours = per_hour.get(tv_id, {}) or {}
@@ -175,8 +184,36 @@ def _capacities_per_bin(
                 continue
             end = min(start + bins_per_hour, T)
             arr[start:end] = float(cap)
-        capacities[str(tv_id)] = arr
-    return capacities
+        raw_capacities[str(tv_id)] = arr
+
+    if raw_capacities:
+        non_positive = [tv for tv, arr in raw_capacities.items() if float(np.max(arr)) <= 0.0]
+        if non_positive:
+            print(
+                f"Regen: capacity rows are non-positive for {len(non_positive)}/{len(raw_capacities)} TVs; sample="
+                + ",".join([str(x) for x in non_positive[:5]])
+            )
+
+    # Normalize: treat missing/zero bins as unconstrained
+    capacities_by_tv = normalize_capacities(raw_capacities)
+
+    if capacities_by_tv:
+        sample_items = list(capacities_by_tv.items())[:5]
+        sample_stats = []
+        for tv, arr in sample_items:
+            arr_np = np.asarray(arr, dtype=np.float64)
+            if arr_np.size == 0:
+                sample_stats.append(f"{tv}:empty")
+                continue
+            sample_stats.append(
+                f"{tv}:min={float(arr_np.min()):.1f},max={float(arr_np.max()):.1f}"
+            )
+        print(
+            f"Regen: normalized capacities ready for {len(capacities_by_tv)} TVs; samples: "
+            + "; ".join(sample_stats)
+        )
+
+    return capacities_by_tv
 
 
 def _tv_centroids(
@@ -323,7 +360,7 @@ def propose_regulations(
         raise ValueError("network evaluator missing flight_list reference")
 
     # Prepare shared inputs
-    capacities_by_tv = _capacities_per_bin(evaluator, indexer)
+    capacities_by_tv = _build_capacities_by_tv(evaluator, indexer)
     centroids = _tv_centroids(evaluator.traffic_volumes_gdf, indexer)
     travel_minutes_map = _travel_minutes_from_centroids(centroids)
 
@@ -339,6 +376,7 @@ def propose_regulations(
         str(k): tuple(v or []) for k, v in flow_to_flights_in.items()
     }
 
+    proposals: List[Dict[str, Any]] = []
     try:
         fallback_cfg = RegenConfig(
             g_min=-float("inf"),
@@ -347,6 +385,9 @@ def propose_regulations(
             distinct_controls_required=False,
             raise_on_edge_cases=True,
         )
+
+
+        
         proposals = propose_regulations_for_hotspot(
             indexer=indexer,
             flight_list=flight_list,
@@ -358,6 +399,7 @@ def propose_regulations(
             flow_to_flights=flow_to_flights,
             config=fallback_cfg,
         )
+
     except ValueError as exc:
         print(f"[regen] Primary proposal attempt failed: {exc}")
     if not proposals:
@@ -416,9 +458,57 @@ def main() -> None:
 
     hotspot_payload = {
         "control_volume_id": "LFBZX15",
-        "window_bins": [45, 46, 47, 48],
+        "window_bins": [45, 49], # means [45, 46, 47, 48]
         "metadata": {},
         "mode": "manual",
+    }
+
+    # Build metadata in the same schema as HotspotInventory descriptors
+    # - flow_to_flights: { flow_id(str): [flight_id(str), ...] }
+    # - flow_proxies: { flow_id(str): [entrants per bin within window] }
+    control_tv = str(hotspot_payload["control_volume_id"])
+    timebins_h = _timebins_from_window(hotspot_payload.get("window_bins", []))
+    set_global_resources(indexer, flight_list)
+    centroids = _tv_centroids(evaluator.traffic_volumes_gdf, indexer)
+    direction_opts = {"mode": "coord_cosine", "tv_centroids": centroids} if centroids else {"mode": "coord_cosine"}
+    flows_payload = compute_flows(
+        tvs=[control_tv],
+        timebins=timebins_h,
+        direction_opts=direction_opts,
+        threshold=leiden_params["threshold"],
+        resolution=leiden_params["resolution"],
+    )
+
+    flow_to_flights: Dict[str, List[str]] = {}
+    flow_proxies: Dict[str, List[float]] = {}
+    for flow in flows_payload.get("flows", []) or []:
+        # Normalize flow id to string
+        try:
+            fid_key = str(int(flow.get("flow_id")))
+        except Exception:
+            fid_key = str(flow.get("flow_id"))
+
+        # Flights for this flow
+        flights: List[str] = []
+        for spec in flow.get("flights", []) or []:
+            fid = spec.get("flight_id")
+            if fid is not None:
+                flights.append(str(fid))
+        flow_to_flights[fid_key] = flights
+
+        # Proxies: entrants per bin within [t0, t1)
+        demand = flow.get("demand") or []
+        proxy: List[float] = []
+        for b in timebins_h:
+            try:
+                proxy.append(float(demand[int(b)]))
+            except Exception:
+                proxy.append(0.0)
+        flow_proxies[fid_key] = proxy
+
+    hotspot_payload["metadata"] = {
+        "flow_to_flights": flow_to_flights,
+        "flow_proxies": flow_proxies,
     }
     print(
         "[regen] Using manual hotspot selection: "

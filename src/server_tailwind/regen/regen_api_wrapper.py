@@ -90,6 +90,10 @@ class RegenAPIWrapper:
             raise ValueError("time_window resolves to no bins for the configured bin size")
         return bins
 
+
+    # INSTRUCTIONS FOR CODING AGENTS AND DEVELOPERS: This function could be a source of inconsistency
+    # since it replicates regen_test_bench_custom_tvtw's _build_capacities_by_tv function
+    # If the objective function seem very high, one common culprit is the normalization of missing capacity values
     def _build_capacities_by_tv(self) -> Dict[str, np.ndarray]:
         if self._capacities_by_tv is not None:
             return self._capacities_by_tv
@@ -188,12 +192,8 @@ class RegenAPIWrapper:
                         slack_min=-float("inf"),
                         distinct_controls_required=False,
                         raise_on_edge_cases=True,
-            )
+            )            
 
-            print("DEBUG: Proposing regulations for hotspot:")
-            print(f"   TV: {tv}")
-            print(f"   Timebins: {timebins_h}")
-            print(f"   My config: {my_cfg}")
 
             proposals = propose_regulations_for_hotspot(
                 indexer=self._indexer,
@@ -207,6 +207,8 @@ class RegenAPIWrapper:
                 weights=None,
                 config=my_cfg,
             )
+
+
             return flows_payload, flow_to_flights, proposals
 
         flows_payload, flow_to_flights, proposals = await loop.run_in_executor(self._executor, _compute)
