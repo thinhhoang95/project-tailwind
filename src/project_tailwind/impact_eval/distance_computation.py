@@ -1,8 +1,8 @@
 import json
-import networkx as nx
-import numpy as np
-from typing import Dict, List, Tuple
 import warnings
+from typing import Dict, List, Tuple
+
+import numpy as np
 
 # Suppress networkx warnings for better output
 warnings.filterwarnings("ignore")
@@ -18,6 +18,13 @@ def load_route_graph(gml_path: str) -> Dict[str, Tuple[float, float]]:
     Returns:
         Dictionary mapping waypoint names to (lat, lon) tuples
     """
+    try:
+        import networkx as nx
+    except ModuleNotFoundError as exc:  # pragma: no cover - environment guard
+        raise ModuleNotFoundError(
+            "The 'networkx' dependency is required to load route graphs."
+        ) from exc
+
     graph = nx.read_gml(gml_path)
     waypoint_coords = {}
     

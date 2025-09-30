@@ -7,6 +7,9 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from statistics import median
+import threading
+import hashlib
+import json
 from typing import Any, Callable, ContextManager, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -20,6 +23,7 @@ from parrhesia.optim.objective import (
     ScoreContext,
     build_score_context,
 )
+from .monitoring import GlobalStatsHook
 
 
 def _coerce_to_datetime(value: Any) -> Optional[datetime]:
@@ -80,7 +84,6 @@ class RateFinderConfig:
     )
     passes: int = 2
     epsilon: float = 1e-3
-    max_eval_calls: int = 256
     cache_size: int = 256
     objective_weights: Optional[Dict[str, float]] = None
     use_adaptive_grid: bool = False
@@ -117,6 +120,7 @@ class RateFinder:
         indexer: TVTWIndexer,
         config: Optional[RateFinderConfig] = None,
         timer: Optional[Callable[[str], ContextManager[Any]]] = None,
+        monitoring: Optional[GlobalStatsHook] = None,
     ) -> None:
         self.evaluator = evaluator
         self._base_flight_list = flight_list
@@ -129,14 +133,76 @@ class RateFinder:
         self._rate_grid_cache: "OrderedDict[Tuple, Tuple[float, ...]]" = OrderedDict()
         self._base_occ_cache: "OrderedDict[Tuple[str, str], Tuple[np.ndarray, np.ndarray]]" = OrderedDict()
         self._timer_factory = timer
+        self._lock = threading.RLock()
+        self._global_stats = monitoring
 
     def _timed(self, name: str) -> ContextManager[Any]:
         if self._timer_factory is None:
             return nullcontext()
         return self._timer_factory(name)
 
+    @staticmethod
+    def _candidate_id_from_signature(signature: Tuple) -> str:
+        try:
+            payload = json.dumps(signature, default=str, ensure_ascii=False)
+        except Exception:
+            payload = repr(signature)
+        digest = hashlib.sha1(payload.encode("utf-8", "replace")).hexdigest()
+        return digest[:16]
+
+    def _notify_candidate_scored(
+        self,
+        *,
+        signature: Tuple,
+        objective: float,
+        delta_j: float,
+        control_volume_id: str,
+        window_bins: Tuple[int, int],
+        mode: str,
+        rates_map: Mapping[str, float],
+        flow_map: Mapping[str, Sequence[str]],
+        entrants_counts: Mapping[str, int],
+    ) -> None:
+        if self._global_stats is None:
+            return
+        candidate_id = self._candidate_id_from_signature(signature)
+        flow_serialized = {str(k): [str(x) for x in v] for k, v in flow_map.items()}
+        entrants_serialized = {str(k): int(v) for k, v in entrants_counts.items()}
+        rates_serialized = {str(k): float(v) for k, v in rates_map.items()}
+        self._global_stats.on_candidate_scored(
+            candidate_id,
+            float(objective),
+            float(delta_j),
+            {
+                "control_volume_id": str(control_volume_id),
+                "window_bins": [int(window_bins[0]), int(window_bins[1])],
+                "mode": str(mode),
+                "rates": rates_serialized,
+                "flow_to_flights": flow_serialized,
+                "entrants_by_flow": entrants_serialized,
+            },
+        )
+
     # ------------------------------------------------------------------
     def find_rates(
+        self,
+        *,
+        plan_state: PlanState,
+        control_volume_id: str,
+        window_bins: Tuple[int, int],
+        flows: Mapping[str, Sequence[str]],
+        mode: str = "per_flow",
+    ) -> Tuple[Union[int, Dict[str, float]], float, Dict[str, object]]:
+        with self._lock:
+            return self._find_rates_locked(
+                plan_state=plan_state,
+                control_volume_id=control_volume_id,
+                window_bins=window_bins,
+                flows=flows,
+                mode=mode,
+            )
+
+    def _find_rates_locked(
         self,
         *,
         plan_state: PlanState,
@@ -153,6 +219,11 @@ class RateFinder:
         if not flow_ids:
             return ({} if mode == "per_flow" else math.inf, 0.0, {"reason": "no_flows"})
 
+        flow_map_serializable: Dict[str, List[str]] = {
+            str(fid): [str(f) for f in flights]
+            for fid, flights in flow_map.items()
+        }
+
         window_start = int(window_bins[0])
         window_end = int(window_bins[1])
         if window_end <= window_start:
@@ -162,6 +233,9 @@ class RateFinder:
 
         with self._timed("rate_finder.compute_entrants"):
             entrants = self._compute_entrants(control_volume_id, active_windows, flow_map)
+        entrants_counts = {str(fid): len(values) for fid, values in entrants.items()}
+        for fid in flow_ids:
+            entrants_counts.setdefault(str(fid), 0)
 
         with self._timed("rate_finder.resolve_rate_grid"):
             rate_grid = self._resolve_rate_grid(
@@ -236,11 +310,6 @@ class RateFinder:
         # Adaptive pass control
         passes_to_use = 1 if bool(self.config.use_adaptive_grid) else int(self.config.passes)
 
-        # Evaluation call budgeting
-        rate_grid_len = len(rate_grid)
-        flow_count = len(context_flow_ids)
-        eval_call_limit = min(int(self.config.max_eval_calls), int(flow_count) * (int(rate_grid_len) + 3))
-
         if mode == "per_flow":
             best_rates: Dict[str, float] = {fid: math.inf for fid in context_flow_ids}
             history_out: Dict[str, Dict[str, float]] = {fid: {} for fid in context_flow_ids}
@@ -252,6 +321,8 @@ class RateFinder:
                         break
                     for rate in rate_grid:
                         rate_val = float(rate)
+                        candidate_rates = dict(best_rates)
+                        candidate_rates[flow_id] = rate_val
                         rates_tuple = self._as_rate_tuple(best_rates, context_flow_ids, override=(flow_id, rate_val))
                         signature = self._candidate_signature(
                             plan_key,
@@ -266,8 +337,6 @@ class RateFinder:
                             result = cached_result
                             cache_hits += 1
                         else:
-                            candidate_rates = dict(best_rates)
-                            candidate_rates[flow_id] = rate_val
                             with self._timed("rate_finder.build_schedule"):
                                 schedule = self._build_schedule_from_rates(
                                     rates_map=candidate_rates,
@@ -286,8 +355,17 @@ class RateFinder:
                                     baseline_obj=baseline_obj,
                                 )
                             eval_calls += 1
-                            if eval_calls >= eval_call_limit:
-                                stopped_early = True
+                        self._notify_candidate_scored(
+                            signature=signature,
+                            objective=result.objective,
+                            delta_j=result.delta_j,
+                            control_volume_id=str(control_volume_id),
+                            window_bins=window_bins,
+                            mode=mode,
+                            rates_map=candidate_rates,
+                            flow_map=flow_map_serializable,
+                            entrants_counts=entrants_counts,
+                        )
                         history_out.setdefault(flow_id, {})[str(rate_val)] = result.delta_j
                         if result.delta_j < best_delta:
                             best_delta = result.delta_j
@@ -338,6 +416,7 @@ class RateFinder:
                 prev_delta = best_delta
                 for rate in rate_grid:
                     rate_val = float(rate)
+                    candidate_rates = {context_flow_ids[0]: rate_val}
                     rates_tuple = (rate_val,)
                     signature = self._candidate_signature(
                         plan_key,
@@ -352,7 +431,6 @@ class RateFinder:
                         result = cached_result
                         cache_hits += 1
                     else:
-                        candidate_rates = {context_flow_ids[0]: rate_val}
                         with self._timed("rate_finder.build_schedule"):
                             schedule = self._build_schedule_from_rates(
                                 rates_map=candidate_rates,
@@ -371,8 +449,17 @@ class RateFinder:
                                 baseline_obj=baseline_obj,
                             )
                         eval_calls += 1
-                        if eval_calls >= eval_call_limit:
-                            stopped_early = True
+                    self._notify_candidate_scored(
+                        signature=signature,
+                        objective=result.objective,
+                        delta_j=result.delta_j,
+                        control_volume_id=str(control_volume_id),
+                        window_bins=window_bins,
+                        mode=mode,
+                        rates_map=candidate_rates,
+                        flow_map=flow_map_serializable,
+                        entrants_counts=entrants_counts,
+                    )
                     history_out.setdefault("__blanket__", {})[str(rate_val)] = result.delta_j
                     if result.delta_j < best_delta:
                         best_delta = result.delta_j
@@ -442,7 +529,18 @@ class RateFinder:
                     context=context,
                     baseline_obj=baseline_obj,
                 )
-            eval_calls += 1
+
+        self._notify_candidate_scored(
+            signature=final_signature,
+            objective=final_result.objective,
+            delta_j=final_result.delta_j,
+            control_volume_id=str(control_volume_id),
+            window_bins=window_bins,
+            mode=mode,
+            rates_map=final_rates_map,
+            flow_map=flow_map_serializable,
+            entrants_counts=entrants_counts,
+        )
 
         best_delta = final_result.delta_j
         best_objective = final_result.objective
@@ -725,6 +823,7 @@ class RateFinder:
             pass
 
         if use_fast:
+            raise NotImplementedError("Fast scorer is currently not supported because it is very buggy. It is out of commission for now.")
             # Build occ_by_tv for the single control TV using base caches + schedule sum
             T = int(self._indexer.num_time_bins)
             sched_sum = np.zeros(T, dtype=np.int64)
@@ -770,6 +869,8 @@ class RateFinder:
             except Exception:
                 pass
         else:
+            # If we don't use a fast scorer, we use the same scorer in `safespill_objective`
+            # which is the same as objective.py used by the API endpoints
             with self._timed("rate_finder.score_with_context.candidate"):
                 objective, components, artifacts = score_with_context(
                     schedule,

@@ -41,7 +41,8 @@ dependencies = [
     "alns",
     "python-jose[cryptography]",
     "passlib[bcrypt]",
-    "python-multipart"
+    "python-multipart",
+    "jay"
 ]
 
 [project.optional-dependencies]

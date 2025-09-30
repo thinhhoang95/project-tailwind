@@ -15,6 +15,7 @@ from .query.NLPQueryParser import (
     NLPQueryParser,
     NLPQueryParserError,
 )
+from .regen.regen_api_wrapper import RegenAPIWrapper
 from .core.resources import get_resources
 from parrhesia.api.base_evaluation import compute_base_evaluation
 from parrhesia.api.automatic_rate_adjustment import compute_automatic_rate_adjustment
@@ -40,6 +41,8 @@ flows_wrapper = FlowsWrapper()
 count_wrapper = CountAPIWrapper()
 query_wrapper = QueryAPIWrapper()
 nlp_query_parser = NLPQueryParser(resources=_res, query_wrapper=query_wrapper)
+regen_wrapper = RegenAPIWrapper()
+
 
 # Auth utilities (kept separate so endpoints remain pure)
 from .auth import (
@@ -644,6 +647,56 @@ async def regulation_plan_simulation(request: Dict[str, Any], current_user: dict
             include_excess_vector=include_excess_vector,
         )
         return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/propose_regulations")
+async def post_propose_regulations(request: Dict[str, Any], current_user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+    """Generate top-k regulation proposals for a hotspot time window."""
+    if not isinstance(request, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+
+    tv = request.get("traffic_volume_id")
+    if not isinstance(tv, str) or not tv.strip():
+        raise HTTPException(status_code=400, detail="'traffic_volume_id' is required")
+
+    time_window = request.get("time_window")
+    if not isinstance(time_window, str) or not time_window.strip():
+        raise HTTPException(status_code=400, detail="'time_window' is required")
+
+    top_k = request.get("top_k_regulations")
+    threshold_raw = request.get("threshold")
+    resolution_raw = request.get("resolution")
+
+    threshold: Optional[float]
+    resolution: Optional[float]
+
+    try:
+        threshold = None if threshold_raw is None else float(threshold_raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="'threshold' must be a number")
+
+    try:
+        resolution = None if resolution_raw is None else float(resolution_raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="'resolution' must be a number")
+
+    if threshold is not None and not (0.0 <= threshold <= 1.0):
+        raise HTTPException(status_code=400, detail="'threshold' must be between 0 and 1")
+    if resolution is not None and resolution <= 0.0:
+        raise HTTPException(status_code=400, detail="'resolution' must be greater than 0")
+
+    try:
+        return await regen_wrapper.propose_regulations(
+            traffic_volume_id=tv,
+            time_window=time_window,
+            top_k_regulations=top_k,
+            threshold=threshold,
+            resolution=resolution,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

@@ -46,13 +46,17 @@ Module: src/parrhesia/flow_agent/mcts.py
 
 Classes
 - MCTSConfig
-  - c_puct: float = 2.0 — PUCT exploration constant
+  - c_puct: float = 4.0 — PUCT exploration constant
   - alpha: float = 0.7, k0: int = 4, k1: float = 1.0 — widening schedule m(s) = k0 + k1·N(s)^alpha
   - widen_batch_size: int = 2 — expand new children in small batches (implemented as 1-at-a-time deterministic expansion)
   - commit_depth: int = 1 — max commits per simulation
   - max_sims: int = 24, max_time_s: float = 20.0 — simulation and time budgets
   - commit_eval_limit: int = 3 — hard cap on RateFinder calls per MCTS.run()
-  - priors_temperature: float = 1.0 — temperature for softmax priors
+  - priors_temperature: float = 4.0 — temperature for softmax priors
+  - root_dirichlet_epsilon: float = 0.25, root_dirichlet_alpha: float = 0.3 — Dirichlet noise blended into root priors each run
+  - hotspot_dirichlet_epsilon: float = 0.3, hotspot_dirichlet_alpha: float = 0.5 — Noise at the first hotspot-selection node to diversify candidates
+  - flow_dirichlet_epsilon: float = 0.3, flow_dirichlet_alpha: float = 0.4 — Lighter noise for the first flow-selection node in a simulation
+  - min_unique_commit_evals: int = 6 — Target number of unique RateFinder evaluations before the search relaxes forced exploration
   - phi_scale: float = 1.0 — scale for potential φ(s)
   - seed: int = 0 — RNG seeding for determinism
 
@@ -67,10 +71,11 @@ Internal structures
 ## Priors and Progressive Widening
 
 Priors
-- Derived heuristically from flow “proxies” (histograms of entrants within the hotspot window). A larger mass of entrants yields a higher prior for AddFlow(flow_id).
+- Derived heuristically from flow “proxies” (histograms of entrants within the hotspot window). A log1p transform flattens large entrant counts so AddFlow(flow_id) doesn’t overwhelm Continue/Back/Stop.
 - For PickHotspot actions, priors are proportional to a supplied `hotspot_prior` in `PlanState.metadata["hotspot_candidates"]`.
 - RemoveFlow is mildly discouraged initially; Continue, Commit, Back, Stop receive neutral/low priors.
-- Softmax with temperature combines to a probability distribution used by PUCT.
+- Softmax with temperature combines to a probability distribution used by PUCT. Dirichlet noise (ε=0.25, α=0.3 at the root; ε≈0.3, α=0.5 on the first hotspot-selection node; ε≈0.3, α=0.4 on the first flow-selection node) keeps early simulations from collapsing onto one branch.
+- Continue’s prior is slightly reduced so the search grows larger flow sets before committing, and repeated commit signatures trigger additional RateFinder probes until six unique evaluations are collected.
 
 Progressive widening
 - Each node permits at most m(s) = k0 + k1·N(s)^alpha children. When new visits arrive, the highest-prior unexpanded action is added first.

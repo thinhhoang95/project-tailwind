@@ -445,7 +445,7 @@ Notes
 
 ### POST `/regulation_plan_simulation`
 
-Simulates a regulation plan and returns per-flight delays, evaluation metrics, and rolling-hour occupancy for the top-K busiest TVs across all traffic volumes. TVs are ranked by max(pre_rolling_count − hourly_capacity) computed over the union of all active time windows provided in the plan. Also returns `pre_flight_context` with baseline takeoff and TV-arrival times for flights present in `delays_by_flight`.
+Simulates a regulation plan, applies the shared flow-based objective, and returns per-flight delay minutes plus rolling-hour occupancy for every TV that changes. The response also includes `pre_flight_context` with baseline takeoff and TV-arrival timestamps for flights that receive delays.
 
 You can provide regulations as raw strings in the `Regulation` DSL or as structured objects.
 
@@ -471,11 +471,12 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
 
 **Notes:**
 - `regulations`: List of either raw strings like `TV_<LOC> <FILTER> <RATE> <TW>` or objects with `location`, `rate`, `time_windows`, and optional `filter_type`, `filter_value`, `target_flight_ids`.
-- `weights`: Optional objective weights for combining overload and delay components.
-- Deprecated: `top_k` is accepted but ignored for one release (for backward compatibility). The response includes all changed TVs in stable row order (no ranking). If `top_k` is present, a deprecation note is added under `metadata.deprecated`.
-- `include_excess_vector`: If true, returns the full post-regulation excess vector; otherwise returns compact stats.
-- Hours/bins with no capacity are skipped when computing busy-ness.
-- Ranking metric: `max(pre_rolling_count - hourly_capacity)` over the union mask of active regulation windows.
+- `weights`: Optional overrides for `parrhesia.optim.objective.ObjectiveWeights`. Provide only the fields you want to change (e.g., `{"alpha_gt": 5.0, "gamma_ctx": 0.25}`). Legacy `{alpha,beta,gamma,delta}` still work for the fallback hourly objective stored under `legacy_objective`.
+- Deprecated: `top_k` is accepted but ignored for one release (backward compatibility). The response includes all changed TVs in stable row order. If `top_k` is present, a deprecation note is added under `metadata.deprecated`.
+- `include_excess_vector`: If true, returns the full post-regulation excess vector; otherwise returns compact stats (`excess_vector_stats`).
+- Each regulation becomes a flow; per-flow demand histograms are capped using the supplied hourly rate (distributed across bins) before scoring.
+- Ripple cells are auto-derived with a ±2-bin shoulder from the flights covered by the regulations.
+- `objective` is the total from `parrhesia.optim.objective.score`. `objective_components` enumerates all active terms (`J_cap`, `J_delay`, `J_reg`, `J_tv`, and optionally `J_share`, `J_spill`). The legacy hourly combination remains under `legacy_objective(_components)` for one release.
 
 **Response:**
 ```json
@@ -485,15 +486,21 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
     "F1": {"takeoff_time": "07:12:05", "tv_arrival_time": "08:00:12"}
   },
   "delay_stats": {
-    "total_delay_seconds": 300.0,
-    "mean_delay_seconds": 150.0,
-    "max_delay_seconds": 300.0,
-    "min_delay_seconds": 0.0,
-    "delayed_flights_count": 1,
-    "num_flights": 2
+    "total_delay_minutes": 12.0,
+    "total_delay_seconds": 720.0,
+    "mean_delay_minutes": 6.0,
+    "max_delay_minutes": 12.0,
+    "num_flights": 2,
+    "num_delayed": 1
   },
-  "objective": 12.0,
+  "objective": 87.4,
   "objective_components": {
+    "J_cap": 55.0,
+    "J_delay": 18.0,
+    "J_reg": 8.4,
+    "J_tv": 6.0
+  },
+  "legacy_objective_components": {
     "z_sum": 10.0,
     "z_max": 5.0,
     "delay_min": 5.0,
@@ -514,12 +521,29 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
   ],
   "rolling_top_tvs": [ ... same as rolling_changed_tvs ... ],
   "excess_vector_stats": {"sum": 10.0, "max": 3.0, "mean": 0.1, "count": 9600},
+  "weights_used": {
+    "alpha_gt": 10.0,
+    "alpha_rip": 3.0,
+    "alpha_ctx": 0.5,
+    "beta_gt": 0.1,
+    "beta_rip": 0.5,
+    "beta_ctx": 1.0,
+    "gamma_gt": 0.1,
+    "gamma_rip": 0.25,
+    "gamma_ctx": 0.5,
+    "lambda_delay": 0.1,
+    "theta_share": 0.0,
+    "eta_spill": 0.0,
+    "class_tolerance_w": 1
+  },
   "metadata": {
     "time_bin_minutes": 15,
     "bins_per_tv": 384,
     "bins_per_hour": 4,
     "num_traffic_volumes": 1,
     "num_changed_tvs": 1,
+    "num_flows": 1,
+    "tvs_scored": ["TVA"],
     "deprecated": {
       "top_k": "accepted but ignored; will be removed in next release",
       "rolling_top_tvs": "alias of rolling_changed_tvs for one release"
@@ -529,12 +553,13 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
 ```
 
 Fields:
-- `pre_flight_context`: Map of flight ID → `{takeoff_time, tv_arrival_time}` strings (HH:MM:SS). `tv_arrival_time` can be `null` if the flight does not enter any regulated traffic volume.
-
-Fields:
+- `delays_by_flight`: Minutes of delay applied per flight (integers, spill captured in overflow bin if present).
 - `pre_flight_context`: Map of flight ID → `{takeoff_time, tv_arrival_time}` strings (HH:MM:SS). `tv_arrival_time` can be `null` if the flight does not enter any regulated traffic volume.
 - `rolling_changed_tvs`: All TVs where any raw occupancy bin changed due to the plan; arrays are full-length per TV. Results are returned in stable TV row order (no ranking or top-k selection).
 - `rolling_top_tvs`: Deprecated alias, equal to `rolling_changed_tvs` for one release.
+- `weights_used`: Snapshot of the resolved `ObjectiveWeights` applied during scoring (helpful when partial overrides are supplied).
+- `metadata.num_flows`: Count of flow schedules evaluated by the objective.
+- `metadata.tvs_scored`: Alphabetical list of TVs included in the scoring window (targets ∪ ripple).
 - `metadata.num_changed_tvs`: Count of changed TVs.
 
 **cURL Example:**
@@ -1278,7 +1303,7 @@ Notes
 
 ### POST `/regulation_plan_simulation`
 
-Simulates a regulation plan and returns per-flight delays, evaluation metrics, and rolling-hour occupancy for the top-K busiest TVs across all traffic volumes. TVs are ranked by max(pre_rolling_count − hourly_capacity) computed over the union of all active time windows provided in the plan. Also returns `pre_flight_context` with baseline takeoff and TV-arrival times for flights present in `delays_by_flight`.
+Simulates a regulation plan, applies the shared flow-based objective, and returns per-flight delay minutes plus rolling-hour occupancy for every TV that changes. The response also includes `pre_flight_context` with baseline takeoff and TV-arrival timestamps for flights that receive delays.
 
 You can provide regulations as raw strings in the `Regulation` DSL or as structured objects.
 
@@ -1304,11 +1329,12 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
 
 **Notes:**
 - `regulations`: List of either raw strings like `TV_<LOC> <FILTER> <RATE> <TW>` or objects with `location`, `rate`, `time_windows`, and optional `filter_type`, `filter_value`, `target_flight_ids`.
-- `weights`: Optional objective weights for combining overload and delay components.
-- Deprecated: `top_k` is accepted but ignored for one release (for backward compatibility). The response includes all changed TVs in stable row order (no ranking). If `top_k` is present, a deprecation note is added under `metadata.deprecated`.
-- `include_excess_vector`: If true, returns the full post-regulation excess vector; otherwise returns compact stats.
-- Hours/bins with no capacity are skipped when computing busy-ness.
-- Ranking metric: `max(pre_rolling_count - hourly_capacity)` over the union mask of active regulation windows.
+- `weights`: Optional overrides for `parrhesia.optim.objective.ObjectiveWeights`. Provide only the fields you want to change (e.g., `{"alpha_gt": 5.0, "gamma_ctx": 0.25}`). Legacy `{alpha,beta,gamma,delta}` still work for the fallback hourly objective stored under `legacy_objective`.
+- Deprecated: `top_k` is accepted but ignored for one release (backward compatibility). The response includes all changed TVs in stable row order. If `top_k` is present, a deprecation note is added under `metadata.deprecated`.
+- `include_excess_vector`: If true, returns the full post-regulation excess vector; otherwise returns compact stats (`excess_vector_stats`).
+- Each regulation becomes a flow; per-flow demand histograms are capped using the supplied hourly rate (distributed across bins) before scoring.
+- Ripple cells are auto-derived with a ±2-bin shoulder from the flights covered by the regulations.
+- `objective` is the total from `parrhesia.optim.objective.score`. `objective_components` enumerates all active terms (`J_cap`, `J_delay`, `J_reg`, `J_tv`, and optionally `J_share`, `J_spill`). The legacy hourly combination remains under `legacy_objective(_components)` for one release.
 
 **Response:**
 ```json
@@ -1318,15 +1344,21 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
     "F1": {"takeoff_time": "07:12:05", "tv_arrival_time": "08:00:12"}
   },
   "delay_stats": {
-    "total_delay_seconds": 300.0,
-    "mean_delay_seconds": 150.0,
-    "max_delay_seconds": 300.0,
-    "min_delay_seconds": 0.0,
-    "delayed_flights_count": 1,
-    "num_flights": 2
+    "total_delay_minutes": 12.0,
+    "total_delay_seconds": 720.0,
+    "mean_delay_minutes": 6.0,
+    "max_delay_minutes": 12.0,
+    "num_flights": 2,
+    "num_delayed": 1
   },
-  "objective": 12.0,
+  "objective": 87.4,
   "objective_components": {
+    "J_cap": 55.0,
+    "J_delay": 18.0,
+    "J_reg": 8.4,
+    "J_tv": 6.0
+  },
+  "legacy_objective_components": {
     "z_sum": 10.0,
     "z_max": 5.0,
     "delay_min": 5.0,
@@ -1347,12 +1379,29 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
   ],
   "rolling_top_tvs": [ ... same as rolling_changed_tvs ... ],
   "excess_vector_stats": {"sum": 10.0, "max": 3.0, "mean": 0.1, "count": 9600},
+  "weights_used": {
+    "alpha_gt": 10.0,
+    "alpha_rip": 3.0,
+    "alpha_ctx": 0.5,
+    "beta_gt": 0.1,
+    "beta_rip": 0.5,
+    "beta_ctx": 1.0,
+    "gamma_gt": 0.1,
+    "gamma_rip": 0.25,
+    "gamma_ctx": 0.5,
+    "lambda_delay": 0.1,
+    "theta_share": 0.0,
+    "eta_spill": 0.0,
+    "class_tolerance_w": 1
+  },
   "metadata": {
     "time_bin_minutes": 15,
     "bins_per_tv": 384,
     "bins_per_hour": 4,
     "num_traffic_volumes": 1,
     "num_changed_tvs": 1,
+    "num_flows": 1,
+    "tvs_scored": ["TVA"],
     "deprecated": {
       "top_k": "accepted but ignored; will be removed in next release",
       "rolling_top_tvs": "alias of rolling_changed_tvs for one release"
@@ -1362,12 +1411,13 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
 ```
 
 Fields:
-- `pre_flight_context`: Map of flight ID → `{takeoff_time, tv_arrival_time}` strings (HH:MM:SS). `tv_arrival_time` can be `null` if the flight does not enter any regulated traffic volume.
-
-Fields:
+- `delays_by_flight`: Minutes of delay applied per flight (integers, spill captured in overflow bin if present).
 - `pre_flight_context`: Map of flight ID → `{takeoff_time, tv_arrival_time}` strings (HH:MM:SS). `tv_arrival_time` can be `null` if the flight does not enter any regulated traffic volume.
 - `rolling_changed_tvs`: All TVs where any raw occupancy bin changed due to the plan; arrays are full-length per TV. Results are returned in stable TV row order (no ranking or top-k selection).
 - `rolling_top_tvs`: Deprecated alias, equal to `rolling_changed_tvs` for one release.
+- `weights_used`: Snapshot of the resolved `ObjectiveWeights` applied during scoring (helpful when partial overrides are supplied).
+- `metadata.num_flows`: Count of flow schedules evaluated by the objective.
+- `metadata.tvs_scored`: Alphabetical list of TVs included in the scoring window (targets ∪ ripple).
 - `metadata.num_changed_tvs`: Count of changed TVs.
 
 **cURL Example:**
