@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+import logging
 import numpy as np
 
 from .bundles import build_candidate_bundles
@@ -40,6 +41,9 @@ from parrhesia.optim.ripple import compute_auto_ripple_cells
 AUTO_RIPPLE_DILATION_BINS = 2
 
 
+logger = logging.getLogger(__name__)
+
+
 def _flow_ids_from_rates(rates: Sequence[RateCut]) -> List[int]:
     return sorted({int(rc.flow_id) for rc in rates})
 
@@ -74,6 +78,45 @@ def _bundle_overlap_score(candidate: BundleVariant, selected: Sequence[BundleVar
 
 def _build_target_cells(hotspot_tv: str, timebins_h: Sequence[int]) -> List[Tuple[str, int]]:
     return [(str(hotspot_tv), int(b)) for b in timebins_h]
+
+
+def _log_capacity_snapshot(
+    label: str,
+    tv_ids: Sequence[str],
+    capacities_by_tv: Mapping[str, np.ndarray],
+    timebins: Sequence[int],
+    max_entries: int = 8,
+) -> None:
+    ids_unique = list(dict.fromkeys(str(tv) for tv in tv_ids))
+    if not ids_unique:
+        print("Regen: capacity snapshot [%s] skipped (no TVs)", label)
+        return
+    truncated = len(ids_unique) > max_entries
+    ids_for_log = ids_unique[:max_entries]
+    entries: List[str] = []
+    for tv in ids_for_log:
+        arr = capacities_by_tv.get(str(tv))
+        if arr is None:
+            entries.append(f"{tv}:missing")
+            continue
+        arr_np = np.asarray(arr, dtype=np.float64)
+        if arr_np.size == 0:
+            entries.append(f"{tv}:empty")
+            continue
+        if timebins:
+            valid_bins = [b for b in timebins if 0 <= int(b) < arr_np.size]
+            slice_vals = arr_np[valid_bins] if valid_bins else np.asarray([], dtype=np.float64)
+        else:
+            slice_vals = arr_np
+        if slice_vals.size == 0:
+            entries.append(f"{tv}:no-window-data")
+            continue
+        entries.append(
+            f"{tv}:min={float(slice_vals.min()):.1f},max={float(slice_vals.max()):.1f},mean={float(slice_vals.mean()):.1f}"
+        )
+    if truncated:
+        entries.append(f"... {len(ids_unique) - max_entries} more")
+    print("Regen: capacity snapshot [%s] %s", label, "; ".join(entries))
 
 
 def _tvs_traversed_by_flows(*, flights_by_flow: Mapping[int, Sequence[Mapping[str, Any]]], flight_list: Any, indexer) -> List[str]:
@@ -247,48 +290,17 @@ def propose_regulations_for_hotspot(
     # Optional: add two shoulder timebins to cover the "dumping" effect from unreleased flights in the queue, not used for now
     # timebins_seq_with_shoulder = timebins_seq + [timebins_seq[-1] + 1, timebins_seq[-1] + 2] # add two shoulder timebins to cover the "dumping" effect from unreleased flights in the queue
     
+    # Target cells: hotspot TV across designated hotspot timebins
     target_cells = _build_target_cells(hotspot_tv, timebins_seq)
-
-    # Ripple cells from union of flow flight footprints with ±window dilation
-    flight_ids_all: List[str] = []
-    for _fid, specs in flights_by_flow.items():
-        for sp in (specs or ()):  # each spec is a mapping with 'flight_id'
-            fid = sp.get("flight_id") if isinstance(sp, dict) else None
-            if fid is None:
-                continue
-            flight_ids_all.append(str(fid))
-    ripple_cells = compute_auto_ripple_cells(
-        indexer=indexer,
-        flight_list=flight_list,
-        flight_ids=sorted(set(flight_ids_all)),
-        window_bins=AUTO_RIPPLE_DILATION_BINS,
-    )
-    ripple_tv_ids = sorted({str(tv) for (tv, _b) in ripple_cells})
-    tv_filter = sorted({str(hotspot_tv)} | set(ripple_tv_ids))
-
-    # Context mirrors the simulated annealing scoring: hotspot is target;
-    # other TVs inside the localized filter become ripple within the window.
-    context = build_local_context(
-        indexer=indexer,
-        flight_list=flight_list,
-        capacities_by_tv=capacities_by_tv,
-        target_cells=target_cells,
-        flights_by_flow=flights_by_flow,
-        weights=None,
-        tv_filter=tv_filter,
-        ripple_cells=ripple_cells,
-    )
-    baseline_schedule = baseline_schedule_from_context(context)
-    context_flow_ids = set(int(fid) for fid in baseline_schedule.keys())
-    demand_by_flow = {
-        int(fid): np.asarray(arr, dtype=np.int64)
-        for fid, arr in demand_by_flow.items()
-        if int(fid) in context_flow_ids
-    }
+    _log_capacity_snapshot("hotspot", [hotspot_tv], capacities_by_tv, timebins_seq)
 
     candidates: List[Tuple[BundleVariant, PredictedImprovement, Dict[str, Any]]] = []
     total_bins = int(getattr(indexer, "num_time_bins"))
+
+
+    # Each bundle is one regulation proposal that could contain one, two or more flows
     for bundle in bundles:
+        # 1) Select evaluation window for this bundle
         window = select_window_for_bundle(
             bundle,
             bins_per_hour=bins_per_hour,
@@ -296,9 +308,49 @@ def propose_regulations_for_hotspot(
             margin_hours=cfg.window_margin_hours,
             min_window_hours=cfg.min_window_hours,
         )
+        # 2) Build base rate cuts for this bundle
         base_cuts = rate_cuts_for_bundle(bundle, E_target=E_target, bins_per_hour=bins_per_hour)
         if not base_cuts:
             continue
+        # 3) Compute per-bundle ripple cells from flights of flows in the bundle only,
+        #    then derive tv_filter = hotspot ∪ ripple TVs.
+        bundle_flow_ids = [int(fs.flow_id) for fs in bundle.flows]
+        bundle_flight_ids: List[str] = []
+        for fid in bundle_flow_ids:
+            for sp in (flights_by_flow.get(int(fid)) or ()):  # each spec is a mapping with 'flight_id'
+                _sp_fid = sp.get("flight_id") if isinstance(sp, dict) else None
+                if _sp_fid is None:
+                    continue
+                bundle_flight_ids.append(str(_sp_fid))
+        bundle_ripple_cells = compute_auto_ripple_cells(
+            indexer=indexer,
+            flight_list=flight_list,
+            flight_ids=sorted(set(bundle_flight_ids)),
+            window_bins=AUTO_RIPPLE_DILATION_BINS,
+        )
+        bundle_ripple_tvs = sorted({str(tv) for (tv, _b) in bundle_ripple_cells})
+        bundle_tv_filter = sorted({str(hotspot_tv)} | set(bundle_ripple_tvs))
+        _log_capacity_snapshot("tv_filter", bundle_tv_filter, capacities_by_tv, timebins_seq)
+
+        # 4) Build a localized scoring context per-bundle so that ripple/target TVs are correct.
+        #    Context mirrors the simulated annealing scoring: hotspot is target; TVs in tv_filter act as ripple.
+        context_bundle = build_local_context(
+            indexer=indexer,
+            flight_list=flight_list,
+            capacities_by_tv=capacities_by_tv,
+            target_cells=target_cells,
+            flights_by_flow=flights_by_flow,
+            weights=None,
+            tv_filter=bundle_tv_filter,
+            ripple_cells=bundle_ripple_cells,
+        )
+        baseline_schedule = baseline_schedule_from_context(context_bundle)
+        context_flow_ids = set(int(fid) for fid in baseline_schedule.keys())
+        demand_for_context = {
+            int(fid): np.asarray(arr, dtype=np.int64)
+            for fid, arr in demand_by_flow.items()
+            if int(fid) in context_flow_ids
+        }
         variants = local_search_variants(
             bundle,
             base_cuts,
@@ -313,7 +365,7 @@ def propose_regulations_for_hotspot(
         for rates in variants:
             regulated_schedule = apply_regulation_to_schedule(
                 baseline_schedule,
-                demand_by_flow,
+                demand_for_context,
                 rates=rates,
                 indexer=indexer,
                 window=window,
@@ -331,7 +383,7 @@ def propose_regulations_for_hotspot(
                 flights_by_flow=flights_by_flow,
                 capacities_by_tv=capacities_by_tv,
                 flight_list=flight_list,
-                context=context,
+                context=context_bundle,
             )
             delta_objective = score_before - score_after
             delta_deficit = compute_delta_deficit_per_hour(
@@ -355,6 +407,9 @@ def propose_regulations_for_hotspot(
                 "weights_used": dict(bundle.weights_by_flow),
                 "E_target": float(E_target),
                 "E_target_occupancy": float(E_target_occ),
+                # Include per-bundle ripple context used for evaluation
+                "ripple_tvs": list(bundle_ripple_tvs),
+                "ripple_cells": [(str(tv), int(b)) for (tv, b) in bundle_ripple_cells],
             }
             if best_variant is None or improvement.delta_objective_score > best_variant[1].delta_objective_score:
                 best_variant = (bundle_variant, improvement, diagnostics)
@@ -444,6 +499,10 @@ def propose_regulations_for_hotspot(
                 flows_info=flows_info,
                 predicted_improvement=improvement,
                 diagnostics=proposal_diag,
+                target_cells=[(str(tv), int(b)) for (tv, b) in target_cells],
+                ripple_cells=list(proposal_diag.get("ripple_cells", [])),
+                target_tvs=[str(hotspot_tv)],
+                ripple_tvs=list(proposal_diag.get("ripple_tvs", [])),
             )
         )
     return proposals

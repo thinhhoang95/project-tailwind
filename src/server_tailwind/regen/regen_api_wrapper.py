@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+import logging
+
 import numpy as np
 
 from parrhesia.flow_agent35.regen.types import RegenConfig
@@ -13,6 +15,10 @@ from server_tailwind.core.resources import get_resources
 from parrhesia.api.flows import compute_flows
 from parrhesia.flow_agent35.regen.config import resolve_weights
 from parrhesia.flow_agent35.regen.engine import propose_regulations_for_hotspot
+from parrhesia.optim.capacity import normalize_capacities
+
+
+logger = logging.getLogger(__name__)
 
 
 class RegenAPIWrapper:
@@ -89,17 +95,44 @@ class RegenAPIWrapper:
             return self._capacities_by_tv
         matrix = self._resources.capacity_per_bin_matrix
         if matrix is None:
+            logger.warning("Regen: AppResources capacity matrix is unavailable; capacities_by_tv will be empty")
             self._capacities_by_tv = {}
             return self._capacities_by_tv
         T = int(self._indexer.num_time_bins)
-        result: Dict[str, np.ndarray] = {}
+        raw_capacities: Dict[str, np.ndarray] = {}
         for tv_id, row_idx in self._tv_to_row.items():
             try:
                 slice_vec = np.asarray(matrix[int(row_idx), :T], dtype=np.float64)
             except Exception:
                 slice_vec = np.full((T,), -1.0, dtype=np.float64)
-            result[str(tv_id)] = slice_vec
-        self._capacities_by_tv = result
+            raw_capacities[str(tv_id)] = slice_vec
+        if raw_capacities:
+            non_positive = [tv for tv, arr in raw_capacities.items() if float(np.max(arr)) <= 0.0]
+            if non_positive:
+                logger.warning(
+                    "Regen: capacity matrix rows are non-positive for %d/%d TVs; sample=%s",
+                    len(non_positive),
+                    len(raw_capacities),
+                    ",".join(non_positive[:5]),
+                )
+        # Normalize: treat missing/zero bins as unconstrained
+        self._capacities_by_tv = normalize_capacities(raw_capacities)
+        if self._capacities_by_tv:
+            sample_items = list(self._capacities_by_tv.items())[:5]
+            sample_stats = []
+            for tv, arr in sample_items:
+                arr_np = np.asarray(arr, dtype=np.float64)
+                if arr_np.size == 0:
+                    sample_stats.append(f"{tv}:empty")
+                    continue
+                sample_stats.append(
+                    f"{tv}:min={float(arr_np.min()):.1f},max={float(arr_np.max()):.1f}"
+                )
+            print(
+                "Regen: normalized capacities ready for %d TVs; samples: %s",
+                len(self._capacities_by_tv),
+                "; ".join(sample_stats),
+            )
         return self._capacities_by_tv
 
     @staticmethod
@@ -263,6 +296,15 @@ class RegenAPIWrapper:
                         "bins": [start_bin, end_bin],
                         "label": control_window_label,
                     },
+                    # Regulation-level scope for inspection
+                    "target_tvs": list(getattr(proposal, "target_tvs", [])),
+                    "target_cells": [
+                        [str(tv_id), int(b)] for (tv_id, b) in getattr(proposal, "target_cells", [])
+                    ],
+                    "ripple_tvs": list(getattr(proposal, "ripple_tvs", [])),
+                    "ripple_cells": [
+                        [str(tv_id), int(b)] for (tv_id, b) in getattr(proposal, "ripple_cells", [])
+                    ],
                     "objective_improvement": {
                         "delta_deficit_per_hour": float(proposal.predicted_improvement.delta_deficit_per_hour),
                         "delta_objective_score": float(proposal.predicted_improvement.delta_objective_score),

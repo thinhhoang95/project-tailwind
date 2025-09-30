@@ -142,3 +142,8 @@ class Proposal:
     flows_info: List[Mapping[str, Any]]
     predicted_improvement: PredictedImprovement
     diagnostics: Mapping[str, Any]
+    # Regulation-level scope: target/ripple TVs and explicit cells
+    target_cells: List[Tuple[str, int]]
+    ripple_cells: List[Tuple[str, int]]
+    target_tvs: List[str]
+    ripple_tvs: List[str]
