@@ -13,10 +13,10 @@
             "console": "integratedTerminal"
         },
         {
-            "name": "regen_test_bench",
+            "name": "Regen (Custom Hotspot)",
             "type": "debugpy",
             "request": "launch",
-            "program": "examples/regen/regen_test_bench.py",
+            "program": "examples/regen/regen_test_bench_custom_tvtw.py",
             "console": "integratedTerminal"
         }
     ]

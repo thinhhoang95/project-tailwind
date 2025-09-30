@@ -26,7 +26,9 @@ artifacts.
 {
   "traffic_volume_id": "MASB5KL",
   "time_window": "09:00-10:15",
-  "top_k_regulations": 5
+  "top_k_regulations": 5,
+  "threshold": 0.15,
+  "resolution": 1.2
 }
 ```
 
@@ -35,11 +37,14 @@ artifacts.
 | `traffic_volume_id` | string | ✔ | Hotspot TV identifier; must exist in the shared TV list. |
 | `time_window` | string | ✔ | Time interval for the hotspot in `HH:MM-HH:MM` (end-exclusive) or `HH:MM:SS-HH:MM:SS`. The server converts this to TVTW bins using the global indexer, so any values that would collapse to zero bins for the configured bin size are rejected. |
 | `top_k_regulations` | integer | ✖ | Optional cap on the number of proposals returned. When omitted, regen’s configured `k_proposals` is used (defaults to 6). |
+| `threshold` | number | ✖ | Optional clustering similarity cutoff passed to `compute_flows`. Must be in `[0,1]`. Defaults to `0.1` when omitted. |
+| `resolution` | number | ✖ | Optional Leiden resolution parameter (>0) passed to `compute_flows`. Defaults to `1.0` when omitted. |
 
 - Times must be same-day and `end > start`. For example, with 15-minute bins a
   75-minute window produces 5 bins.
 - If `top_k_regulations` is supplied it must be positive; otherwise the server
   ignores it.
+- `threshold` outside `[0,1]` or `resolution <= 0` triggers `400` validation errors.
 
 ### Validation failures
 
@@ -180,6 +185,10 @@ Field notes:
 5. **Error Handling** – Domain errors (unknown TV, invalid time window) return
    HTTP 400. Unexpected errors during flow computation or regen raise HTTP 500
    with a generic message; inspect server logs for stack traces.
+6. **Clustering Controls** – `threshold` and `resolution` are forwarded to
+   `compute_flows` to tune the Leiden clustering behaviour. The server validates
+   them (`threshold` in `[0,1]`, `resolution > 0`) before invoking the regen
+   wrapper.
 
 ---
 
@@ -192,7 +201,9 @@ curl -X POST "http://localhost:8000/propose_regulations" \
   -d '{
         "traffic_volume_id": "MASB5KL",
         "time_window": "09:00-10:15",
-        "top_k_regulations": 3
+        "top_k_regulations": 3,
+        "threshold": 0.1,
+        "resolution": 1.0
       }'
 ```
 

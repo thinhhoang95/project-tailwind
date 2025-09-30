@@ -126,6 +126,8 @@ class RegenAPIWrapper:
         traffic_volume_id: str,
         time_window: str,
         top_k_regulations: Optional[int] = None,
+        threshold: Optional[float] = None,
+        resolution: Optional[float] = None,
     ) -> Dict[str, Any]:
         tv = str(traffic_volume_id).strip()
         if tv not in self._tv_to_row:
@@ -142,6 +144,8 @@ class RegenAPIWrapper:
                 tvs=[tv],
                 timebins=list(timebins_h),
                 direction_opts=dir_opts,
+                threshold=threshold,
+                resolution=resolution,
             )
             flow_to_flights = self._flow_id_to_flights(flows_payload)
             
@@ -152,6 +156,11 @@ class RegenAPIWrapper:
                         distinct_controls_required=False,
                         raise_on_edge_cases=True,
             )
+
+            print("DEBUG: Proposing regulations for hotspot:")
+            print(f"   TV: {tv}")
+            print(f"   Timebins: {timebins_h}")
+            print(f"   My config: {my_cfg}")
 
             proposals = propose_regulations_for_hotspot(
                 indexer=self._indexer,

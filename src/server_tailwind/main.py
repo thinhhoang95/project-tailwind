@@ -531,12 +531,34 @@ async def post_propose_regulations(request: Dict[str, Any], current_user: dict =
         raise HTTPException(status_code=400, detail="'time_window' is required")
 
     top_k = request.get("top_k_regulations")
+    threshold_raw = request.get("threshold")
+    resolution_raw = request.get("resolution")
+
+    threshold: Optional[float]
+    resolution: Optional[float]
+
+    try:
+        threshold = None if threshold_raw is None else float(threshold_raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="'threshold' must be a number")
+
+    try:
+        resolution = None if resolution_raw is None else float(resolution_raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="'resolution' must be a number")
+
+    if threshold is not None and not (0.0 <= threshold <= 1.0):
+        raise HTTPException(status_code=400, detail="'threshold' must be between 0 and 1")
+    if resolution is not None and resolution <= 0.0:
+        raise HTTPException(status_code=400, detail="'resolution' must be greater than 0")
 
     try:
         return await regen_wrapper.propose_regulations(
             traffic_volume_id=tv,
             time_window=time_window,
             top_k_regulations=top_k,
+            threshold=threshold,
+            resolution=resolution,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

@@ -468,9 +468,6 @@ def main() -> None:
     inventory = HotspotInventory(evaluator=evaluator, flight_list=flight_list, indexer=indexer)
 
     top = pick_top_hotspot(inventory, threshold=0.0)
-    if not top:
-        print("[regen] No hotspots detected above threshold.")
-        return
 
     ctrl = top.get("control_volume_id")
     win = top.get("window_bins")
