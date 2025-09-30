@@ -107,6 +107,49 @@ def build_bin_capacities(
     return capacities
 
 
+def normalize_capacities(
+    capacities_by_tv: Dict[str, np.ndarray],
+    unconstrained_value: float = 9999.0,
+) -> Dict[str, np.ndarray]:
+    """
+    Normalize capacity arrays to treat missing/invalid bins as unconstrained.
+
+    For bins with capacity <= 0 (meaning unspecified or invalid), replaces them
+    with a large "unconstrained" value to prevent artificial exceedance penalties.
+
+    This ensures consistent objective scoring across different capacity sources
+    (GeoJSON with partial hours, resource matrices with -1 sentinels, etc.).
+
+    Parameters
+    ----------
+    capacities_by_tv : Dict[str, np.ndarray]
+        Per-TV capacity arrays, possibly containing zeros or negative sentinels.
+    unconstrained_value : float, optional
+        Value to use for bins without explicit capacity (default 9999.0).
+
+    Returns
+    -------
+    Dict[str, np.ndarray]
+        Normalized capacity arrays where non-positive bins are replaced with
+        unconstrained_value.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> caps = {"V1": np.array([10, 0, -1, 20], dtype=np.float64)}
+    >>> normalized = normalize_capacities(caps)
+    >>> normalized["V1"]
+    array([   10.,  9999.,  9999.,    20.])
+    """
+    result: Dict[str, np.ndarray] = {}
+    for tv_id, arr in capacities_by_tv.items():
+        arr_copy = np.asarray(arr, dtype=np.float64).copy()
+        # Replace non-positive capacities with unconstrained value
+        arr_copy[arr_copy <= 0.0] = float(unconstrained_value)
+        result[str(tv_id)] = arr_copy
+    return result
+
+
 def rolling_hour_sum(occ_by_bin: np.ndarray, K: int) -> np.ndarray:
     """
     Compute rolling-hour sums over window size K along the last axis.
@@ -130,5 +173,5 @@ def rolling_hour_sum(occ_by_bin: np.ndarray, K: int) -> np.ndarray:
     return s_end - s_start
 
 
-__all__ = ["build_bin_capacities", "rolling_hour_sum"]
+__all__ = ["build_bin_capacities", "normalize_capacities", "rolling_hour_sum"]
 

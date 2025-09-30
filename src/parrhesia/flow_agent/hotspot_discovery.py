@@ -1,7 +1,36 @@
+""" HOTSPOT DISCOVERY AND FLOW EXTRACTION INVENTORY
+### Overall Purpose
+
+The primary goal of this file is to identify and characterize "hotspots" in air traffic. A hotspot is defined as a specific air traffic control volume that is congested during a particular time window. The code analyzes flight data to find these congested segments, groups the flights causing the congestion into logical "flows," and packages this information for use by other parts of the system, likely for planning traffic management solutions.
+
+### Main Classes
+
+1.  **`HotspotInventory`**: This is the main class that orchestrates the discovery process.
+    *   **`__init__(self, evaluator, flight_list, indexer)`**: It's initialized with a `NetworkEvaluator` (to find over-capacity sectors), a `FlightList` (containing all flight data), and a `TVTWIndexer` (for time/space indexing).
+    *   **`build_from_segments(...)`**: This is the key public method. It takes configuration parameters like thresholds and limits. It gets congested segments from the evaluator, ranks them by severity, and then for each one, it builds a `HotspotDescriptor` object that contains detailed information about the flows of flights contributing to the congestion.
+    *   **`_build_descriptor(...)`**: An internal method that does the heavy lifting. For a given hotspot (a control volume and time window), it finds all the flights involved, clusters them into flows using `build_global_flows` (184:191), filters and selects the most significant flows, and computes statistics about them.
+    *   **`to_candidate_payloads(...)`**: A static method to convert the discovered `HotspotDescriptor` objects into a list of dictionaries, which is a serializable format suitable for APIs or saving to files.
+
+2.  **`HotspotDescriptor`**: A dataclass that serves as a structured container for all information about a single hotspot. It holds:
+    *   The ID of the control volume.
+    *   The start and end time bins of the congestion window.
+    *   A tuple of `candidate_flow_ids` which are the groups of flights involved.
+    *   A `hotspot_prior` which is a severity score, based on the number of flights in the window.
+    *   `metadata` which contains the detailed breakdown of which flights belong to which flow (`flow_to_flights`) and other metrics.
+
+3.  **`HotspotDiscoveryConfig`**: A simple dataclass holding configuration parameters that control the hotspot discovery process, such as:
+    *   `threshold`: The minimum severity for a segment to be considered a hotspot.
+    *   `top_hotspots`: The maximum number of hotspots to identify.
+    *   `top_flows`: The maximum number of flows to identify within each hotspot.
+    *   `max_flights_per_flow`: The maximum number of flights to include in any single flow.
+
+In summary, the `HotspotInventory` class uses flight and network data to discover congested areas, and for each one, it creates a detailed `HotspotDescriptor` that breaks down the congestion into manageable flight groups, ready for further analysis or optimization.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -19,6 +48,7 @@ class HotspotDiscoveryConfig:
     top_hotspots: int = 10
     top_flows: int = 4
     max_flights_per_flow: int = 20
+    min_flights_per_flow: int = 5
     leiden_params: Optional[Dict[str, float | int]] = None
     direction_opts: Optional[Dict[str, Any]] = None
 
@@ -79,6 +109,7 @@ class HotspotInventory:
         threshold: float = 0.0,
         top_hotspots: int = 10,
         top_flows: int = 4,
+        min_flights_per_flow: int = 5,
         max_flights_per_flow: int = 20,
         leiden_params: Optional[Mapping[str, float | int]] = None,
         direction_opts: Optional[Mapping[str, Any]] = None,
@@ -134,6 +165,7 @@ class HotspotInventory:
                     control_volume_id=tv_id,
                     window_bins=window_bins,
                     top_flows=top_flows,
+                    min_flights_per_flow=min_flights_per_flow,
                     max_flights_per_flow=max_flights_per_flow,
                     leiden_params=leiden_params,
                     direction_opts=direction_opts,
@@ -157,6 +189,7 @@ class HotspotInventory:
         control_volume_id: str,
         window_bins: Tuple[int, int],
         top_flows: int,
+        min_flights_per_flow: int,
         max_flights_per_flow: int,
         leiden_params: Optional[Mapping[str, float | int]],
         direction_opts: Optional[Mapping[str, Any]],
@@ -207,16 +240,14 @@ class HotspotInventory:
         if not flows_for_ctrl:
             return None
 
-        # Entrants-based proxies (histograms) and severity
+        # Trim flows by entrants count and cap per-flow flights
         win_len = max(1, int(window_bins[1]) - int(window_bins[0]))
-        proxies: Dict[str, np.ndarray] = {}
-        entrants_count: Dict[str, int] = {}
-        total = 0
         reverse: Dict[str, str] = {}
         for fid, flights in flows_for_ctrl.items():
             for fl in flights:
                 reverse[str(fl)] = str(fid)
 
+        entrants_seed: Dict[str, int] = {}
         for b in active_bins:
             offset = int(b) - int(window_bins[0])
             if not (0 <= offset < win_len):
@@ -225,33 +256,102 @@ class HotspotInventory:
                 flow = reverse.get(str(fl))
                 if flow is None:
                     continue
-                proxies.setdefault(flow, np.zeros(win_len, dtype=float))[offset] += 1.0
-                entrants_count[flow] = entrants_count.get(flow, 0) + 1
-                total += 1
+                entrants_seed[flow] = entrants_seed.get(flow, 0) + 1
 
-        # Trim flows by entrants count and cap per-flow flights
-        flow_ids_sorted = sorted(flows_for_ctrl.keys(), key=lambda f: (-int(entrants_count.get(f, 0)), int(f)))
-        trimmed: Dict[str, Tuple[str, ...]] = {}
-        for f in flow_ids_sorted:
-            flights = flows_for_ctrl[f][: int(max(1, max_flights_per_flow))]
-            if flights:
-                trimmed[str(f)] = tuple(flights)
-            if len(trimmed) >= int(max(1, top_flows)):
-                break
-        if not trimmed:
+        def _flow_sort_key(fid: str) -> Tuple[int, str]:
+            entrants = int(entrants_seed.get(str(fid), 0))
+            fid_str = str(fid)
+            if fid_str.isdigit():
+                order = f"{int(fid_str):020d}"
+            else:
+                order = fid_str
+            return (-entrants, order)
+
+        flow_ids_sorted = sorted(flows_for_ctrl.keys(), key=_flow_sort_key)
+
+        min_required = max(0, int(min_flights_per_flow))
+        cap_limit = max(1, int(max_flights_per_flow))
+        top_limit = max(1, int(top_flows)) if top_flows is not None else None
+
+        selected: Dict[str, Tuple[str, ...]] = {}
+        for fid in flow_ids_sorted:
+            all_flights = [str(x) for x in flows_for_ctrl[fid]]
+            if not all_flights:
+                continue
+            if min_required > 0 and len(all_flights) < min_required:
+                continue
+            if top_limit is not None and len(selected) >= top_limit:
+                continue
+            selected[str(fid)] = tuple(all_flights[:cap_limit])
+
+        all_flights_linear: List[str] = []
+        for flights in flows_for_ctrl.values():
+            all_flights_linear.extend(str(x) for x in flights)
+
+        if not selected and not all_flights_linear:
             return None
 
+        selected_flights = {fl for flights in selected.values() for fl in flights}
+        remaining_flights: List[str] = []
+        seen_remaining: set[str] = set()
+        for fl in all_flights_linear:
+            if fl in selected_flights:
+                continue
+            if fl in seen_remaining:
+                continue
+            seen_remaining.add(fl)
+            remaining_flights.append(fl)
+
+        if remaining_flights:
+            # Keep a catch-all flow for the flights that failed the gating rules.
+            remaining_flow_id = "remaining"
+            suffix = 0
+            while remaining_flow_id in selected:
+                suffix += 1
+                remaining_flow_id = f"remaining_{suffix}"
+            selected[remaining_flow_id] = tuple(remaining_flights)
+
+        if not selected:
+            return None
+
+        # Entrants-based proxies (histograms) and severity
+        proxies: Dict[str, np.ndarray] = {flow_id: np.zeros(win_len, dtype=float) for flow_id in selected}
+        entrants_count: Dict[str, int] = {flow_id: 0 for flow_id in selected}
+        flight_to_flow: Dict[str, str] = {}
+        for flow_id, flights in selected.items():
+            for fl in flights:
+                flight_to_flow[str(fl)] = flow_id
+
+        for b in active_bins:
+            offset = int(b) - int(window_bins[0])
+            if not (0 <= offset < win_len):
+                continue
+            for fl in cache.flights_by_bin.get(int(b), ()):  # type: ignore[arg-type]
+                flow = flight_to_flow.get(str(fl))
+                if flow is None:
+                    continue
+                proxies[flow][offset] += 1.0
+                entrants_count[flow] = entrants_count.get(flow, 0) + 1
+
         # Severity prior: total entrants in window (normalized later by MCTS priors)
-        severity = float(sum(int(entrants_count.get(f, 0)) for f in trimmed))
+        severity = float(sum(int(entrants_count.get(f, 0)) for f in selected))
 
         meta: Dict[str, Any] = {
-            "flow_to_flights": {k: list(v) for k, v in trimmed.items()},
-            "flow_proxies": {k: proxies.get(k, np.zeros(win_len, dtype=float)).tolist() for k in trimmed.keys()},
+            "flow_to_flights": {k: list(v) for k, v in selected.items()},
+            "flow_proxies": {k: proxies.get(k, np.zeros(win_len, dtype=float)).tolist() for k in selected.keys()},
         }
+        def _candidate_sort_key(flow_id: str) -> Tuple[int, int | str]:
+            fid_str = str(flow_id)
+            if fid_str.isdigit():
+                return (0, int(fid_str))
+            return (1, fid_str)
+
         desc = HotspotDescriptor(
             control_volume_id=str(control_volume_id),
             window_bins=(int(window_bins[0]), int(window_bins[1])),
-            candidate_flow_ids=tuple(sorted(trimmed.keys(), key=lambda x: int(x) if str(x).isdigit() else str(x))),
+            candidate_flow_ids=tuple(
+                sorted(selected.keys(), key=_candidate_sort_key)
+            ),
             hotspot_prior=severity,
             mode="per_flow",
             metadata=meta,

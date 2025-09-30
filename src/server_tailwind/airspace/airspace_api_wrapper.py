@@ -7,6 +7,7 @@ and the data science logic in NetworkEvaluator.
 
 import json
 import time
+from dataclasses import asdict
 from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
 import geopandas as gpd
@@ -33,6 +34,11 @@ from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.subflows.flow_extractor import assign_communities_for_hotspot
 from parrhesia.flows.flow_pipeline import build_global_flows
 from server_tailwind.core.resources import get_resources
+from parrhesia.optim.objective import score as flow_score, ObjectiveWeights
+from parrhesia.optim.capacity import normalize_capacities
+from parrhesia.optim.sa_optimizer import prepare_flow_scheduling_inputs
+from parrhesia.optim.ripple import compute_auto_ripple_cells
+from parrhesia.flow_agent35.regen.rates import distribute_hourly_rate_to_bins
 
 
 class AirspaceAPIWrapper:
@@ -1048,6 +1054,7 @@ class AirspaceAPIWrapper:
 
             # 5) Rolling-hour (forward) sums per bin: sum over bins [i, i+W-1] (clamped at end)
             time_start = time.time()
+
             def rolling_forward_sum_full(mat: np.ndarray, window: int) -> np.ndarray:
                 # pad zeros at end to keep length the same (forward-looking window)
                 pad = [(0, 0), (0, window - 1)]
@@ -1062,64 +1069,209 @@ class AirspaceAPIWrapper:
             post_roll = rolling_forward_sum_full(post_by_tv, bins_per_hour)
             time_end = time.time()
             print(f"Rolling-hour sums computation took {time_end - time_start} seconds")
-            
-            # 6) Capacity per bin for each TV (repeat hourly capacity across bins in that hour)
-            # Reuse the cached evaluator for consistent capacity parsing
-            cap_by_tv = {}
-            for tv_id, row in tv_items:
-                hourly_caps = self._evaluator.hourly_capacity_by_tv.get(tv_id, {})
-                if not hourly_caps:
-                    # mark as missing capacity with -1.0 per bin
-                    cap_by_tv[tv_id] = np.full(bins_per_tv, -1.0, dtype=np.float32)
-                    continue
-                arr = np.full(bins_per_tv, -1.0, dtype=np.float32)
-                for h, c in hourly_caps.items():
-                    if 0 <= int(h) < (bins_per_tv // bins_per_hour):
-                        start = int(h) * bins_per_hour
-                        end = start + bins_per_hour
-                        arr[start:end] = float(c)
-                cap_by_tv[tv_id] = arr
 
-            # Compute post-regulation capacity exceedance (J_cap) and total delay minutes (J_delay)
-            j_cap_total = 0.0
-            z_max_roll = 0.0
-            for tv_id, row in tv_items:
-                cap_arr = cap_by_tv.get(tv_id)
-                if cap_arr is None or cap_arr.size == 0:
-                    continue
-                pr = post_roll[row, :]
-                valid = cap_arr >= 0.0
-                if not np.any(valid):
-                    continue
-                exceed = pr - cap_arr
-                exceed = np.where(valid, exceed, 0.0)
-                pos = np.maximum(exceed, 0.0)
-                j_cap_total += float(np.sum(pos, dtype=np.float64))
-                try:
-                    z_max_roll = max(z_max_roll, float(np.max(pos)))
-                except Exception:
-                    pass
+            def _compute_delay_stats_from_minutes(delays_map: Dict[str, int]) -> Dict[str, float]:
+                """Aggregate delay statistics derived from per-flight minute delays."""
+                total_minutes = sum(int(v) for v in delays_map.values())
+                count = len(delays_map)
+                delayed = [int(v) for v in delays_map.values() if int(v) > 0]
+                max_delay = max(delayed) if delayed else 0
+                mean_delay = (total_minutes / count) if count else 0.0
+                return {
+                    "total_delay_minutes": float(total_minutes),
+                    "total_delay_seconds": float(total_minutes) * 60.0,
+                    "mean_delay_minutes": float(mean_delay),
+                    "max_delay_minutes": float(max_delay),
+                    "num_flights": int(count),
+                    "num_delayed": int(len(delayed)),
+                }
 
-            delay_stats_local = plan_result.get("delay_stats", {}) or {}
-            j_delay_min = float(delay_stats_local.get("total_delay_seconds", 0.0)) / 60.0
-
-            # Rolling-hour objective (network-level) with weights; keep hourly (legacy) separately
-            # Defaults mirror PlanEvaluator defaults
-            default_weights = {"alpha": 1.0, "beta": 2.0, "gamma": 0.1, "delta": 25.0}
-            if weights:
-                try:
-                    w = {**default_weights, **weights}
-                except Exception:
-                    w = default_weights
+            # 6) Capacity per bin for each TV, preferring precomputed per-bin matrices when available
+            res = get_resources()
+            capacity_matrix = getattr(res, "capacity_per_bin_matrix", None)
+            cap_by_tv: Dict[str, np.ndarray] = {}
+            if isinstance(capacity_matrix, np.ndarray) and capacity_matrix.size > 0:
+                mat = np.asarray(capacity_matrix, dtype=np.float32)
+                for tv_id, row in tv_items:
+                    row_idx = int(row)
+                    if 0 <= row_idx < mat.shape[0]:
+                        row_arr = mat[row_idx]
+                        if row_arr.size < bins_per_tv:
+                            padded = np.full(bins_per_tv, -1.0, dtype=np.float32)
+                            padded[: row_arr.size] = row_arr
+                            cap_by_tv[tv_id] = padded
+                        else:
+                            cap_by_tv[tv_id] = row_arr[:bins_per_tv].astype(np.float32, copy=False)
             else:
-                w = default_weights
-            num_regs = len(network_plan.regulations)
-            objective_new = (
-                float(w["alpha"]) * float(j_cap_total)
-                + float(w["beta"]) * float(z_max_roll)
-                + float(w["gamma"]) * float(j_delay_min)
-                + float(w["delta"]) * float(num_regs)
-            )
+                hourly_caps_global = getattr(res, "hourly_capacity_by_tv", None) or self._evaluator.hourly_capacity_by_tv
+                for tv_id, _row in tv_items:
+                    hourly_caps = (hourly_caps_global or {}).get(tv_id, {})
+                    arr = np.full(bins_per_tv, -1.0, dtype=np.float32)
+                    if hourly_caps:
+                        for h, c in hourly_caps.items():
+                            try:
+                                hour_idx = int(h)
+                            except Exception:
+                                continue
+                            start = hour_idx * bins_per_hour
+                            end = min(start + bins_per_hour, bins_per_tv)
+                            if 0 <= start < bins_per_tv:
+                                arr[start:end] = float(c)
+                    cap_by_tv[tv_id] = arr
+            for tv_id, _ in tv_items:
+                if tv_id not in cap_by_tv:
+                    cap_by_tv[tv_id] = np.full(bins_per_tv, -1.0, dtype=np.float32)
+
+            cap_by_tv_norm = normalize_capacities({tv: np.asarray(arr, dtype=np.float64) for tv, arr in cap_by_tv.items()})
+
+            # 7) Flow-based objective integration via parrhesia.optim.objective.score
+            delays_by_flight_output = plan_result.get("delays_by_flight", {}) or {}
+            delay_stats_output = plan_result.get("delay_stats", {}) or {}
+            objective_components_out: Dict[str, float] = {}
+            objective_new = float(plan_result.get("objective", 0.0))
+            weights_obj = ObjectiveWeights()
+            weights_used_export = asdict(weights_obj)
+            num_flows_scored = 0
+            tvs_scored: List[str] = []
+
+            try:
+                flow_map: Dict[str, int] = {}
+                flow_to_reg: Dict[int, Regulation] = {}
+                assigned_flights: set[str] = set()
+
+                for reg in network_plan.regulations:
+                    if getattr(reg, "target_flight_ids", None):
+                        candidates = [str(fid) for fid in reg.target_flight_ids or [] if fid]
+                    else:
+                        try:
+                            candidates = [str(fid) for fid in parser.parse(reg) or []]
+                        except Exception:
+                            candidates = []
+                    if not candidates:
+                        continue
+                    unique_fids: List[str] = []
+                    for fid in candidates:
+                        if fid in assigned_flights:
+                            continue
+                        assigned_flights.add(fid)
+                        unique_fids.append(fid)
+                    if not unique_fids:
+                        continue
+                    flow_idx = len(flow_to_reg)
+                    flow_to_reg[flow_idx] = reg
+                    for fid in unique_fids:
+                        flow_map[fid] = flow_idx
+
+                if flow_to_reg:
+                    hotspot_ids = [flow_to_reg[idx].location for idx in sorted(flow_to_reg.keys())]
+                    flights_by_flow_raw, _ = prepare_flow_scheduling_inputs(
+                        flight_list=self._flight_list,
+                        flow_map=flow_map,
+                        hotspot_ids=hotspot_ids,
+                        flight_ids=list(flow_map.keys()),
+                    )
+                    flights_by_flow = {fid: specs for fid, specs in flights_by_flow_raw.items() if specs}
+                    if flights_by_flow:
+                        T = int(tvtw_indexer.num_time_bins)
+                        n_f_t_for_score: Dict[int, List[int]] = {}
+                        target_cells_set: set[Tuple[str, int]] = set()
+                        target_tv_ids: set[str] = set()
+                        for flow_id, specs in flights_by_flow.items():
+                            reg = flow_to_reg.get(flow_id)
+                            demand = np.zeros(T + 1, dtype=np.int64)
+                            for spec in specs:
+                                rb = spec.get("requested_bin") if isinstance(spec, dict) else None
+                                try:
+                                    bin_idx = int(rb)
+                                except Exception:
+                                    continue
+                                if bin_idx < 0:
+                                    bin_idx = 0
+                                if bin_idx >= T:
+                                    bin_idx = T - 1
+                                demand[bin_idx] += 1
+                            schedule = demand.copy()
+                            if reg is not None:
+                                target_tv_ids.add(str(reg.location))
+                                wins = [int(w) for w in getattr(reg, "time_windows", []) or []]
+                                wins_in_range = [w for w in wins if 0 <= w < T]
+                                if wins_in_range:
+                                    start_bin = min(wins_in_range)
+                                    end_bin = max(wins_in_range)
+                                    try:
+                                        allowance = distribute_hourly_rate_to_bins(
+                                            int(reg.rate),
+                                            bins_per_hour=bins_per_hour,
+                                            start_bin=start_bin,
+                                            end_bin=end_bin,
+                                        )
+                                    except Exception:
+                                        allowance = np.zeros(max(0, end_bin - start_bin + 1), dtype=np.int64)
+                                    for offset, bin_idx in enumerate(range(start_bin, end_bin + 1)):
+                                        if 0 <= bin_idx < T:
+                                            allow_val = int(allowance[offset]) if offset < allowance.size else 0
+                                            schedule[bin_idx] = int(min(schedule[bin_idx], allow_val))
+                                    for b in wins_in_range:
+                                        target_cells_set.add((str(reg.location), int(b)))
+                            total_flights = int(np.sum(demand[:T], dtype=np.int64))
+                            released = int(np.sum(schedule[:T], dtype=np.int64))
+                            schedule[T] = max(0, total_flights - released)
+                            n_f_t_for_score[flow_id] = schedule.astype(int).tolist()
+                        if n_f_t_for_score:
+                            ripple_fids: List[str] = []
+                            for specs in flights_by_flow.values():
+                                for spec in specs:
+                                    fid_val = spec.get("flight_id") if isinstance(spec, dict) else None
+                                    if fid_val:
+                                        ripple_fids.append(str(fid_val))
+                            ripple_cells = compute_auto_ripple_cells(
+                                indexer=tvtw_indexer,
+                                flight_list=self._flight_list,
+                                flight_ids=ripple_fids,
+                                window_bins=2,
+                            )
+                            tv_filter_set = set(target_tv_ids)
+                            for tv_id, _ in ripple_cells:
+                                tv_filter_set.add(str(tv_id))
+                            tvs_scored = sorted(tv_filter_set)
+                            target_cells_list = sorted(target_cells_set, key=lambda item: (item[0], item[1]))
+                            weight_kwargs: Dict[str, Any] = {}
+                            if isinstance(weights, dict):
+                                for key, value in weights.items():
+                                    if key in ObjectiveWeights.__dataclass_fields__:
+                                        weight_kwargs[key] = value
+                            weights_obj = ObjectiveWeights(**weight_kwargs) if weight_kwargs else ObjectiveWeights()
+                            weights_used_export = {k: float(v) for k, v in asdict(weights_obj).items()}
+                            J_total, components, artifacts = flow_score(
+                                n_f_t=n_f_t_for_score,
+                                flights_by_flow=flights_by_flow,
+                                indexer=tvtw_indexer,
+                                capacities_by_tv=cap_by_tv_norm,
+                                target_cells=target_cells_list,
+                                ripple_cells=ripple_cells,
+                                flight_list=self._flight_list,
+                                weights=weights_obj,
+                                tv_filter=tvs_scored,
+                                spill_mode="dump_to_next_bin",
+                            )
+                            objective_new = float(J_total)
+                            objective_components_out = {str(k): float(v) for k, v in components.items()}
+                            delays_min = artifacts.get("delays_min", {}) or {}
+                            if isinstance(delays_min, dict) and delays_min:
+                                delays_by_flight_output = {str(fid): int(val) for fid, val in delays_min.items()}
+                                delay_stats_output = _compute_delay_stats_from_minutes(delays_by_flight_output)
+                            num_flows_scored = len(n_f_t_for_score)
+                        else:
+                            tvs_scored = sorted(str(tv) for tv in target_tv_ids)
+                    else:
+                        tvs_scored = []
+                else:
+                    tvs_scored = []
+            except Exception as exc:
+                print(f"Warning: flow objective scoring failed: {exc}")
+
+            if not objective_components_out:
+                objective_components_out = {k: 0.0 for k in ("J_cap", "J_delay", "J_reg", "J_tv")}
 
             # 7) Build per-TV active window mask from the plan and also the UNION mask across all TVs
             tv_to_active_mask = {tv: np.zeros(bins_per_tv, dtype=bool) for tv, _ in tv_items}
@@ -1184,7 +1336,7 @@ class AirspaceAPIWrapper:
 
             # Build pre-flight context: takeoff time and baseline arrival time to any regulated TV
             pre_flight_context: Dict[str, Dict[str, Optional[str]]] = {}
-            delays_by_flight = plan_result.get("delays_by_flight", {}) or {}
+            delays_by_flight = delays_by_flight_output or {}
             if delays_by_flight:
                 # Collect regulated TV ranges [start, end) in the flat TVTW index space
                 regulated_tv_ids: List[str] = []
@@ -1248,20 +1400,11 @@ class AirspaceAPIWrapper:
                     }
 
             result_payload = {
-                "delays_by_flight": plan_result.get("delays_by_flight", {}),
-                "delay_stats": plan_result.get("delay_stats", {}),
+                "delays_by_flight": delays_by_flight_output,
+                "delay_stats": delay_stats_output,
                 # New rolling-hour objective (network-level)
                 "objective": float(objective_new),
-                "objective_components": {
-                    "J_cap": float(j_cap_total),
-                    "J_delay": float(j_delay_min),
-                    "z_max": float(z_max_roll),
-                    "num_regs": float(num_regs),
-                    "alpha": float(w["alpha"]),
-                    "beta": float(w["beta"]),
-                    "gamma": float(w["gamma"]),
-                    "delta": float(w["delta"]),
-                },
+                "objective_components": objective_components_out,
                 # Preserve hourly objective as legacy
                 "legacy_objective": float(plan_result.get("objective", 0.0)),
                 "legacy_objective_components": plan_result.get("objective_components", {}),
@@ -1270,12 +1413,15 @@ class AirspaceAPIWrapper:
                 "rolling_changed_tvs": rolling_changed_tvs,
                 # Backward-compatibility alias for one release
                 "rolling_top_tvs": rolling_changed_tvs,
+                "weights_used": weights_used_export,
                 "metadata": {
                     "time_bin_minutes": int(self._flight_list.time_bin_minutes),
                     "bins_per_tv": int(bins_per_tv),
                     "bins_per_hour": int(bins_per_hour),
                     "num_traffic_volumes": int(num_tvs),
                     "num_changed_tvs": int(len(rolling_changed_tvs)),
+                    "num_flows": int(num_flows_scored),
+                    "tvs_scored": tvs_scored,
                 },
                 **excess_payload,
             }

@@ -30,15 +30,17 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from datetime import datetime
+import numpy as np
 
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.optimize.eval.flight_list import FlightList
-from parrhesia.optim.capacity import build_bin_capacities
+from parrhesia.optim.capacity import build_bin_capacities, normalize_capacities
 from parrhesia.optim.objective import ObjectiveWeights, score
 from parrhesia.optim.sa_optimizer import prepare_flow_scheduling_inputs
 from parrhesia.optim.occupancy import compute_occupancy
 from .flows import _load_indexer_and_flights  # reuse helper for defaults
 from .resources import get_global_resources
+from parrhesia.optim.ripple import compute_auto_ripple_cells
 
 
 def _parse_time_hms(s: str) -> datetime:
@@ -75,80 +77,6 @@ def _cells_from_ranges(
             cells.append((tv_id, int(b)))
         tvs.append(tv_id)
     return cells, tvs
-
-
-def _auto_ripple_cells_from_flows(
-    idx: TVTWIndexer,
-    fl: FlightList,
-    flight_ids: Iterable[str],
-    window: int,
-) -> List[Tuple[str, int]]:
-    """
-    Build ripple cells as the union of TVTW footprints for the provided flights,
-    optionally dilated by ±window bins along time for robustness.
-
-    Args:
-        idx: TVTW indexer providing bin/time mappings
-        fl: Flight list with metadata including occupancy intervals
-        flight_ids: Iterable of flight IDs to consider (typically all flights in all flows)
-        window: Non-negative integer time-bin dilation to apply on each footprint bin
-
-    Returns:
-        List of (tv_id, bin) pairs suitable for use as ripple_cells.
-    """
-    try:
-        w = int(window)
-    except Exception:
-        w = 0
-    if w < 0:
-        w = 0
-
-    T = int(idx.num_time_bins)
-    bins_by_tv: Dict[str, set] = {}
-
-    # 1) Collect base bins per TV across all provided flights
-    for fid in flight_ids:
-        meta = fl.flight_metadata.get(str(fid))
-        if not meta:
-            continue
-        for iv in (meta.get("occupancy_intervals") or []):
-            try:
-                tvtw_idx = int(iv.get("tvtw_index"))
-            except Exception:
-                continue
-            decoded = idx.get_tvtw_from_index(tvtw_idx)
-            if not decoded:
-                continue
-            tv_id, tbin = decoded
-            s_tv = str(tv_id)
-            if s_tv not in bins_by_tv:
-                bins_by_tv[s_tv] = set()
-            try:
-                tb = int(tbin)
-            except Exception:
-                continue
-            if 0 <= tb < T:
-                bins_by_tv[s_tv].add(tb)
-
-    # 2) Dilate by ±w bins along time for each TV
-    if w > 0:
-        for tv in list(bins_by_tv.keys()):
-            base_bins = bins_by_tv[tv]
-            expanded = set()
-            for b in base_bins:
-                start = 0 if (b - w) < 0 else (b - w)
-                end = (T - 1) if (b + w) > (T - 1) else (b + w)
-                # inclusive range
-                for t in range(start, end + 1):
-                    expanded.add(t)
-            bins_by_tv[tv] = expanded
-
-    # 3) Flatten to explicit cells sorted by tv then bin for determinism
-    cells: List[Tuple[str, int]] = []
-    for tv in sorted(bins_by_tv.keys()):
-        for b in sorted(bins_by_tv[tv]):
-            cells.append((tv, int(b)))
-    return cells
 
 
 def _default_paths_from_root() -> Tuple[Path, Path, Path]:
@@ -207,15 +135,16 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 # Ensure we iterate TVs in the indexer's map for consistency
                 for tv_id, row_idx in _res.flight_list.tv_id_to_idx.items():
                     arr = mat[int(row_idx), :]
-                    # Replace missing capacity markers (-1) with zeros
-                    capacities_by_tv[str(tv_id)] = (arr * (arr >= 0.0)).astype(int)
-                    capacities_by_tv[str(tv_id)][capacities_by_tv[str(tv_id)] == 0] = 9999
+                    capacities_by_tv[str(tv_id)] = arr.astype(np.float64)
         except Exception:
             capacities_by_tv = None
 
         if capacities_by_tv is None:
             # Fallback to project default path
             capacities_by_tv = build_bin_capacities(str(cap_path_default), idx)
+    
+    # Normalize capacities: treat missing/zero bins as unconstrained
+    capacities_by_tv = normalize_capacities(capacities_by_tv)
 
     
     # 2) Parse and validate targets / ripples
@@ -289,7 +218,12 @@ def compute_base_evaluation(payload: Mapping[str, Any]) -> Dict[str, Any]:
     except Exception:
         _auto_w = 0
     if _auto_w > 0:
-        ripple_cells = _auto_ripple_cells_from_flows(idx, fl, flow_map.keys(), _auto_w)
+        ripple_cells = compute_auto_ripple_cells(
+            indexer=idx,
+            flight_list=fl,
+            flight_ids=list(flow_map.keys()),
+            window_bins=_auto_w,
+        )
 
     # 5b) Per-TV demand vectors for targets and ripples (length T, no overflow)
     target_tv_ids = list(dict.fromkeys(str(tv) for tv in tvs))  # preserve order from targets

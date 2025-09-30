@@ -4,6 +4,7 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
+
         {
             "name": "Python Debugger: Current File",
             "type": "debugpy",
@@ -12,52 +13,10 @@
             "console": "integratedTerminal"
         },
         {
-            "name": "Test Regulation (Debug)",
+            "name": "Regen (Custom Hotspot)",
             "type": "debugpy",
             "request": "launch",
-            "program": "tests/test_regulation.py",
-            "console": "integratedTerminal"
-        },
-        {
-            "name": "Test Network Eval (Debug)",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "src/project_tailwind/optimize/eval/test_network_eval.py",
-            "console": "integratedTerminal"
-        },
-        {
-            "name": "Test Regulation and Network Plan Move (Debug)",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "tests/test_regulation_and_network_plan_move.py",
-            "console": "integratedTerminal"
-        },
-        {
-            "name": "Test ALNS Orchestra (Debug)",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "src/project_tailwind/optimize/alns/orchestrator.py",
-            "console": "integratedTerminal"
-        },
-        {
-            "name": "Test Hotspot Flow Retrieval (Debug)",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "tests/test_hotspot_flow_retrieval.py",
-            "console": "integratedTerminal"
-        },
-        {
-            "name": "Test Flow Cache Extraction (Debug)",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "examples/run_flow_cache_extraction_basic_debug.py",
-            "console": "integratedTerminal"
-        },
-        {
-            "name": "Example: Regulation Use (Debug)",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "tests/tabu/regulation_use_example.py",
+            "program": "examples/regen/regen_test_bench_custom_tvtw.py",
             "console": "integratedTerminal"
         }
     ]
