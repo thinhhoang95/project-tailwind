@@ -30,7 +30,7 @@ import numpy as np
 
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.optimize.eval.flight_list import FlightList
-from parrhesia.optim.capacity import build_bin_capacities
+from parrhesia.optim.capacity import build_bin_capacities, normalize_capacities
 from parrhesia.optim.objective import ObjectiveWeights, score
 from parrhesia.optim.sa_optimizer import SAParams, prepare_flow_scheduling_inputs, run_sa
 from parrhesia.optim.occupancy import compute_occupancy
@@ -39,8 +39,8 @@ from parrhesia.optim import occupancy as _occ
 from .base_evaluation import (
     _default_paths_from_root,
     _cells_from_ranges,
-    _auto_ripple_cells_from_flows,
 )
+from parrhesia.optim.ripple import compute_auto_ripple_cells
 from .flows import _load_indexer_and_flights
 from .resources import get_global_resources
 
@@ -261,12 +261,14 @@ def compute_automatic_rate_adjustment(payload: Mapping[str, Any]) -> Dict[str, A
                 capacities_by_tv = {}
                 for tv_id, row_idx in _res.flight_list.tv_id_to_idx.items():
                     arr = mat[int(row_idx), :]
-                    capacities_by_tv[str(tv_id)] = (arr * (arr >= 0.0)).astype(int)
-                    capacities_by_tv[str(tv_id)][capacities_by_tv[str(tv_id)] == 0] = 9999
+                    capacities_by_tv[str(tv_id)] = arr.astype(np.float64)
         except Exception:
             capacities_by_tv = None
         if capacities_by_tv is None:
             capacities_by_tv = build_bin_capacities(str(cap_path_default), idx)
+    
+    # Normalize capacities: treat missing/zero bins as unconstrained
+    capacities_by_tv = normalize_capacities(capacities_by_tv)
 
     # 2) Parse and validate targets / ripples
     targets_in = payload.get("targets") or {}
@@ -311,7 +313,12 @@ def compute_automatic_rate_adjustment(payload: Mapping[str, Any]) -> Dict[str, A
     except Exception:
         auto_w = 0
     if auto_w > 0:
-        ripple_cells = _auto_ripple_cells_from_flows(idx, fl, flow_map.keys(), auto_w)
+        ripple_cells = compute_auto_ripple_cells(
+            indexer=idx,
+            flight_list=fl,
+            flight_ids=list(flow_map.keys()),
+            window_bins=auto_w,
+        )
 
     # 5b) Per-TV baseline earliest-crossing demand (same as base_evaluation)
     target_tv_ids = list(dict.fromkeys(str(tv) for tv in tvs))

@@ -21,6 +21,7 @@ def build_local_context(
     flights_by_flow: Mapping[int, Sequence[Mapping[str, Any]]],
     weights: Optional[ObjectiveWeights] = None,
     tv_filter: Optional[Iterable[str]] = None,
+    ripple_cells: Optional[Iterable[Tuple[str, int]]] = None,
 ) -> ScoreContext:
     """Build a localized :class:`ScoreContext` for evaluation."""
 
@@ -29,7 +30,7 @@ def build_local_context(
         indexer=indexer,
         capacities_by_tv=capacities_by_tv,
         target_cells=list(target_cells),
-        ripple_cells=None,
+        ripple_cells=list(ripple_cells) if ripple_cells is not None else None,
         flight_list=flight_list,
         weights=weights,
         tv_filter=tv_filter,
@@ -158,9 +159,19 @@ def compute_delta_deficit_per_hour(
             t_end = min(T, t + bins_per_hour)
             occ_before_sum = float(occ_before_vec[t:t_end].sum())
             occ_after_sum = float(occ_after_vec[t:t_end].sum())
-            cap_sum = float(cap_vec[t:t_end].sum())
-            ex_before = max(0.0, occ_before_sum - cap_sum)
-            ex_after = max(0.0, occ_after_sum - cap_sum)
+            # Map the rolling-bin slice onto its parent hour and use a single
+            # representative hourly capacity so we mirror the simulated annealing
+            # objective, which subtracts one hourly capacity per window.
+            hour_idx = int(t) // bins_per_hour
+            h_start = hour_idx * bins_per_hour
+            h_end = min(h_start + bins_per_hour, T)
+            slice_caps = cap_vec[h_start:h_end]
+            if slice_caps.size:
+                hourly_cap = float(np.median(slice_caps))
+            else:
+                hourly_cap = float(cap_vec[t]) if t < len(cap_vec) else 0.0
+            ex_before = max(0.0, occ_before_sum - hourly_cap)
+            ex_after = max(0.0, occ_after_sum - hourly_cap)
             total_delta += ex_before - ex_after
             count += 1
     if count == 0:

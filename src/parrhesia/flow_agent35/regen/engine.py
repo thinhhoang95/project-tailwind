@@ -34,6 +34,10 @@ from .types import (
     Window,
 )
 from .window import select_window_for_bundle
+from parrhesia.optim.ripple import compute_auto_ripple_cells
+
+
+AUTO_RIPPLE_DILATION_BINS = 2
 
 
 def _flow_ids_from_rates(rates: Sequence[RateCut]) -> List[int]:
@@ -244,14 +248,26 @@ def propose_regulations_for_hotspot(
     # timebins_seq_with_shoulder = timebins_seq + [timebins_seq[-1] + 1, timebins_seq[-1] + 2] # add two shoulder timebins to cover the "dumping" effect from unreleased flights in the queue
     
     target_cells = _build_target_cells(hotspot_tv, timebins_seq)
-    tv_filter = _build_tv_filter(
-        hotspot_tv,
-        bundles,
-        flights_by_flow=flights_by_flow,
-        flight_list=flight_list,
+
+    # Ripple cells from union of flow flight footprints with ±window dilation
+    flight_ids_all: List[str] = []
+    for _fid, specs in flights_by_flow.items():
+        for sp in (specs or ()):  # each spec is a mapping with 'flight_id'
+            fid = sp.get("flight_id") if isinstance(sp, dict) else None
+            if fid is None:
+                continue
+            flight_ids_all.append(str(fid))
+    ripple_cells = compute_auto_ripple_cells(
         indexer=indexer,
+        flight_list=flight_list,
+        flight_ids=sorted(set(flight_ids_all)),
+        window_bins=AUTO_RIPPLE_DILATION_BINS,
     )
-    # The context only includes the hotspot in tv_filter
+    ripple_tv_ids = sorted({str(tv) for (tv, _b) in ripple_cells})
+    tv_filter = sorted({str(hotspot_tv)} | set(ripple_tv_ids))
+
+    # Context mirrors the simulated annealing scoring: hotspot is target;
+    # other TVs inside the localized filter become ripple within the window.
     context = build_local_context(
         indexer=indexer,
         flight_list=flight_list,
@@ -260,6 +276,7 @@ def propose_regulations_for_hotspot(
         flights_by_flow=flights_by_flow,
         weights=None,
         tv_filter=tv_filter,
+        ripple_cells=ripple_cells,
     )
     baseline_schedule = baseline_schedule_from_context(context)
     context_flow_ids = set(int(fid) for fid in baseline_schedule.keys())
