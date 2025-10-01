@@ -336,7 +336,7 @@ class RegenAPIWrapper:
             "traffic_volume_id": tv,
             "time_window": time_window,
             "time_bin_minutes": self.time_bin_minutes,
-            "top_k": num_regulations_limit,
+            "top_k": top_k_regulations,
             "weights": weights_dict,
             "num_proposals": len(proposals_payload),
             "proposals": proposals_payload,
