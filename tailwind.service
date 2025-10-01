@@ -1,23 +1,26 @@
+# Better: use envs, create separate home directory, user and enable hardening
+# Current config uses root for quick iteration
+
 [Unit]
 Description=Tailwind API Service
 After=network.target
 Wants=network-online.target
 
 [Service]
-User=fastapi
-Group=fastapi
+User=root
+Group=root
 WorkingDirectory=/root/project-tailwind
 EnvironmentFile=/etc/tailwind.env
 
-# Security hardening (relax as needed)
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=true
+# Security hardening (switch to full/true for production)
+NoNewPrivileges=false
+PrivateTmp=false
+ProtectSystem=off
+ProtectHome=false
 
 # Run the script with the env's Python
-ExecStart=/root/minicoda3/envs/sdrizzle/bin/python /root/project-tailwind/run_server.py
-Restart=always
+ExecStart=/root/miniconda3/envs/sdrizzle/bin/python /root/project-tailwind/run_server.py
+Restart=never
 RestartSec=3
 TimeoutStopSec=30
 KillSignal=SIGTERM
