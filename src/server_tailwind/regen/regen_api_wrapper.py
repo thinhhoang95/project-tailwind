@@ -196,7 +196,7 @@ class RegenAPIWrapper:
                 distinct_controls_required=False,
                 raise_on_edge_cases=True,
                 min_num_flights=4,
-                top_k_regulations=num_regulations_limit
+                k_proposals=num_regulations_limit
             )            
 
 
