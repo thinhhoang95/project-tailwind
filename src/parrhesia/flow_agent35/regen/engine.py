@@ -204,6 +204,7 @@ def propose_regulations_for_hotspot(
     flow_to_flights: Optional[Mapping[str, Sequence[str]]] = None,
     weights: Optional[FlowScoreWeights] = None,
     config: Optional[RegenConfig] = None,
+    verbose_debug: bool = False,
 ) -> List[Proposal]:
     cfg = resolve_config(config)
     wts = resolve_weights(weights)
@@ -249,13 +250,15 @@ def propose_regulations_for_hotspot(
         if cfg.raise_on_edge_cases:
             raise ValueError("Hotspot exceedance target is zero; nothing to regulate")
         return []
-
+    # Prune flows according to cfg (xGH == 0, r0_i == 0, gH <= g_min, rho >= rho_max, Slack_G15 <= slack_min)
     bins_per_hour = int(indexer.rolling_window_size())
+    n_flows_before_pruning = len(features)
     eligible_ids = prune_flows(features=features, config=cfg, bins_per_hour=bins_per_hour)
     if not eligible_ids:
         if cfg.raise_on_edge_cases:
             raise ValueError("No eligible flows after pruning")
         return []
+    print(f'{n_flows_before_pruning} → {len(eligible_ids)} eligible flows, {n_flows_before_pruning - len(eligible_ids)} flows pruned')
     scored_flows = score_flows(
         eligible_flows=eligible_ids,
         features=features,
@@ -292,7 +295,7 @@ def propose_regulations_for_hotspot(
     
     # Target cells: hotspot TV across designated hotspot timebins
     target_cells = _build_target_cells(hotspot_tv, timebins_seq)
-    _log_capacity_snapshot("hotspot", [hotspot_tv], capacities_by_tv, timebins_seq)
+    # _log_capacity_snapshot("hotspot", [hotspot_tv], capacities_by_tv, timebins_seq)
 
     candidates: List[Tuple[BundleVariant, PredictedImprovement, Dict[str, Any]]] = []
     total_bins = int(getattr(indexer, "num_time_bins"))
@@ -330,7 +333,7 @@ def propose_regulations_for_hotspot(
         )
         bundle_ripple_tvs = sorted({str(tv) for (tv, _b) in bundle_ripple_cells})
         bundle_tv_filter = sorted({str(hotspot_tv)} | set(bundle_ripple_tvs))
-        _log_capacity_snapshot("tv_filter", bundle_tv_filter, capacities_by_tv, timebins_seq)
+        # _log_capacity_snapshot("tv_filter", bundle_tv_filter, capacities_by_tv, timebins_seq)
 
         # 4) Build a localized scoring context per-bundle so that ripple/target TVs are correct.
         #    Context mirrors the simulated annealing scoring

@@ -187,11 +187,12 @@ class RegenAPIWrapper:
             flow_to_flights = self._flow_id_to_flights(flows_payload)
             
             my_cfg = RegenConfig(
-                        g_min=-float("inf"),
-                        rho_max=10.0,
-                        slack_min=-float("inf"),
-                        distinct_controls_required=False,
-                        raise_on_edge_cases=True,
+                g_min=-float("inf"),
+                rho_max=float("inf"),
+                slack_min=-float("inf"),
+                distinct_controls_required=False,
+                raise_on_edge_cases=True,
+                min_num_flights=4
             )            
 
 

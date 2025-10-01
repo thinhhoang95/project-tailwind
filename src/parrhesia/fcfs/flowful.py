@@ -515,7 +515,7 @@ def assign_delays_flowful_preparsed(
         demanded = len(flights_norm)
         scheduled_total = int(sum(schedule))
         if scheduled_total != demanded:
-            logging.warning(
+            logging.info(
                 "Flow %s: schedule sum (%d) != number of flights (%d)",
                 str(flow_id), scheduled_total, demanded,
             )

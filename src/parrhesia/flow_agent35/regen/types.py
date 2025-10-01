@@ -35,9 +35,9 @@ class FlowScoreWeights:
 class RegenConfig:
     """Configuration controlling the regulation proposal generator."""
 
-    g_min: float = 0.1
-    rho_max: float = 0.7
-    slack_min: float = 2.0
+    g_min: float = -float("inf")
+    rho_max: float = float("inf")
+    slack_min: float = -float("inf")
     window_margin_hours: float = 0.25
     min_window_hours: float = 1.0
     e_target_mode: str = "q95"
@@ -52,13 +52,14 @@ class RegenConfig:
     local_search_percent_lower: float = 0.15  # 5%
     local_search_percent_upper: float = 0.85  # 50%
     local_search_percent_step: float = 0.1  # 5% increments
-    max_variants_per_bundle: int = 64
+    max_variants_per_bundle: int = 32
     diversity_alpha: float = 0.2
     k_proposals: int = 6
-    max_bundle_size: int = 6
+    max_bundle_size: int = 8
     distinct_controls_required: bool = True
     autotrim_from_ctrl_to_hotspot: bool = False
     raise_on_edge_cases: bool = True
+    min_num_flights: int = 4 # practically infinite
 
 
 @dataclass(frozen=True)

@@ -5,7 +5,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from parrhesia.metaopt.feats.flow_features import FlowFeaturesExtractor
+from parrhesia.metaopt.feats.flow_features import FlowFeaturesExtractor, FlowFeatures
 
 def build_flow_features_extractor(
     indexer: Any,
@@ -33,15 +33,67 @@ def extract_features_for_flows(
     *,
     flows_payload: Optional[Mapping[str, Any]] = None,
     direction_opts: Optional[Mapping[str, Any]] = None,
+    verbose_debug: bool = False,
 ) -> Dict[int, FlowFeatures]:
     """Compute flow features for the provided hotspot window."""
 
-    return extractor.compute_for_hotspot(
+    out = extractor.compute_for_hotspot(
         hotspot_tv=hotspot_tv,
         timebins=timebins,
         flows_payload=flows_payload,
         direction_opts=direction_opts,
     )
+
+    if verbose_debug:
+        try:
+            from rich.console import Console
+            from rich.table import Table
+
+            console = Console()
+            window_str = f"[{min(timebins)}–{max(timebins)}]" if timebins else ""
+            table = Table(title=f"Flow features for hotspot {hotspot_tv} {window_str}")
+
+            table.add_column("Flow", justify="right", style="bold")
+            table.add_column("CtrlTV", overflow="fold")
+            table.add_column("tGl", justify="right")
+            table.add_column("tGu", justify="right")
+            table.add_column("xGH", justify="right")
+            table.add_column("DH", justify="right")
+            table.add_column("gH", justify="right")
+            table.add_column("gH_avg", justify="right")
+            table.add_column("v_tilde", justify="right")
+            table.add_column("S0", justify="right")
+            table.add_column("S15", justify="right")
+            table.add_column("S30", justify="right")
+            table.add_column("S45", justify="right")
+            table.add_column("#bins", justify="right")
+            table.add_column("#flts", justify="right")
+
+            for fid in sorted(out.keys()):
+                feats = out[int(fid)]
+                table.add_row(
+                    str(int(feats.flow_id)),
+                    str(feats.control_tv_id) if feats.control_tv_id is not None else "-",
+                    str(int(feats.tGl)),
+                    str(int(feats.tGu)),
+                    f"{float(feats.xGH):.4f}",
+                    f"{float(feats.DH):.4f}",
+                    f"{float(feats.gH):.4f}",
+                    f"{float(feats.gH_avg):.4f}",
+                    f"{float(feats.v_tilde):.4f}",
+                    f"{float(feats.Slack_G0):.4f}",
+                    f"{float(feats.Slack_G15):.4f}",
+                    f"{float(feats.Slack_G30):.4f}",
+                    f"{float(feats.Slack_G45):.4f}",
+                    str(int(getattr(feats, "bins_count", 0))),
+                    str(int(getattr(feats, "num_flights", 0))),
+                )
+
+            console.print(table)
+        except Exception:
+            pass
+
+    return out
 
 
 def _extract_requested_bin_from_metadata(

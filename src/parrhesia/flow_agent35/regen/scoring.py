@@ -20,26 +20,43 @@ def prune_flows(
     features: Mapping[int, FlowFeatures],
     config: RegenConfig,
     bins_per_hour: int,
+    verbose_debug: bool = False,
 ) -> List[int]:
     """Return flow ids that pass the eligibility filters."""
 
     eligible: List[int] = []
     slack_min = float(config.slack_min)
     for flow_id, feat in features.items():
+        if feat.num_flights < config.min_num_flights:
+            if verbose_debug:
+                print(f'Pruning flow {flow_id} because num_flights is {feat.num_flights}')
+            continue
         if float(feat.xGH) <= 0.0:
+            if verbose_debug:
+                print(f'Pruning flow {flow_id} because xGH is 0')
             continue
         r0_i = _baseline_rate_from_features(feat, bins_per_hour=bins_per_hour)
         if r0_i <= 0.0:
+            if verbose_debug:
+                print(f'Pruning flow {flow_id} because r0_i is 0')
             continue
         if float(feat.gH) <= float(config.g_min):
+            if verbose_debug:
+                print(f'Pruning flow {flow_id} because gH is {float(feat.gH)}')
             continue
         if float(feat.rho) >= float(config.rho_max):
+            if verbose_debug:
+                print(f'Pruning flow {flow_id} because rho is {float(feat.rho)}')
             continue
         slack15 = float(getattr(feat, "Slack_G15", 0.0) or 0.0)
         if slack15 <= slack_min:
+            if verbose_debug:
+                print(f'Pruning flow {flow_id} because slack15 is {slack15}')
             slack30 = float(getattr(feat, "Slack_G30", 0.0) or 0.0)
             slack45 = float(getattr(feat, "Slack_G45", 0.0) or 0.0)
             if max(slack30, slack45) <= slack_min:
+                if verbose_debug:
+                    print(f'Pruning flow {flow_id} because slack30 or slack45 is {max(slack30, slack45)}')
                 continue
         eligible.append(int(flow_id))
     return eligible
@@ -52,6 +69,7 @@ def score_flows(
     weights: FlowScoreWeights,
     indexer,
     timebins_h: Sequence[int],
+    verbose_debug: bool = False,
 ) -> List[FlowScore]:
     """Score eligible flows and attach diagnostics."""
 
@@ -108,4 +126,55 @@ def score_flows(
             )
         )
     scores.sort(key=lambda fs: fs.score, reverse=True)
+
+    if verbose_debug:
+        try:
+            from rich.console import Console
+            from rich.table import Table
+        except ImportError:  # pragma: no cover - optional dependency
+            print("Rich is not installed; skipping verbose debug table.")
+        else:
+            console = Console()
+            table = Table(title="Flow Scores", highlight=True, expand=True)
+            table.add_column("Flow ID", style="cyan", justify="right")
+            table.add_column("Control TV", style="cyan")
+            table.add_column("Score", style="green", justify="right")
+            table.add_column("gH", justify="right")
+            table.add_column("v_tilde", justify="right")
+            table.add_column("rho", justify="right")
+            table.add_column("Slack15", justify="right")
+            table.add_column("Slack30", justify="right")
+            table.add_column("Slack45", justify="right")
+            table.add_column("Coverage", justify="right")
+            table.add_column("r0_i", justify="right")
+            table.add_column("xGH", justify="right")
+            table.add_column("DH", justify="right")
+            table.add_column("tGl", justify="right")
+            table.add_column("tGu", justify="right")
+            table.add_column("Bins", justify="right")
+            table.add_column("Flights", justify="right")
+
+            for score in scores:
+                diag = score.diagnostics
+                table.add_row(
+                    str(score.flow_id),
+                    str(score.control_tv_id) if score.control_tv_id is not None else "-",
+                    f"{score.score:.3f}",
+                    f"{diag.gH:.3f}",
+                    f"{diag.v_tilde:.3f}",
+                    f"{diag.rho:.3f}",
+                    f"{diag.slack15:.3f}",
+                    f"{diag.slack30:.3f}",
+                    f"{diag.slack45:.3f}",
+                    f"{diag.coverage:.3f}",
+                    f"{diag.r0_i:.3f}",
+                    f"{diag.xGH:.3f}",
+                    f"{diag.DH:.3f}",
+                    str(diag.tGl),
+                    str(diag.tGu),
+                    str(diag.bins_count),
+                    str(score.num_flights),
+                )
+            console.print(table)
+
     return scores
