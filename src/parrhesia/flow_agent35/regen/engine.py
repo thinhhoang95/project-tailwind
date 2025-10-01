@@ -333,7 +333,7 @@ def propose_regulations_for_hotspot(
         _log_capacity_snapshot("tv_filter", bundle_tv_filter, capacities_by_tv, timebins_seq)
 
         # 4) Build a localized scoring context per-bundle so that ripple/target TVs are correct.
-        #    Context mirrors the simulated annealing scoring: hotspot is target; TVs in tv_filter act as ripple.
+        #    Context mirrors the simulated annealing scoring
         context_bundle = build_local_context(
             indexer=indexer,
             flight_list=flight_list,

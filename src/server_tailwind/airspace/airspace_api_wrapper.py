@@ -959,6 +959,11 @@ class AirspaceAPIWrapper:
         - weights: optional objective weights
         - include_excess_vector: if True, include the full post-regulation excess vector
 
+        Additional outputs:
+        - pre_objective: objective before applying regulations (flow-based, same TVs/time windows)
+        - objective: objective after applying regulations
+        - delta_objective: pre_objective - objective (objective improvement)
+
         Backward compatibility (one release):
         - top_k is accepted but ignored; a deprecation note is included in metadata when present.
         """
@@ -967,14 +972,23 @@ class AirspaceAPIWrapper:
         loop = asyncio.get_event_loop()
 
         def _compute() -> Dict[str, Any]:
-            # Build indexer and parser based on the same files backing the server's FlightList
+            # This synchronous function contains the core logic for the simulation.
+            # It is run in a separate thread to avoid blocking the asyncio event loop.
+
+            # Initialize the TVTWIndexer and RegulationParser. These are essential tools for
+            # interpreting the traffic volume and time window data, and for parsing the
+            # regulation definitions. They are loaded based on the file paths associated
+            # with the current flight list, ensuring consistency.
             tvtw_indexer = TVTWIndexer.load(self._flight_list.tvtw_indexer_path)
             parser = RegulationParser(
                 flights_file=self._flight_list.occupancy_file_path,
                 tvtw_indexer=tvtw_indexer,
             )
 
-            # Normalize regulations into Regulation objects or raw strings
+            # The input `regulations` can be a mix of raw strings and dictionary objects.
+            # This loop normalizes them into a consistent list of `Regulation` objects or
+            # strings, making them easier to process later. Dictionaries are parsed
+            # to extract regulation components, and `Regulation` objects are created.
             normalized_regs: List[Any] = []
             for item in regulations:
                 if isinstance(item, str):
@@ -998,7 +1012,8 @@ class AirspaceAPIWrapper:
                 else:
                     raise ValueError("Each regulation must be a string or an object with required fields")
 
-            # Debug: print out the regulations
+            # For debugging purposes, print out the normalized regulations. This helps in
+            # verifying that the input regulations have been parsed correctly.
             print("DEBUG: Normalized regulations:")
             for i, reg in enumerate(normalized_regs):
                 if isinstance(reg, str):
@@ -1007,9 +1022,13 @@ class AirspaceAPIWrapper:
                     print(f"  {i}: (object) loc={reg.location}, rate={reg.rate}, time_windows={reg.time_windows}, filter_type={reg.filter_type}, filter_value={reg.filter_value}, target_flight_ids={reg.target_flight_ids}")
 
 
+            # A `NetworkPlan` is created from the list of normalized regulations. This object
+            # represents the entire set of regulations to be applied in the simulation.
             network_plan = NetworkPlan(normalized_regs)
 
-            # Evaluate plan -> delays, overlay view, metrics
+            # The `PlanEvaluator` is the core component that simulates the impact of the
+            # `NetworkPlan`. It calculates post-regulation delays, generates an overlay
+            # view of traffic, and computes various performance metrics.
             evaluator = PlanEvaluator(
                 traffic_volumes_gdf=self._traffic_volumes_gdf,
                 parser=parser,
@@ -1020,7 +1039,10 @@ class AirspaceAPIWrapper:
             time_end = time.time()
             print(f"Plan evaluation took {time_end - time_start} seconds")
 
-            # Rolling-hour occupancy arrays for all bins per TV (length = bins_per_tv)
+            # To analyze the impact of regulations, we need to compare traffic occupancy
+            # before and after the simulation. Here, flat occupancy vectors for both
+            # scenarios are computed. These vectors represent the number of flights in
+            # each traffic volume time window (TVTW).
             # 1) Build flat occupancy vectors pre/post
             time_start = time.time()
             pre_total = self._flight_list.get_total_occupancy_by_tvtw().astype(np.float32, copy=False)
@@ -1031,6 +1053,10 @@ class AirspaceAPIWrapper:
             time_end = time.time()
             print(f"Post-regulation occupancy computation took {time_end - time_start} seconds")
 
+            # Several dimensional parameters are calculated from the flight list data.
+            # These are used for reshaping arrays and performing calculations, such as
+            # `bins_per_hour` for converting hourly rates to per-bin capacities, and
+            # `bins_per_tv` for segmenting the flat occupancy vectors by traffic volume.
             # 2) Dimensions and helpers
             num_tvtws = int(self._flight_list.num_tvtws)
             num_tvs = int(len(self._flight_list.tv_id_to_idx))
@@ -1039,10 +1065,15 @@ class AirspaceAPIWrapper:
             if bins_per_tv <= 0:
                 raise RuntimeError("Invalid bins_per_tv computed from occupancy vector")
 
+            # To ensure consistent processing, a stable ordering of traffic volumes (TVs)
+            # is established based on their row index in the data.
             # 3) Stable ordering of TVs by row index
             tv_items = sorted(self._flight_list.tv_id_to_idx.items(), key=lambda kv: kv[1])
             tv_ids_in_row_order = [tv for tv, _ in tv_items]
 
+            # The flat pre- and post-regulation occupancy vectors are reshaped into 2D
+            # matrices. Each row corresponds to a traffic volume, and each column
+            # represents a time bin, making it easier to perform TV-specific analysis.
             # 4) Reshape pre/post into [num_tvs, bins_per_tv]
             pre_by_tv = np.zeros((num_tvs, bins_per_tv), dtype=np.float32)
             post_by_tv = np.zeros((num_tvs, bins_per_tv), dtype=np.float32)
@@ -1052,6 +1083,9 @@ class AirspaceAPIWrapper:
                 pre_by_tv[row, :] = pre_total[start:end]
                 post_by_tv[row, :] = post_total[start:end]
 
+            # Rolling-hour sums are calculated to understand the traffic density over a
+            # moving one-hour window. This is a key metric for assessing whether traffic
+            # levels exceed capacity. A forward-looking window is used.
             # 5) Rolling-hour (forward) sums per bin: sum over bins [i, i+W-1] (clamped at end)
             time_start = time.time()
 
@@ -1070,6 +1104,9 @@ class AirspaceAPIWrapper:
             time_end = time.time()
             print(f"Rolling-hour sums computation took {time_end - time_start} seconds")
 
+            # A helper function to compute aggregate delay statistics from a map of
+            # per-flight delays in minutes. This provides a summary of the regulation
+            # plan's impact on flight delays.
             def _compute_delay_stats_from_minutes(delays_map: Dict[str, int]) -> Dict[str, float]:
                 """Aggregate delay statistics derived from per-flight minute delays."""
                 total_minutes = sum(int(v) for v in delays_map.values())
@@ -1086,6 +1123,10 @@ class AirspaceAPIWrapper:
                     "num_delayed": int(len(delayed)),
                 }
 
+            # This section calculates the capacity for each time bin for every traffic
+            # volume. It first attempts to use a precomputed capacity matrix for efficiency.
+            # If not available, it falls back to calculating capacities from hourly
+            # capacity data, distributing the hourly rate across the bins within that hour.
             # 6) Capacity per bin for each TV, preferring precomputed per-bin matrices when available
             res = get_resources()
             capacity_matrix = getattr(res, "capacity_per_bin_matrix", None)
@@ -1124,17 +1165,24 @@ class AirspaceAPIWrapper:
 
             cap_by_tv_norm = normalize_capacities({tv: np.asarray(arr, dtype=np.float64) for tv, arr in cap_by_tv.items()})
 
+            # This is a major section for calculating a flow-based objective score.
+            # It groups flights into "flows" based on the regulations that affect them.
+            # The objective score provides a quantitative measure of the regulation
+            # plan's quality, considering factors like capacity violations, delays, etc.
             # 7) Flow-based objective integration via parrhesia.optim.objective.score
             delays_by_flight_output = plan_result.get("delays_by_flight", {}) or {}
             delay_stats_output = plan_result.get("delay_stats", {}) or {}
             objective_components_out: Dict[str, float] = {}
             objective_new = float(plan_result.get("objective", 0.0))
+            objective_before = 0.0
             weights_obj = ObjectiveWeights()
             weights_used_export = asdict(weights_obj)
             num_flows_scored = 0
             tvs_scored: List[str] = []
 
             try:
+                # First, flights are mapped to flows. Each regulation is regarded as one flow.
+                # Flights are uniquely assigned to one flow to avoid double counting.
                 flow_map: Dict[str, int] = {}
                 flow_to_reg: Dict[int, Regulation] = {}
                 assigned_flights: set[str] = set()
@@ -1163,6 +1211,8 @@ class AirspaceAPIWrapper:
                         flow_map[fid] = flow_idx
 
                 if flow_to_reg:
+                    # Prepare inputs for the flow scheduling and scoring functions.
+                    # This involves gathering flight data structured by the defined flows.
                     hotspot_ids = [flow_to_reg[idx].location for idx in sorted(flow_to_reg.keys())]
                     flights_by_flow_raw, _ = prepare_flow_scheduling_inputs(
                         flight_list=self._flight_list,
@@ -1172,8 +1222,11 @@ class AirspaceAPIWrapper:
                     )
                     flights_by_flow = {fid: specs for fid, specs in flights_by_flow_raw.items() if specs}
                     if flights_by_flow:
+                        # For each flow, determine the demand (requested flight times) and
+                        # the schedule (allowed flight times) based on regulation rates.
                         T = int(tvtw_indexer.num_time_bins)
                         n_f_t_for_score: Dict[int, List[int]] = {}
+                        n0_f_t_for_score: Dict[int, List[int]] = {}
                         target_cells_set: set[Tuple[str, int]] = set()
                         target_tv_ids: set[str] = set()
                         for flow_id, specs in flights_by_flow.items():
@@ -1190,6 +1243,12 @@ class AirspaceAPIWrapper:
                                 if bin_idx >= T:
                                     bin_idx = T - 1
                                 demand[bin_idx] += 1
+                            # Baseline schedule keeps raw demand (no allowance cap)
+                            baseline = demand.copy()
+                            baseline_total = int(np.sum(demand[:T], dtype=np.int64))
+                            baseline_released = int(np.sum(baseline[:T], dtype=np.int64))
+                            baseline[T] = max(0, baseline_total - baseline_released)
+                            # Regulated schedule applies allowance caps per regulation
                             schedule = demand.copy()
                             if reg is not None:
                                 target_tv_ids.add(str(reg.location))
@@ -1217,7 +1276,10 @@ class AirspaceAPIWrapper:
                             released = int(np.sum(schedule[:T], dtype=np.int64))
                             schedule[T] = max(0, total_flights - released)
                             n_f_t_for_score[flow_id] = schedule.astype(int).tolist()
+                            n0_f_t_for_score[flow_id] = baseline.astype(int).tolist()
                         if n_f_t_for_score:
+                            # Ripple cells are computed to account for scoring the overload
+                            # on non-target TVs (usually target = control volume = reference volume) .
                             ripple_fids: List[str] = []
                             for specs in flights_by_flow.values():
                                 for spec in specs:
@@ -1242,6 +1304,9 @@ class AirspaceAPIWrapper:
                                         weight_kwargs[key] = value
                             weights_obj = ObjectiveWeights(**weight_kwargs) if weight_kwargs else ObjectiveWeights()
                             weights_used_export = {k: float(v) for k, v in asdict(weights_obj).items()}
+                            # The `flow_score` function is called to compute the objective value.
+                            # It takes into account the scheduled flows, capacities, target cells,
+                            # ripple effects, and objective weights.
                             J_total, components, artifacts = flow_score(
                                 n_f_t=n_f_t_for_score,
                                 flights_by_flow=flights_by_flow,
@@ -1256,11 +1321,28 @@ class AirspaceAPIWrapper:
                             )
                             objective_new = float(J_total)
                             objective_components_out = {str(k): float(v) for k, v in components.items()}
+                            # The delays are updated based on the artifacts from the scoring,
+                            # providing a more accurate delay calculation that is consistent
+                            # with the flow-based objective.
                             delays_min = artifacts.get("delays_min", {}) or {}
                             if isinstance(delays_min, dict) and delays_min:
                                 delays_by_flight_output = {str(fid): int(val) for fid, val in delays_min.items()}
                                 delay_stats_output = _compute_delay_stats_from_minutes(delays_by_flight_output)
                             num_flows_scored = len(n_f_t_for_score)
+                            if n0_f_t_for_score:
+                                J_before, _components0, _artifacts0 = flow_score(
+                                    n_f_t=n0_f_t_for_score,
+                                    flights_by_flow=flights_by_flow,
+                                    indexer=tvtw_indexer,
+                                    capacities_by_tv=cap_by_tv_norm,
+                                    target_cells=target_cells_list,
+                                    ripple_cells=ripple_cells,
+                                    flight_list=self._flight_list,
+                                    weights=weights_obj,
+                                    tv_filter=tvs_scored,
+                                    spill_mode="dump_to_next_bin",
+                                )
+                                objective_before = float(J_before)
                         else:
                             tvs_scored = sorted(str(tv) for tv in target_tv_ids)
                     else:
@@ -1273,6 +1355,9 @@ class AirspaceAPIWrapper:
             if not objective_components_out:
                 objective_components_out = {k: 0.0 for k in ("J_cap", "J_delay", "J_reg", "J_tv")}
 
+            # A boolean mask is created for each TV to indicate which time windows are
+            # actively being regulated according to the network plan. A union mask
+            # across all TVs is also created for a global view of active windows.
             # 7) Build per-TV active window mask from the plan and also the UNION mask across all TVs
             tv_to_active_mask = {tv: np.zeros(bins_per_tv, dtype=bool) for tv, _ in tv_items}
             union_active_mask = np.zeros(bins_per_tv, dtype=bool)
@@ -1288,6 +1373,9 @@ class AirspaceAPIWrapper:
                         mask[wi] = True
                         union_active_mask[wi] = True
 
+            # To optimize the response payload, only TVs where the occupancy has
+            # changed are included. This is determined by comparing the pre- and
+            # post-regulation occupancy arrays for each TV.
             # 8) Determine changed TVs by comparing raw pre/post occupancy per TV (integer semantics)
             # If arrays are float, use tolerance to be safe.
             if np.issubdtype(pre_by_tv.dtype, np.floating) or np.issubdtype(post_by_tv.dtype, np.floating):
@@ -1296,6 +1384,9 @@ class AirspaceAPIWrapper:
                 diff_mask = (pre_by_tv != post_by_tv)
             changed_rows = np.where(np.any(diff_mask, axis=1))[0].tolist()
 
+            # The results for the changed TVs are packaged into a list of dictionaries.
+            # Each dictionary contains the TV ID, pre- and post-regulation rolling
+            # counts, capacity data, and active time windows.
             # 9) Package rolling arrays for changed TVs in stable row order
             rolling_changed_tvs: List[Dict[str, Any]] = []
             for tv_id, row in tv_items:
@@ -1312,6 +1403,9 @@ class AirspaceAPIWrapper:
                     }
                 )
 
+            # The `excess_vector` represents the amount by which occupancy exceeds
+            # capacity. Depending on the `include_excess_vector` flag, either the full
+            # vector or a statistical summary is included in the output.
             # Optionally include the full post-regulation excess vector
             post_excess = plan_result.get("excess_vector")
             excess_payload: Dict[str, Any]
@@ -1334,6 +1428,9 @@ class AirspaceAPIWrapper:
                     }
                 }
 
+            # To provide more context for the delays, pre-flight information is
+            # gathered for each delayed flight. This includes the original takeoff
+            # time and the baseline arrival time at the first regulated TV in its path.
             # Build pre-flight context: takeoff time and baseline arrival time to any regulated TV
             pre_flight_context: Dict[str, Dict[str, Optional[str]]] = {}
             delays_by_flight = delays_by_flight_output or {}
@@ -1399,11 +1496,16 @@ class AirspaceAPIWrapper:
                         "tv_arrival_time": tv_arrival_time_str,
                     }
 
+            # All the computed results are assembled into the final `result_payload`
+            # dictionary. This includes delays, objective scores, rolling occupancy
+            # data for changed TVs, pre-flight context, and metadata about the simulation.
             result_payload = {
                 "delays_by_flight": delays_by_flight_output,
                 "delay_stats": delay_stats_output,
                 # New rolling-hour objective (network-level)
+                "pre_objective": float(objective_before),
                 "objective": float(objective_new),
+                "delta_objective": float(objective_before - objective_new),
                 "objective_components": objective_components_out,
                 # Preserve hourly objective as legacy
                 "legacy_objective": float(plan_result.get("objective", 0.0)),
@@ -1426,6 +1528,9 @@ class AirspaceAPIWrapper:
                 **excess_payload,
             }
 
+            # For backward compatibility, a deprecation note is added to the metadata
+            # if the `top_k` parameter was used in the request, as it is no longer
+            # used for selecting which TVs to return.
             # Add deprecation note if top_k was provided in the request
             if top_k is not None:
                 try:

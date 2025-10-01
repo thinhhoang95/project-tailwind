@@ -443,7 +443,7 @@ Notes
 
 ### POST `/regulation_plan_simulation`
 
-Simulates a regulation plan, applies the shared flow-based objective, and returns per-flight delay minutes plus rolling-hour occupancy for every TV that changes. The response also includes `pre_flight_context` with baseline takeoff and TV-arrival timestamps for flights that receive delays.
+Simulates a regulation plan, applies the shared flow-based objective, and returns per-flight delay minutes plus rolling-hour occupancy for every TV that changes. The response also includes `pre_objective` (baseline score), `objective` (post-regulation score), `delta_objective`, and `pre_flight_context` with baseline takeoff and TV-arrival timestamps for flights that receive delays.
 
 You can provide regulations as raw strings in the `Regulation` DSL or as structured objects.
 
@@ -474,7 +474,7 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
 - `include_excess_vector`: If true, returns the full post-regulation excess vector; otherwise returns compact stats (`excess_vector_stats`).
 - Each regulation becomes a flow; per-flow demand histograms are capped using the supplied hourly rate (distributed across bins) before scoring.
 - Ripple cells are auto-derived with a ±2-bin shoulder from the flights covered by the regulations.
-- `objective` is the total from `parrhesia.optim.objective.score`. `objective_components` enumerates all active terms (`J_cap`, `J_delay`, `J_reg`, `J_tv`, and optionally `J_share`, `J_spill`). The legacy hourly combination remains under `legacy_objective(_components)` for one release.
+- `objective` is the post-regulation total from `parrhesia.optim.objective.score`; `pre_objective` is computed from the raw-demand baseline using the same flows/TVs, and `delta_objective = pre_objective - objective`. `objective_components` enumerates all active terms (`J_cap`, `J_delay`, `J_reg`, `J_tv`, and optionally `J_share`, `J_spill`). The legacy hourly combination remains under `legacy_objective(_components)` for one release.
 
 **Response:**
 ```json
@@ -491,7 +491,9 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
     "num_flights": 2,
     "num_delayed": 1
   },
+  "pre_objective": 102.5,
   "objective": 87.4,
+  "delta_objective": 15.1,
   "objective_components": {
     "J_cap": 55.0,
     "J_delay": 18.0,
@@ -555,6 +557,8 @@ Fields:
 - `pre_flight_context`: Map of flight ID → `{takeoff_time, tv_arrival_time}` strings (HH:MM:SS). `tv_arrival_time` can be `null` if the flight does not enter any regulated traffic volume.
 - `rolling_changed_tvs`: All TVs where any raw occupancy bin changed due to the plan; arrays are full-length per TV. Results are returned in stable TV row order (no ranking or top-k selection).
 - `rolling_top_tvs`: Deprecated alias, equal to `rolling_changed_tvs` for one release.
+- `pre_objective`: Baseline flow objective computed from raw demand with no allowances (same flows/TVs as the regulated run).
+- `delta_objective`: Difference `pre_objective - objective`, representing the improvement from the regulation plan (positive means improvement).
 - `weights_used`: Snapshot of the resolved `ObjectiveWeights` applied during scoring (helpful when partial overrides are supplied).
 - `metadata.num_flows`: Count of flow schedules evaluated by the objective.
 - `metadata.tvs_scored`: Alphabetical list of TVs included in the scoring window (targets ∪ ripple).
@@ -1117,7 +1121,7 @@ Notes
 
 ### POST `/regulation_plan_simulation`
 
-Simulates a regulation plan, applies the shared flow-based objective, and returns per-flight delay minutes plus rolling-hour occupancy for every TV that changes. The response also includes `pre_flight_context` with baseline takeoff and TV-arrival timestamps for flights that receive delays.
+Simulates a regulation plan, applies the shared flow-based objective, and returns per-flight delay minutes plus rolling-hour occupancy for every TV that changes. The response also includes `pre_objective`, `objective`, `delta_objective`, and `pre_flight_context` with baseline takeoff and TV-arrival timestamps for flights that receive delays.
 
 You can provide regulations as raw strings in the `Regulation` DSL or as structured objects.
 
@@ -1148,7 +1152,7 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
 - `include_excess_vector`: If true, returns the full post-regulation excess vector; otherwise returns compact stats (`excess_vector_stats`).
 - Each regulation becomes a flow; per-flow demand histograms are capped using the supplied hourly rate (distributed across bins) before scoring.
 - Ripple cells are auto-derived with a ±2-bin shoulder from the flights covered by the regulations.
-- `objective` is the total from `parrhesia.optim.objective.score`. `objective_components` enumerates all active terms (`J_cap`, `J_delay`, `J_reg`, `J_tv`, and optionally `J_share`, `J_spill`). The legacy hourly combination remains under `legacy_objective(_components)` for one release.
+- `objective` is the post-regulation total from `parrhesia.optim.objective.score`; `pre_objective` is computed from the raw-demand baseline using the same flows/TVs, and `delta_objective = pre_objective - objective`. `objective_components` enumerates all active terms (`J_cap`, `J_delay`, `J_reg`, `J_tv`, and optionally `J_share`, `J_spill`). The legacy hourly combination remains under `legacy_objective(_components)` for one release.
 
 **Response:**
 ```json
@@ -1165,7 +1169,9 @@ You can provide regulations as raw strings in the `Regulation` DSL or as structu
     "num_flights": 2,
     "num_delayed": 1
   },
+  "pre_objective": 102.5,
   "objective": 87.4,
+  "delta_objective": 15.1,
   "objective_components": {
     "J_cap": 55.0,
     "J_delay": 18.0,
@@ -1229,6 +1235,8 @@ Fields:
 - `pre_flight_context`: Map of flight ID → `{takeoff_time, tv_arrival_time}` strings (HH:MM:SS). `tv_arrival_time` can be `null` if the flight does not enter any regulated traffic volume.
 - `rolling_changed_tvs`: All TVs where any raw occupancy bin changed due to the plan; arrays are full-length per TV. Results are returned in stable TV row order (no ranking or top-k selection).
 - `rolling_top_tvs`: Deprecated alias, equal to `rolling_changed_tvs` for one release.
+- `pre_objective`: Baseline flow objective computed from raw demand with no allowances (same flows/TVs as the regulated run).
+- `delta_objective`: Difference `pre_objective - objective`, representing the improvement from the regulation plan (positive means improvement).
 - `weights_used`: Snapshot of the resolved `ObjectiveWeights` applied during scoring (helpful when partial overrides are supplied).
 - `metadata.num_flows`: Count of flow schedules evaluated by the objective.
 - `metadata.tvs_scored`: Alphabetical list of TVs included in the scoring window (targets ∪ ripple).
