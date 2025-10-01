@@ -185,6 +185,9 @@ class RegenAPIWrapper:
                 resolution=resolution,
             )
             flow_to_flights = self._flow_id_to_flights(flows_payload)
+
+            num_regulations_limit = int(top_k_regulations) if (top_k_regulations is not None and int(top_k_regulations) > 0) else None
+            
             
             my_cfg = RegenConfig(
                 g_min=-float("inf"),
@@ -192,7 +195,8 @@ class RegenAPIWrapper:
                 slack_min=-float("inf"),
                 distinct_controls_required=False,
                 raise_on_edge_cases=True,
-                min_num_flights=4
+                min_num_flights=4,
+                top_k_regulations=num_regulations_limit
             )            
 
 
@@ -214,9 +218,7 @@ class RegenAPIWrapper:
 
         flows_payload, flow_to_flights, proposals = await loop.run_in_executor(self._executor, _compute)
 
-        limit = int(top_k_regulations) if (top_k_regulations is not None and int(top_k_regulations) > 0) else None
-        if limit is not None:
-            proposals = proposals[:limit]
+        
 
         weights = resolve_weights(None)
         weights_dict = {
