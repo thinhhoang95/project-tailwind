@@ -1,0 +1,28 @@
+[Unit]
+Description=Tailwind API Service
+After=network.target
+Wants=network-online.target
+
+[Service]
+User=fastapi
+Group=fastapi
+WorkingDirectory=/root/project-tailwind
+EnvironmentFile=/etc/tailwind.env
+
+# Security hardening (relax as needed)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+# Run the script with the env's Python
+ExecStart=/root/minicoda3/envs/sdrizzle/bin/python /root/project-tailwind/run_server.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
