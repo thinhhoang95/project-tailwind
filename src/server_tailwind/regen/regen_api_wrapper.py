@@ -197,7 +197,10 @@ class RegenAPIWrapper:
                 raise_on_edge_cases=True,
                 min_num_flights=4,
                 k_proposals=num_regulations_limit
-            )            
+            )
+
+            if num_regulations_limit is None:
+                num_regulations_limit = my_cfg.k_proposals
 
 
             proposals = propose_regulations_for_hotspot(
@@ -333,7 +336,7 @@ class RegenAPIWrapper:
             "traffic_volume_id": tv,
             "time_window": time_window,
             "time_bin_minutes": self.time_bin_minutes,
-            "top_k": limit,
+            "top_k": num_regulations_limit,
             "weights": weights_dict,
             "num_proposals": len(proposals_payload),
             "proposals": proposals_payload,
