@@ -2,6 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
+._*
 
 # C extensions
 *.so
@@ -212,7 +213,6 @@ output/*
 
 # agent runs
 agent_runs/
-
 # macOS meta files
 .DS_Store
 .DS_Store?
