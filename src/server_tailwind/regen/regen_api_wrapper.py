@@ -186,7 +186,8 @@ class RegenAPIWrapper:
             )
             flow_to_flights = self._flow_id_to_flights(flows_payload)
 
-            num_regulations_limit = int(top_k_regulations) if (top_k_regulations is not None and int(top_k_regulations) > 0) else None
+            DEFAULT_CONFIG = RegenConfig() # to provide reference values in case top_k_regulations is not provided
+            num_regulations_limit = int(top_k_regulations) if (top_k_regulations is not None and int(top_k_regulations) > 0) else DEFAULT_CONFIG.k_proposals
             
             
             my_cfg = RegenConfig(
