@@ -29,7 +29,7 @@ from parrhesia.flow_agent35.regen.engine import propose_regulations_for_hotspot
 from parrhesia.flow_agent35.regen.exceedance import compute_hotspot_exceedance
 from parrhesia.flow_agent35.regen.rates import compute_e_target
 from parrhesia.flow_agent35.regen.types import RegenConfig
-from parrhesia.optim.capacity import normalize_capacities
+from parrhesia.optim.capacity import build_bin_capacities, normalize_capacities
 
 
 # Time Profiling helpers ===
@@ -139,6 +139,12 @@ def build_data(occupancy_path: Path, indexer_path: Path, caps_path: Path) -> Tup
         raise SystemExit("Traffic volume capacity file is empty; cannot proceed.")
 
     evaluator = NetworkEvaluator(caps_gdf, flight_list)
+    # Preserve capacities path for later use by _build_capacities_by_tv
+    try:
+        evaluator._capacities_path = str(caps_path)  # type: ignore[attr-defined]
+    except Exception:
+        print(f"[warning] Failed to set capacities path on evaluator")
+        pass
     return flight_list, indexer, evaluator
 
 
@@ -165,6 +171,31 @@ def _build_capacities_by_tv(
     Build per-bin capacities for each traffic volume and normalize them,
     mirroring the approach used by the server-side wrapper.
     """
+    # Prefer the shared builder from parrhesia.optim.capacity when a source path is known
+    caps_path = getattr(evaluator, "_capacities_path", None)
+    if caps_path:
+        try:
+            raw_caps = build_bin_capacities(str(caps_path), indexer)
+            capacities_by_tv = normalize_capacities(raw_caps)
+            if capacities_by_tv:
+                sample_items = list(capacities_by_tv.items())[:5]
+                sample_stats = []
+                for tv, arr in sample_items:
+                    arr_np = np.asarray(arr, dtype=np.float64)
+                    if arr_np.size == 0:
+                        sample_stats.append(f"{tv}:empty")
+                        continue
+                    sample_stats.append(
+                        f"{tv}:min={float(arr_np.min()):.1f},max={float(arr_np.max()):.1f}"
+                    )
+                print(
+                    f"Regen: normalized capacities (from GeoJSON) ready for {len(capacities_by_tv)} TVs; samples: "
+                    + "; ".join(sample_stats)
+                )
+            return capacities_by_tv
+        except Exception as exc:
+            print(f"Regen: capacity builder fallback due to error: {exc}")
+
     T = int(indexer.num_time_bins)
     bins_per_hour = int(indexer.rolling_window_size())
 
