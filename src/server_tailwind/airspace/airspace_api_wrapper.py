@@ -62,7 +62,13 @@ class AirspaceAPIWrapper:
         self._tv_travel_minutes: Optional[Dict[str, Dict[str, float]]] = None
         self._travel_lock = threading.Lock()
         self._initialize_data()
-    
+
+    def invalidate_caches(self) -> None:
+        """Reset cached occupancy/slack vectors so next access recomputes using latest data."""
+        with self._slack_lock:
+            self._slack_vector = None
+            self._total_occupancy_vector = None
+
     def _initialize_data(self):
         """Initialize the NetworkEvaluator with required data."""
         try:

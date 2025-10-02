@@ -11,9 +11,9 @@ import sys
 project_root = Path(__file__).parent.parent.parent / "src"
 sys.path.insert(0, str(project_root))
 
-from project_tailwind.optimize.eval.flight_list import FlightList
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.impact_eval.distance_computation import haversine_vectorized
+from project_tailwind.stateman.flight_list_with_delta import FlightListWithDelta
 
 
 @dataclass(frozen=True)
@@ -34,7 +34,7 @@ class AppResources:
     def __init__(self, paths: Optional[ResourcePaths] = None):
         self.paths = paths or ResourcePaths()
         self._lock = threading.RLock()
-        self._flight_list: Optional[FlightList] = None
+        self._flight_list: Optional[FlightListWithDelta] = None
         self._indexer: Optional[TVTWIndexer] = None
         self._traffic_volumes_gdf: Optional[Any] = None
         self._hourly_capacity_by_tv: Optional[Dict[str, Dict[int, float]]] = None
@@ -51,10 +51,10 @@ class AppResources:
         return self
 
     @property
-    def flight_list(self) -> FlightList:
+    def flight_list(self) -> FlightListWithDelta:
         with self._lock:
             if self._flight_list is None:
-                self._flight_list = FlightList(
+                self._flight_list = FlightListWithDelta(
                     occupancy_file_path=str(self.paths.occupancy_file_path),
                     tvtw_indexer_path=str(self.paths.tvtw_indexer_path),
                 )
@@ -211,4 +211,3 @@ def get_resources() -> AppResources:
         if _GLOBAL_RESOURCES is None:
             _GLOBAL_RESOURCES = AppResources()
         return _GLOBAL_RESOURCES
-
