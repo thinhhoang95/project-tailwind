@@ -166,6 +166,34 @@ class RegenAPIWrapper:
         threshold: Optional[float] = None,
         resolution: Optional[float] = None,
     ) -> Dict[str, Any]:
+        """
+        Generate regulation proposals for a hotspot traffic volume within a specified time window.
+        
+        Parameters:
+        	traffic_volume_id (str): Identifier of the hotspot traffic volume to analyze.
+        	time_window (str): Time window label in "HH:MM-HH:MM" format that defines the analysis bins.
+        	top_k_regulations (Optional[int]): Optional maximum number of proposals to prefer; when omitted, a default from configuration is used.
+        	threshold (Optional[float]): Optional threshold passed to flow computation to filter low-impact flows.
+        	resolution (Optional[float]): Optional spatial/metric resolution passed to flow computation.
+        
+        Returns:
+        	response (Dict[str, Any]): A dictionary with keys:
+        		- "traffic_volume_id": the normalized traffic volume id used.
+        		- "time_window": the input time_window string.
+        		- "time_bin_minutes": length of a time bin in minutes.
+        		- "top_k": the input top_k_regulations value (or None).
+        		- "weights": resolved weight components as {"w1": .., "w2": .., ..., "w6": ..}.
+        		- "num_proposals": number of proposals returned.
+        		- "proposals": list of proposal objects; each proposal contains:
+        			- "hotspot": metadata about the hotspot and input timebins.
+        			- "control_window": control window bins and human-readable label.
+        			- "target_tvs" / "ripple_tvs": affected traffic volume ids.
+        			- "target_cells" / "ripple_cells": affected (tv_id, bin) pairs.
+        			- "objective_improvement": predicted improvement metrics.
+        			- "objective_components": score components before, after, and their delta.
+        			- "flows": per-flow details including flow_id, flight_ids, baseline/allowed/assigned rates, time window bins, features, and final_score.
+        			- "diagnostics": summary diagnostics (ranking score, E_target, occupancy, diversity penalty).
+        """
         tv = str(traffic_volume_id).strip()
         if tv not in self._tv_to_row:
             raise ValueError(f"Unknown traffic_volume_id: {tv}")
@@ -177,6 +205,15 @@ class RegenAPIWrapper:
         loop = asyncio.get_event_loop()
 
         def _compute() -> Tuple[Dict[str, Any], Dict[int, List[str]], List[Any]]:
+            """
+            Compute flows for the given hotspot, build a mapping from flow IDs to flight IDs, and generate regulation proposals.
+            
+            Returns:
+                tuple:
+                    - flows_payload (dict): The computed flows payload keyed by flow identifiers (structure produced by compute_flows).
+                    - flow_to_flights (dict[int, list[str]]): Mapping from flow ID to a list of associated flight IDs.
+                    - proposals (list): List of proposal objects returned by propose_regulations_for_hotspot.
+            """
             flows_payload = compute_flows(
                 tvs=[tv],
                 timebins=list(timebins_h),

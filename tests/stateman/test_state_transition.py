@@ -26,6 +26,15 @@ from project_tailwind.stateman.regulation_history import RegulationHistory
 
 @pytest.fixture
 def sample_flight_files(tmp_path: Path) -> tuple[Path, Path]:
+    """
+    Create two temporary JSON files (occupancy and tvtw indexer) and return their paths.
+    
+    Parameters:
+        tmp_path (Path): Pytest temporary directory in which to create the files.
+    
+    Returns:
+        tuple[Path, Path]: Paths to the created occupancy JSON and tvtw_indexer JSON, respectively.
+    """
     indexer_path = tmp_path / "tvtw_indexer.json"
     occupancy_path = tmp_path / "occupancy.json"
 
@@ -65,6 +74,15 @@ def sample_flight_files(tmp_path: Path) -> tuple[Path, Path]:
 
 @pytest.fixture
 def base_flight_list(sample_flight_files: tuple[Path, Path]) -> FlightList:
+    """
+    Create a FlightList initialized from a pair of occupancy and indexer JSON file paths.
+    
+    Parameters:
+        sample_flight_files (tuple[Path, Path]): A tuple containing (occupancy_path, indexer_path).
+    
+    Returns:
+        FlightList: An instance loaded from the provided occupancy and indexer files.
+    """
     occupancy_path, indexer_path = sample_flight_files
     return FlightList(str(occupancy_path), str(indexer_path))
 

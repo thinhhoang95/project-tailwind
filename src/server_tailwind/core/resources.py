@@ -32,6 +32,17 @@ class AppResources:
     """
 
     def __init__(self, paths: Optional[ResourcePaths] = None):
+        """
+        Initialize AppResources with optional custom resource paths and prepare thread-safe caches.
+        
+        Parameters:
+            paths (Optional[ResourcePaths]): Optional custom file paths configuration; when omitted, defaults are used.
+        
+        Description:
+            Creates a reentrant lock and initializes internal cached resource slots (flight list, indexer,
+            traffic volumes GeoDataFrame, per-TV hourly capacity mapping, capacity-per-bin matrix,
+            travel-time matrix, and TV centroids) to None for lazy, thread-safe loading.
+        """
         self.paths = paths or ResourcePaths()
         self._lock = threading.RLock()
         self._flight_list: Optional[FlightListWithDelta] = None
@@ -43,6 +54,14 @@ class AppResources:
         self._tv_centroids: Optional[Dict[str, tuple]] = None
 
     def preload_all(self) -> "AppResources":
+        """
+        Force the lazy loading and caching of all primary resources held by this AppResources instance.
+        
+        This accesses each heavy property (flight_list, indexer, traffic_volumes_gdf, hourly_capacity_by_tv, capacity_per_bin_matrix) to ensure they are loaded and cached.
+        
+        Returns:
+            AppResources: The same AppResources instance (`self`).
+        """
         _ = self.flight_list
         _ = self.indexer
         _ = self.traffic_volumes_gdf
@@ -52,6 +71,14 @@ class AppResources:
 
     @property
     def flight_list(self) -> FlightListWithDelta:
+        """
+        Lazily loads and returns the shared FlightListWithDelta instance for the application.
+        
+        This property is thread-safe and caches the created FlightListWithDelta so subsequent accesses return the same instance.
+        
+        Returns:
+            FlightListWithDelta: The cached FlightListWithDelta instance.
+        """
         with self._lock:
             if self._flight_list is None:
                 self._flight_list = FlightListWithDelta(
@@ -206,6 +233,14 @@ _GLOBAL_LOCK = threading.Lock()
 
 
 def get_resources() -> AppResources:
+    """
+    Return the process-wide AppResources singleton.
+    
+    Creates and caches an AppResources instance on first call and returns the same instance thereafter; creation is protected by a process-wide lock to be thread-safe.
+    
+    Returns:
+        AppResources: The singleton AppResources instance.
+    """
     global _GLOBAL_RESOURCES
     with _GLOBAL_LOCK:
         if _GLOBAL_RESOURCES is None:

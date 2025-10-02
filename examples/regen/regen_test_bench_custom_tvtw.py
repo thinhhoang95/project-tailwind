@@ -347,6 +347,27 @@ def propose_regulations(
     indexer: TVTWIndexer,
     top_k: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
+    """
+    Generate regulation proposals for a hotspot (control traffic volume) over a specified time window.
+    
+    This function prepares inputs (capacities, centroids, travel times, and flows), invokes the Regen proposal engine with a relaxed fallback configuration, computes exceedance statistics, and converts the resulting proposals into a list of dictionaries suitable for emission.
+    
+    Parameters:
+    	hotspot_payload (Dict[str, Any]): Hotspot description that must include:
+    		- "control_volume_id": identifier of the control traffic volume (string or int).
+    		- "window_bins": iterable describing the time window (single bin or [start, end_exclusive]).
+    		- optional "metadata" mapping which may contain "flow_to_flights" (mapping flow_id -> list of flight IDs).
+    	evaluator (NetworkEvaluator): Evaluator providing capacity data and a reference to the FlightList.
+    	indexer (TVTWIndexer): Time-volume-time-width indexer describing timebin layout and TV identifiers.
+    	top_k (Optional[int]): If provided, limit output to the first top_k proposals.
+    
+    Returns:
+    	List[Dict[str, Any]]: A list of proposal dictionaries (as produced by _proposal_to_dict) ordered by the engine's ranking.
+    
+    Raises:
+    	ValueError: If hotspot_payload is missing control volume id, missing/empty time window, or if evaluator lacks a flight_list.
+    	RuntimeError: If the regen engine returns no proposals even after the relaxed fallback configuration, or if applying top_k results in zero proposals.
+    """
     control_tv = str(hotspot_payload.get("control_volume_id"))
     if not control_tv:
         raise ValueError("hotspot payload missing control volume id")
@@ -448,6 +469,11 @@ def propose_top_regulations(
 
 
 def main() -> None:
+    """
+    Run an end-to-end Regen proposal workflow and emit human-readable and JSON outputs.
+    
+    Loads required artifacts and data, selects a manual hotspot window, computes flows for the hotspot, generates per-flow regulation proposals, prints formatted summaries to the console, and writes the full proposal payload to agent_runs/runs/regen_proposal.json as JSON. The function performs I/O and console side effects but does not return a value.
+    """
     print("[regen] Resolving artifacts ...")
     occ_path, idx_path, caps_path = load_artifacts()
     print(f"[regen] occupancy: {occ_path}")

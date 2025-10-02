@@ -31,6 +31,13 @@ class CountAPIWrapper:
     """
 
     def __init__(self):
+        """
+        Initialize the CountAPIWrapper, loading shared resources and preparing execution and cache structures.
+        
+        Creates a ThreadPoolExecutor for CPU-bound work, loads the shared FlightList and indexer via get_resources, and initializes occupancy and capacity caches:
+        - _total_occupancy_vector is cleared (None) to indicate no cached total occupancy.
+        - _hourly_capacity_by_tv and _capacity_per_bin_matrix are populated from the shared resources when available.
+        """
         self._executor = ThreadPoolExecutor(max_workers=2)
         # Load once and reuse shared resources
         res = get_resources()
@@ -48,7 +55,15 @@ class CountAPIWrapper:
         self._total_occupancy_vector = None
 
     def _init_capacity_data(self) -> None:
-        """Load hourly capacity by TV from GeoJSON and build per-bin matrix."""
+        """
+        Load hourly capacity data per traffic volume from GeoJSON and build a per-bin capacity matrix.
+        
+        Attempts known file locations (absolute then data/ fallback). If no valid capacity file is found, clears capacity caches and returns. Parses each feature's `capacity` field (accepting dicts or JSON-like strings) into an hour -> capacity mapping, tolerating and skipping malformed entries. Uses the FlightList's time-bin configuration to expand hourly capacities into a matrix of shape [num_tvs, bins_per_tv], repeating each hour's capacity across the corresponding bins and filling -1.0 where capacity is unavailable. Populates:
+        - self._hourly_capacity_by_tv: mapping from traffic_volume_id (str) to {hour (int) -> capacity (float)}
+        - self._capacity_per_bin_matrix: numpy float32 matrix or None
+        
+        Malformed rows or parsing errors are skipped; the method does not raise on parse failures.
+        """
         # Try absolute path first (as used elsewhere), then fallback
         try_paths = [
             Path("D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"),

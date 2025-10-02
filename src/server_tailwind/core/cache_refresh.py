@@ -17,7 +17,15 @@ def refresh_after_state_update(
     count_wrapper: Optional[Any] = None,
     query_wrapper: Optional[Any] = None,
 ) -> None:
-    """Refresh global caches so subsequent queries see the latest flight list state."""
+    """
+    Refresh shared caches and register global resources so subsequent queries observe the updated flight list state.
+    
+    Parameters:
+        resources (Any): Object exposing `flight_list` and `indexer` representing the current flight data.
+        airspace_wrapper (Optional[Any]): Optional wrapper; if it exposes `invalidate_caches`, those caches will be invalidated.
+        count_wrapper (Optional[Any]): Optional wrapper; if it exposes `invalidate_caches`, those caches will be invalidated.
+        query_wrapper (Optional[Any]): Optional wrapper; if it exposes `refresh_flight_list`, it will be invoked with `resources.flight_list`.
+    """
     if airspace_wrapper is not None and hasattr(airspace_wrapper, "invalidate_caches"):
         airspace_wrapper.invalidate_caches()
     if count_wrapper is not None and hasattr(count_wrapper, "invalidate_caches"):

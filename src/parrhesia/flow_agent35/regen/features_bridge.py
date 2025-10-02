@@ -35,7 +35,20 @@ def extract_features_for_flows(
     direction_opts: Optional[Mapping[str, Any]] = None,
     verbose_debug: bool = False,
 ) -> Dict[int, FlowFeatures]:
-    """Compute flow features for the provided hotspot window."""
+    """
+    Compute flow features for the specified hotspot window.
+    
+    Parameters:
+        extractor: Feature extractor used to compute per-flow metrics.
+        hotspot_tv: Identifier of the hotspot time window to analyze.
+        timebins: Sequence of time-bin indices that define the hotspot window.
+        flows_payload: Optional mapping of flow specifications to use instead of extractor defaults.
+        direction_opts: Optional mapping of direction-related options forwarded to the extractor.
+        verbose_debug: If True, attempt to render a human-readable table of computed features; rendering errors are ignored.
+    
+    Returns:
+        A mapping from flow_id (int) to its corresponding FlowFeatures.
+    """
 
     out = extractor.compute_for_hotspot(
         hotspot_tv=hotspot_tv,
@@ -103,7 +116,20 @@ def _extract_requested_bin_from_metadata(
     flight_list: Any,
     indexer: Any,
 ) -> Optional[int]:
-    """Best-effort reconstruction of the control-time requested bin for a flight."""
+    """
+    Reconstruct the earliest requested time bin for a flight that corresponds to the given control time value.
+    
+    Searches flight_list.flight_metadata for the flight's occupancy_intervals, resolves each interval's `tvtw_index` via `indexer.get_tvtw_from_index()` to obtain `(tv_id, tbin)`, and returns the smallest integer `tbin` whose `tv_id` matches `control_tv`. Silently skips missing data or conversion errors.
+    
+    Parameters:
+    	flight_id (str): Flight identifier to look up in flight_list.flight_metadata.
+    	control_tv (Optional[str]): Control time value to match against resolved tv_id; if falsy, the function returns `None`.
+    	flight_list (Any): Object exposing a `flight_metadata` mapping from flight_id to metadata containing `occupancy_intervals`.
+    	indexer (Any): Object providing `get_tvtw_from_index(index)` which returns a `(tv_id, tbin)` pair for a given tvtw index.
+    
+    Returns:
+    	Optional[int]: The earliest matching requested bin as an integer, or `None` if no matching bin can be reconstructed.
+    """
 
     if not control_tv:
         return None

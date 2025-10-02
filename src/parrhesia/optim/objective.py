@@ -1054,7 +1054,22 @@ def _compute_J_cap(
     ripple_cells: Optional[Iterable[Cell]] = None,
 ) -> float:
     """
-    Compute weighted exceedance across TVs with provided alpha weights.
+    Compute the weighted capacity-exceedance penalty across TVs using a K-bin rolling occupancy window.
+    
+    For each TV, this computes a forward-looking rolling sum of occupancy over K bins, subtracts the per-bin capacity (missing TVs or shorter arrays are treated as zeros and arrays are truncated/padded to match lengths), clips negatives to zero, multiplies by the provided per-bin alpha weights, and returns the sum of those weighted exceedances.
+    
+    Parameters:
+        occ_by_tv (Mapping[str, np.ndarray]): Mapping from TV id to 1D occupancy array (per-bin counts).
+        capacities_by_tv (Mapping[str, np.ndarray]): Mapping from TV id to 1D capacity array; missing or shorter arrays are treated as zeros and padded/truncated to match occupancy length.
+        alpha_by_tv (Mapping[str, np.ndarray]): Mapping from TV id to 1D per-bin alpha weights; missing or shorter arrays are treated as zeros and padded/truncated to match occupancy length.
+        K (int): Length of the rolling window (in bins) used to compute occupancy to compare against capacity.
+        audit_exceedances (bool, optional): If True, classify and inspect individual exceedance cells (uses indexer and provided target/ripple cell sets for classification). This does not change the computed value.
+        indexer (Optional[TVTWIndexer], optional): Optional indexer used to obtain human-readable time mappings for auditing; ignored if None.
+        target_cells (Optional[Iterable[Cell]], optional): Iterable of (tv_id, bin) cells considered "target" for auditing classification.
+        ripple_cells (Optional[Iterable[Cell]], optional): Iterable of (tv_id, bin) cells considered "ripple" for auditing classification.
+    
+    Returns:
+        float: Total weighted capacity-exceedance (sum over TVs and bins of alpha * max(rolling_occupancy_K - capacity, 0)).
     """
     # Fast path: no auditing requested -> vectorized
     if not audit_exceedances:
