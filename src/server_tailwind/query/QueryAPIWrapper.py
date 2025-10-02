@@ -42,6 +42,20 @@ class QueryAPIWrapper:
 
     def __init__(self, resources=None):
         # Allow dependency injection for tests; default to shared resources
+        """
+        Initialize the QueryAPIWrapper and prepare internal resource-backed state and caches.
+        
+        Parameters:
+            resources (optional): Dependency-injected resources object providing attributes used by the wrapper
+                (e.g., `indexer`, `capacity_per_bin_matrix`, `hourly_capacity_by_tv`, `traffic_volumes_gdf`, and
+                `flight_list`). If omitted, shared application resources are obtained automatically.
+        
+        Description:
+            - Binds resource-backed attributes required for query evaluation and capacity lookups.
+            - Creates empty caches and lookup stores that will be populated lazily or by calling refresh_flight_list.
+            - Rebinds the current flight list via refresh_flight_list to build flight-derived state.
+            - Initializes internal cache hit counter.
+        """
         self._resources = resources or get_resources()
         self.indexer = getattr(self._resources, "indexer", None)
         self._capacity_per_bin_matrix: Optional[np.ndarray] = getattr(

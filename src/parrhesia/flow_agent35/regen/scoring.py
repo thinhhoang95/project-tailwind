@@ -22,7 +22,26 @@ def prune_flows(
     bins_per_hour: int,
     verbose_debug: bool = False,
 ) -> List[int]:
-    """Return flow ids that pass the eligibility filters."""
+    """
+    Select flow IDs that meet configured eligibility criteria for scoring.
+    
+    Evaluates each flow in `features` against a sequence of filters and returns the flow IDs that pass all checks. Filters applied (in order) include:
+    - minimum number of flights,
+    - positive xGH,
+    - positive baseline rate derived from features and `bins_per_hour`,
+    - minimum gH,
+    - maximum rho,
+    - minimum slack across 15/30/45-minute slack metrics (Slack_G15, Slack_G30, Slack_G45; missing values treated as 0.0).
+    
+    Parameters:
+        features (Mapping[int, FlowFeatures]): Mapping of flow ID to feature summary used for eligibility checks.
+        config (RegenConfig): Configuration object containing threshold values (e.g., min_num_flights, g_min, rho_max, slack_min).
+        bins_per_hour (int): Number of bins per hour used to compute the baseline rate from features.
+        verbose_debug (bool): If True, emit human-readable prune reason messages to stdout.
+    
+    Returns:
+        List[int]: Flow IDs (as ints) that passed all eligibility filters.
+    """
 
     eligible: List[int] = []
     slack_min = float(config.slack_min)
@@ -71,7 +90,20 @@ def score_flows(
     timebins_h: Sequence[int],
     verbose_debug: bool = False,
 ) -> List[FlowScore]:
-    """Score eligible flows and attach diagnostics."""
+    """
+    Compute scores and diagnostics for the provided eligible flows and return them sorted by score in descending order.
+    
+    Parameters:
+        eligible_flows (Sequence[int]): Flow IDs to score.
+        features (Mapping[int, FlowFeatures]): Mapping from flow ID to its FlowFeatures; flows missing from this mapping are skipped.
+        weights (FlowScoreWeights): Weighting factors used to compute the linear score.
+        indexer: Object providing rolling_window_size() used to derive bins_per_hour for baseline rate and coverage calculations.
+        timebins_h (Sequence[int]): Time bin labels (hours) used by the coverage calculation.
+        verbose_debug (bool): If True, attempt to render a detailed diagnostic table (using Rich if available).
+    
+    Returns:
+        List[FlowScore]: List of FlowScore objects (each includes diagnostics) sorted by score in descending order.
+    """
 
     bins_per_hour = int(indexer.rolling_window_size())
     scores: List[FlowScore] = []

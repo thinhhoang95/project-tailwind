@@ -50,7 +50,11 @@ class AirspaceAPIWrapper:
     """
     
     def __init__(self):
-        """Initialize the API wrapper with data loading."""
+        """
+        Create and initialize the AirspaceAPIWrapper, loading resources and preparing internal state.
+        
+        Sets up a thread pool executor, placeholders for the NetworkEvaluator and FlightFeatures, cache containers for slack and occupancy vectors and travel-minute maps, and the associated locks. Calls _initialize_data() to load resources and attempt to build the evaluator.
+        """
         self._evaluator: Optional[NetworkEvaluator] = None
         self._executor = ThreadPoolExecutor(max_workers=2)
         self._flight_features: Optional[FlightFeatures] = None
@@ -64,7 +68,11 @@ class AirspaceAPIWrapper:
         self._initialize_data()
 
     def invalidate_caches(self) -> None:
-        """Reset cached occupancy/slack vectors so next access recomputes using latest data."""
+        """
+        Invalidate cached slack and occupancy vectors so subsequent accesses recompute them from current data.
+        
+        This operation is thread-safe: it acquires the wrapper's internal slack lock before clearing the caches.
+        """
         with self._slack_lock:
             self._slack_vector = None
             self._total_occupancy_vector = None

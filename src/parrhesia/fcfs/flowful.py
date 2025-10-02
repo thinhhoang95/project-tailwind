@@ -470,34 +470,30 @@ def assign_delays_flowful_preparsed(
     release_rate_for_spills: Optional[Union[float, Mapping[Any, float]]] = None,
 ) -> Tuple[Dict[str, int], Dict[str, object]]:
     """
-    Variant of assign_delays_flowful that assumes flights are pre-normalized and sorted.
-
-    Parameters
-    ----------
-    flights_sorted_by_flow : Mapping[Any, Sequence[Tuple[str, Optional[datetime], int]]]
-        Flow-wise sequences of (flight_id, requested_datetime | None, requested_bin)
-        sorted by the FIFO key.
-    n_f_t : Mapping[Any, Sequence[int] | Mapping[int, int]]
-        Per-flow release plan of length T+1 with overflow bin at index T.
-    indexer : TVTWIndexer
-        Provides bin length and horizon.
-    spill_mode : SpillMode, optional
-        Controls spill handling beyond the active window. ``"overflow_bin"``
-        preserves the legacy behaviour (default). ``"dump_to_next_bin"``
-        advances one bin per remaining flight, ``"dump_to_next_bin"`` places all
-        spill into ``last_active_bin + 1``, ``"defined_release_rate_for_spills"``
-        applies a configured flights-per-hour token bucket, and
-        ``"same_release_rate_for_spills"`` uses the mean active rate or falls
-        back to one-per-bin when none is available.
-    release_rate_for_spills : float | Mapping[Any, float] | None, optional
-        Required when ``spill_mode`` is ``"defined_release_rate_for_spills"``.
-        Either a scalar rate (flights/hour) or a mapping keyed by flow id with
-        optional ``"default"``/``"DEFAULT"`` fallbacks.
-
-    Returns
-    -------
-    Tuple[Dict[str, int], Dict[str, object]]
-        Per-flight delays in minutes and realised start records.
+    Schedule pre-normalized, FIFO-ordered flights per flow into time bins and produce per-flight delays and realised start information.
+    
+    Parameters:
+        flights_sorted_by_flow (Mapping[Any, Sequence[Tuple[str, Optional[datetime], int]]]):
+            Flow → list of (flight_id, requested_datetime or None, requested_bin) sorted by FIFO key.
+        n_f_t (Mapping[Any, Sequence[int] | Mapping[int, int]]):
+            Per-flow release plan with length T+1 (index T is the overflow bin); keys may be flow ids.
+        indexer (TVTWIndexer):
+            Provides time-bin length and number of bins (horizon).
+        spill_mode (SpillMode, optional):
+            Spill handling strategy when flights remain beyond the active window:
+            - "overflow_bin": place spill into overflow bin T (legacy).
+            - "dump_to_next_bin": place all spill into last_active_bin + 1.
+            - "one_per_spill_bin": place one flight per consecutive spill bin starting at last_active_bin + 1.
+            - "defined_release_rate_for_spills": use a configured flights-per-hour rate (token bucket).
+            - "same_release_rate_for_spills": use the mean active rate or fall back to dump behavior.
+        release_rate_for_spills (float | Mapping[Any, float] | None, optional):
+            Scalar or per-flow mapping of flights-per-hour used when spill_mode is "defined_release_rate_for_spills".
+            Mapping may include "default"/"DEFAULT" fallbacks.
+    
+    Returns:
+        Tuple[Dict[str, int], Dict[str, object]]:
+            - delays_min: mapping flight_id → delay in whole minutes.
+            - realised_start: mapping flight_id → realised start (datetime for time-based requests or {"bin": int} for bin-only requests).
     """
     T = int(indexer.num_time_bins)
     bin_minutes = _bin_len_minutes(indexer)

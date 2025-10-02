@@ -15,6 +15,23 @@ class FlightListWithDelta(FlightList):
     """FlightList variant that can ingest :class:`DeltaOccupancyView` instances."""
 
     def __init__(self, occupancy_file_path: str, tvtw_indexer_path: str):
+        """
+        Initialize a FlightListWithDelta and prepare data structures for applying and tracking incremental occupancy deltas.
+        
+        Parameters:
+            occupancy_file_path (str): Path to the occupancy data file used by the base FlightList.
+            tvtw_indexer_path (str): Path to the TV/TW indexer used to size internal arrays.
+        
+        Attributes:
+            applied_regulations (List[str]): Regulation identifiers that have been applied, in order.
+            delay_histogram (Dict[int, int]): Mapping from delay minutes to count of flights with that delay.
+            total_delay_assigned_min (int): Total minutes of delay assigned by applied deltas.
+            num_delayed_flights (int): Number of flights currently recorded as delayed.
+            num_regulations (int): Number of delta views applied.
+            _delta_aggregate (np.ndarray): Dense int64 array aggregating delta values across all tvtws.
+            _applied_views (List[DeltaOccupancyView]): List of applied DeltaOccupancyView instances.
+            _delay_by_flight (Dict[str, int]): Per-flight current delay in minutes.
+        """
         super().__init__(occupancy_file_path, tvtw_indexer_path)
         self.applied_regulations: List[str] = []
         self.delay_histogram: Dict[int, int] = {}
@@ -27,7 +44,18 @@ class FlightListWithDelta(FlightList):
         self._delay_by_flight: Dict[str, int] = {}
 
     def step_by_delay(self, *views: DeltaOccupancyView, finalize: bool = True) -> None:
-        """Apply one or more delta views to the flight list."""
+        """
+        Apply one or more DeltaOccupancyView instances to the flight list and optionally finalize occupancy updates.
+        
+        If no views are provided and `finalize` is True, calls `finalize_occupancy_updates` and returns. Each supplied view is validated to be a DeltaOccupancyView and applied via the class's incremental update logic; after all views are applied, `finalize_occupancy_updates` is called when `finalize` is True.
+        
+        Parameters:
+        	views (DeltaOccupancyView): One or more delta views describing occupancy and delay changes.
+        	finalize (bool): If True, call `finalize_occupancy_updates` after applying the views (or immediately if no views).
+        
+        Raises:
+        	TypeError: If any positional argument in `views` is not an instance of DeltaOccupancyView.
+        """
 
         if not views:
             if finalize:
@@ -43,12 +71,34 @@ class FlightListWithDelta(FlightList):
             self.finalize_occupancy_updates()
 
     def get_delta_aggregate(self) -> np.ndarray:
-        """Return the dense aggregate delta vector accumulated so far."""
+        """
+        Get a copy of the dense aggregate delta vector accumulated from applied views.
+        
+        Returns:
+            np.ndarray: A copy of the internal delta aggregate array (dtype int64), indexed by tvtw.
+        """
 
         return self._delta_aggregate.copy()
 
     # --- internal helpers --------------------------------------------------------
     def _apply_single_view(self, view: DeltaOccupancyView) -> None:
+        """
+        Apply a DeltaOccupancyView to the flight list, merging its delta into the aggregate and updating per‑flight occupancy and delay state.
+        
+        Parameters:
+            view (DeltaOccupancyView): Delta view containing a dense delta vector, per-flight occupancy intervals, optional regulation identifier, and delay updates.
+        
+        Raises:
+            ValueError: If the view's dense delta length does not match the flight list occupancy dimensions.
+        
+        Behavior:
+            - Increments the internal aggregate delta with the view's dense delta and records the view as applied.
+            - If the view includes a regulation identifier, records it in the applied regulations list and updates the applied count.
+            - For each flight listed in the view that exists in the flight list:
+                - Replaces that flight's occupancy columns and canonical occupancy_intervals metadata with the view's intervals.
+                - Clears any cached per-flight TV sequence data.
+            - Updates per-flight delay state and overall delay metrics based on the view's delay entries.
+        """
         dense_delta = view.as_dense_delta(np.int64)
         if dense_delta.size != self._delta_aggregate.size:
             raise ValueError("Delta size does not match flight list occupancy dimensions")
@@ -82,6 +132,17 @@ class FlightListWithDelta(FlightList):
         self._update_delay_metrics(view)
 
     def _update_delay_metrics(self, view: DeltaOccupancyView) -> None:
+        """
+        Update the flight-level delay tracking and aggregate delay metrics using delays from the given view.
+        
+        Processes each (flight_id, delay_minutes) pair from view.delays.nonzero_items():
+        - Ignores flights not present in self.flight_id_to_row.
+        - If the delay for a flight changed, updates the per-flight delay map, adjusts the delay_histogram (decrementing the count for the previous delay when present and incrementing the count for the new delay), and adds the difference to total_delay_assigned_min.
+        After processing, sets num_delayed_flights to the number of flights currently tracked in _delay_by_flight.
+        
+        Parameters:
+            view (DeltaOccupancyView): An occupancy delta view whose `delays.nonzero_items()` yields per-flight delay minutes.
+        """
         for flight_id, delay_minutes in view.delays.nonzero_items():
             if flight_id not in self.flight_id_to_row:
                 continue
@@ -97,6 +158,16 @@ class FlightListWithDelta(FlightList):
         self.num_delayed_flights = len(self._delay_by_flight)
 
     def _decrement_histogram(self, delay_minutes: int) -> None:
+        """
+        Decrease the count for a specific delay value in the delay histogram.
+        
+        If there is no entry for the given delay value this does nothing. If the
+        entry's count is 1 the key is removed from the histogram; otherwise the
+        count is decremented by 1.
+        
+        Parameters:
+            delay_minutes (int): Delay value in minutes whose histogram count should be decremented.
+        """
         count = self.delay_histogram.get(delay_minutes)
         if not count:
             return

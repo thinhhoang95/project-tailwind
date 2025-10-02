@@ -206,6 +206,33 @@ def propose_regulations_for_hotspot(
     config: Optional[RegenConfig] = None,
     verbose_debug: bool = False,
 ) -> List[Proposal]:
+    """
+    Generate candidate regulation proposals for a specific hotspot time-volume (TV) and return ranked proposals.
+    
+    Builds flow features, computes hotspot exceedance and a cut target, prunes and scores flows, constructs candidate bundles, performs a localized variant search per bundle (including ripple TV context), evaluates variants by simulated scoring, and selects a diversity-aware set of final proposals with per-flow diagnostics.
+    
+    Parameters:
+        capacities_by_tv (Mapping[str, np.ndarray]): Time-series capacity arrays keyed by TV id used for exceedance and scoring.
+        travel_minutes_map (Mapping[str, Mapping[str, float]]): Travel-time map used by feature extraction.
+        hotspot_tv (str): TV id of the hotspot to regulate.
+        timebins_h (Sequence[int]): Timebin indices that define the hotspot evaluation window.
+        flows_payload (Optional[Mapping[str, Any]]): Optional payload describing baseline demand and flow metadata; used to derive baseline demand by flow.
+        flow_to_flights (Optional[Mapping[str, Sequence[str]]]): Optional mapping from flow id to flight identifiers; used for ripple calculation and diagnostics.
+        weights (Optional[FlowScoreWeights]): Optional scoring weights to rank flows.
+        config (Optional[RegenConfig]): Optional configuration that controls pruning, local search, selection, and edge-case behavior.
+        verbose_debug (bool): If true, enables extra debug output (may be unused depending on configuration).
+    
+    Returns:
+        List[Proposal]: A list of proposals sorted by final ranking score; each Proposal contains window, controlled flows, predicted improvement, target/ripple cells, and diagnostics.
+    
+    Raises:
+        ValueError: Raised when cfg.raise_on_edge_cases is True and one of the following occurs:
+            - Computed cut target (E_target) is <= 0.
+            - No eligible flows remain after pruning.
+            - No flows are scored for regulation.
+            - No candidate bundles can be constructed.
+            - No viable regulation variants are produced.
+    """
     cfg = resolve_config(config)
     wts = resolve_weights(weights)
 

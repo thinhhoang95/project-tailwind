@@ -25,7 +25,17 @@ logger = logging.getLogger(__name__)
 
 
 def _compute_shift_bins(entry_seconds: np.ndarray, delay_seconds: int, bin_seconds: int) -> np.ndarray:
-    """Compute per-interval bin shifts induced by a delay."""
+    """
+    Compute how many discrete time bins each entry shifts after applying a delay.
+    
+    Parameters:
+    	entry_seconds (np.ndarray): Entry times in seconds for each interval.
+    	delay_seconds (int): Delay in seconds applied to each entry.
+    	bin_seconds (int): Duration of a single time bin in seconds.
+    
+    Returns:
+    	np.ndarray: Integer array (same shape as `entry_seconds`) with the per-entry bin shift (new_bin_index - old_bin_index).
+    """
 
     if delay_seconds == 0 or entry_seconds.size == 0:
         return np.zeros(entry_seconds.shape, dtype=np.int64)
@@ -47,6 +57,15 @@ class DeltaOccupancyView:
     _changed_flights: List[str] = None  # type: ignore[assignment]
 
     def __post_init__(self) -> None:
+        """
+        Validate the constructed DeltaOccupancyView and initialize internal changed-flight list.
+        
+        Ensures `delta_counts_sparse` is a 1x`num_tvtws` row vector and, if `_changed_flights`
+        was not provided, sets it to the list of keys from `per_flight_new_intervals`.
+        
+        Raises:
+            ValueError: If `delta_counts_sparse` does not have shape `(1, num_tvtws)`.
+        """
         if self.delta_counts_sparse.shape != (1, self.num_tvtws):
             raise ValueError("delta_counts_sparse must be a row vector matching num_tvtws")
         if self._changed_flights is None:
@@ -60,6 +79,22 @@ class DeltaOccupancyView:
         *,
         regulation_id: Optional[str] = None,
     ) -> "DeltaOccupancyView":
+        """
+        Builds a DeltaOccupancyView that captures incremental occupancy changes after applying the provided delay assignments.
+        
+        Parameters:
+            flights (FlightList): Source flight list containing per-flight metadata, occupancy intervals, and time-bin configuration used to compute TVTW indices and bin shifts.
+            delays (DelayAssignmentTable): Delay assignments (minutes) keyed by flight ID; only nonzero delays are applied to produce updated intervals.
+            regulation_id (Optional[str]): Optional regulation identifier to attach to the resulting view.
+        
+        Returns:
+            DeltaOccupancyView: Instance containing:
+                - a sparse 1xnum_tvtws delta vector representing moved occupancy (delta_counts_sparse),
+                - per_flight_new_intervals mapping flight IDs to their updated occupancy intervals (with tvtw_index, entry_time_s, exit_time_s),
+                - a copy of the provided delays,
+                - the supplied regulation_id,
+                - the list of flight IDs whose occupancy changed.
+        """
         num_tvtws = int(flights.num_tvtws)
         num_time_bins = int(flights.num_time_bins)
         bin_seconds = int(flights.time_bin_minutes) * 60
@@ -132,17 +167,38 @@ class DeltaOccupancyView:
         )
 
     def changed_flights(self) -> List[str]:
-        """Return the list of flights whose occupancy changed."""
+        """
+        List flight IDs whose occupancy changed.
+        
+        Returns:
+            A list of flight IDs that had occupancy changes. The returned list is a shallow copy of the internal changed-flight list.
+        """
 
         return list(self._changed_flights)
 
     def as_dense_delta(self, dtype: np.dtype | type = np.int64) -> np.ndarray:
-        """Return the delta vector as a dense ``numpy`` array."""
+        """
+        Produce the delta vector in dense 1-D form.
+        
+        Parameters:
+            dtype (np.dtype | type): Desired NumPy dtype for the returned array.
+        
+        Returns:
+            np.ndarray: Dense 1-D array of length equal to the view's number of TVTW indices, with the requested dtype.
+        """
 
         return np.asarray(self.delta_counts_sparse.toarray()).ravel().astype(dtype, copy=False)
 
     def stats(self) -> Dict[str, int]:
-        """Return basic statistics about the delta."""
+        """
+        Compute basic statistics for this delta occupancy view.
+        
+        Returns:
+            stats (Dict[str, int]): Mapping with:
+                - num_changed_flights: Number of flights whose occupancy changed.
+                - total_delay_minutes: Sum of delay minutes for the changed flights.
+                - nonzero_entries: Number of nonzero entries in the sparse delta vector.
+        """
 
         total_delay = sum(self.delays.get(fid, 0) for fid in self._changed_flights)
         nnz = int(self.delta_counts_sparse.count_nonzero())
