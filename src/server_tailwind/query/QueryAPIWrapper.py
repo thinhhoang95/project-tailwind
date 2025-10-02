@@ -43,33 +43,16 @@ class QueryAPIWrapper:
     def __init__(self, resources=None):
         # Allow dependency injection for tests; default to shared resources
         self._resources = resources or get_resources()
-        self.flight_list = self._resources.flight_list
         self.indexer = getattr(self._resources, "indexer", None)
+        self._capacity_per_bin_matrix: Optional[np.ndarray] = getattr(
+            self._resources, "capacity_per_bin_matrix", None
+        )
+        self._hourly_capacity_by_tv: Dict[str, Dict[int, float]] = getattr(
+            self._resources, "hourly_capacity_by_tv", {}
+        )
+        self._traffic_volumes_gdf = getattr(self._resources, "traffic_volumes_gdf", None)
 
-        self.time_bin_minutes = int(self.flight_list.time_bin_minutes)
-        self.bins_per_tv = int(self.flight_list.num_time_bins_per_tv)
-        self.tv_id_to_idx = {str(k): int(v) for k, v in self.flight_list.tv_id_to_idx.items()}
-        self.idx_to_tv_id = {int(k): str(v) for k, v in self.flight_list.idx_to_tv_id.items()}
-
-        self.num_flights = int(self.flight_list.num_flights)
-        self.flight_ids: np.ndarray = np.asarray(self.flight_list.flight_ids, dtype=object)
-
-        # Sparse representations
-        self.occupancy_csr = self.flight_list.occupancy_matrix
-        if not sparse.isspmatrix_csr(self.occupancy_csr):
-            self.occupancy_csr = sparse.csr_matrix(self.occupancy_csr, dtype=np.float32)
-        self.occupancy_csc = self.occupancy_csr.tocsc(copy=False)
-
-        self.num_tvtws = int(self.flight_list.num_tvtws)
-
-        # Precompute flight metadata lookups
-        self._flight_row_lookup: Dict[str, int] = {fid: idx for idx, fid in enumerate(self.flight_list.flight_ids)}
-        self._flight_meta = self.flight_list.flight_metadata
-        self._takeoff_cache: Dict[str, datetime] = {
-            fid: meta.get("takeoff_time") for fid, meta in self._flight_meta.items()
-        }
-
-        # Cached helpers: origin/dest masks, tv/bin -> flights, per-flight entries, etc.
+        # Cached helpers and lookup stores (populated via refresh_flight_list)
         self._origin_to_rows: Dict[str, np.ndarray] = {}
         self._destination_to_rows: Dict[str, np.ndarray] = {}
         self._tv_bin_to_rows: Dict[int, Dict[int, np.ndarray]] = {}
@@ -78,24 +61,56 @@ class QueryAPIWrapper:
         self._arrival_time_cache: Dict[Tuple[str, str], datetime] = {}
         self._node_cache: Dict[str, np.ndarray] = {}
         self._debug_last_nodes: List[str] = []
-
-        # Capacity helpers
-        self._total_occupancy_vector: Optional[np.ndarray] = None
-        self._capacity_per_bin_matrix: Optional[np.ndarray] = getattr(
-            self._resources, "capacity_per_bin_matrix", None
-        )
-        self._hourly_capacity_by_tv: Dict[str, Dict[int, float]] = getattr(
-            self._resources, "hourly_capacity_by_tv", {}
-        )
         self._capacity_state_cache: Dict[Tuple[int, int, int, str, float], np.ndarray] = {}
+        self._total_occupancy_vector: Optional[np.ndarray] = None
 
         # Region helpers
-        self._traffic_volumes_gdf = getattr(self._resources, "traffic_volumes_gdf", None)
         self._region_cache: Dict[str, Tuple[str, ...]] = {}
 
-        # Scalars reused across evaluation
-        self._seconds_per_bin = self.time_bin_minutes * 60
+        # Bind flight list-derived state
+        self.refresh_flight_list(self._resources.flight_list)
         self._cache_hits = 0
+
+    def refresh_flight_list(self, flight_list) -> None:
+        """Rebind the flight list and rebuild cached sparse structures and lookups."""
+        self.flight_list = flight_list
+
+        self.time_bin_minutes = int(self.flight_list.time_bin_minutes)
+        self.bins_per_tv = int(self.flight_list.num_time_bins_per_tv)
+        self.tv_id_to_idx = {str(k): int(v) for k, v in self.flight_list.tv_id_to_idx.items()}
+        self.idx_to_tv_id = {int(k): str(v) for k, v in self.flight_list.idx_to_tv_id.items()}
+
+        self.num_flights = int(self.flight_list.num_flights)
+        self.flight_ids = np.asarray(self.flight_list.flight_ids, dtype=object)
+
+        self.occupancy_csr = self.flight_list.occupancy_matrix
+        if not sparse.isspmatrix_csr(self.occupancy_csr):
+            self.occupancy_csr = sparse.csr_matrix(self.occupancy_csr, dtype=np.float32)
+        self.occupancy_csc = self.occupancy_csr.tocsc(copy=False)
+
+        self.num_tvtws = int(self.flight_list.num_tvtws)
+
+        self._flight_row_lookup = {
+            fid: idx for idx, fid in enumerate(self.flight_list.flight_ids)
+        }
+        self._flight_meta = self.flight_list.flight_metadata
+        self._takeoff_cache = {
+            fid: meta.get("takeoff_time") for fid, meta in self._flight_meta.items()
+        }
+
+        # Reset cached structures so they repopulate lazily with fresh data
+        self._origin_to_rows = {}
+        self._destination_to_rows = {}
+        self._tv_bin_to_rows = {}
+        self._tv_time_mask_cache = {}
+        self._flight_entries_cache = {}
+        self._arrival_time_cache = {}
+        self._node_cache = {}
+        self._capacity_state_cache = {}
+        self._total_occupancy_vector = None
+        self._debug_last_nodes = []
+
+        self._seconds_per_bin = self.time_bin_minutes * 60
 
     # ------------------------------------------------------------------
     # Public API

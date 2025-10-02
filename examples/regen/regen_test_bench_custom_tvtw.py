@@ -380,10 +380,11 @@ def propose_regulations(
     try:
         fallback_cfg = RegenConfig(
             g_min=-float("inf"),
-            rho_max=10.0,
+            rho_max=float("inf"),
             slack_min=-float("inf"),
             distinct_controls_required=False,
             raise_on_edge_cases=True,
+            min_num_flights=4
         )
 
 
@@ -459,7 +460,7 @@ def main() -> None:
     hotspot_payload = {
         "control_volume_id": "LFBZX15",
         "window_bins": [45, 49], # means [45, 46, 47, 48]
-        "metadata": {},
+        "metadata": {}, # will be filled in below
         "mode": "manual",
     }
 

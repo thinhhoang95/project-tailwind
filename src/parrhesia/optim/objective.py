@@ -1090,8 +1090,8 @@ def _compute_J_cap(
             if not printed_header:
                 printed_header = True
                 bin_minutes = getattr(indexer, "time_bin_minutes", None)
-                print("\n[Audit] Capacity exceedance details (J_cap):")
-                print(f" - Rolling window K = {K} bins" + (f" (~{K * bin_minutes} minutes)" if bin_minutes else ""))
+                # print("\n[Audit] Capacity exceedance details (J_cap):")
+                # print(f" - Rolling window K = {K} bins" + (f" (~{K * bin_minutes} minutes)" if bin_minutes else ""))
             time_map = getattr(indexer, "time_window_map", {}) if indexer is not None else {}
             any_for_tv = False
             for t in range(T):

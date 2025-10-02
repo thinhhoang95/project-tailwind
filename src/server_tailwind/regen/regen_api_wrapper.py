@@ -185,14 +185,23 @@ class RegenAPIWrapper:
                 resolution=resolution,
             )
             flow_to_flights = self._flow_id_to_flights(flows_payload)
+
+            DEFAULT_CONFIG = RegenConfig() # to provide reference values in case top_k_regulations is not provided
+            num_regulations_limit = int(top_k_regulations) if (top_k_regulations is not None and int(top_k_regulations) > 0) else DEFAULT_CONFIG.k_proposals
+            
             
             my_cfg = RegenConfig(
-                        g_min=-float("inf"),
-                        rho_max=10.0,
-                        slack_min=-float("inf"),
-                        distinct_controls_required=False,
-                        raise_on_edge_cases=True,
-            )            
+                g_min=-float("inf"),
+                rho_max=float("inf"),
+                slack_min=-float("inf"),
+                distinct_controls_required=False,
+                raise_on_edge_cases=True,
+                min_num_flights=4,
+                k_proposals=num_regulations_limit
+            )
+
+            if num_regulations_limit is None:
+                num_regulations_limit = my_cfg.k_proposals
 
 
             proposals = propose_regulations_for_hotspot(
@@ -213,9 +222,7 @@ class RegenAPIWrapper:
 
         flows_payload, flow_to_flights, proposals = await loop.run_in_executor(self._executor, _compute)
 
-        limit = int(top_k_regulations) if (top_k_regulations is not None and int(top_k_regulations) > 0) else None
-        if limit is not None:
-            proposals = proposals[:limit]
+        
 
         weights = resolve_weights(None)
         weights_dict = {
@@ -330,7 +337,7 @@ class RegenAPIWrapper:
             "traffic_volume_id": tv,
             "time_window": time_window,
             "time_bin_minutes": self.time_bin_minutes,
-            "top_k": limit,
+            "top_k": top_k_regulations,
             "weights": weights_dict,
             "num_proposals": len(proposals_payload),
             "proposals": proposals_payload,
