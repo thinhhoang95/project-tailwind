@@ -30,6 +30,8 @@ from parrhesia.flow_agent35.regen.exceedance import compute_hotspot_exceedance
 from parrhesia.flow_agent35.regen.rates import compute_e_target
 from parrhesia.flow_agent35.regen.types import RegenConfig
 from parrhesia.optim.capacity import build_bin_capacities, normalize_capacities
+from server_tailwind.core.resources import AppResources, ResourcePaths  # NEW
+from server_tailwind.core.resources import get_resources  # NEW
 
 
 # Time Profiling helpers ===
@@ -133,16 +135,11 @@ def load_artifacts() -> Tuple[Path, Path, Path]:
 
 def build_data(occupancy_path: Path, indexer_path: Path, caps_path: Path) -> Tuple[FlightList, TVTWIndexer, NetworkEvaluator]:
     """
-    Loads core data structures from artifact paths.
+    Loads core data structures using shared AppResources (delta-enabled).
 
     This function initializes the main objects required for network evaluation
-    and regulation proposals:
-    - TVTWIndexer: Maps traffic volumes and time bins to matrix indices.
-    - FlightList: Manages flight data and their occupancy over TVTWs.
-    - NetworkEvaluator: Handles capacity evaluation and objective scoring.
-
-    It also performs a defensive padding of the occupancy matrix to ensure its
-    dimensions are consistent with the indexer, which is a step mirrored from
+    and regulation proposals using the shared resources flight list for
+    consistency with the server. It preserves defensive occupancy padding.
 
     Args:
         occupancy_path: Path to the flight occupancy matrix JSON file.
@@ -153,23 +150,29 @@ def build_data(occupancy_path: Path, indexer_path: Path, caps_path: Path) -> Tup
         A tuple containing the initialized FlightList, TVTWIndexer, and
         NetworkEvaluator objects.
     """
-    # Load indexer and occupancy
-    indexer = TVTWIndexer.load(str(indexer_path))
+    # Use AppResources so flows/regen share the same flight list/indexer as the server
+    res = AppResources(
+        ResourcePaths(
+            occupancy_file_path=occupancy_path,
+            tvtw_indexer_path=indexer_path,
+            traffic_volumes_path=caps_path,
+        )
+    ).preload_all()
 
-    # Touch occupancy JSON to validate read
-    with open(occupancy_path, "r", encoding="utf-8") as fh:
-        _ = json.load(fh)
+    # Ensure subsequent calls to get_resources() return this same instance
+    try:
+        from server_tailwind.core import resources as _res_mod  # type: ignore
+        _res_mod._GLOBAL_RESOURCES = res  # type: ignore[attr-defined]
+    except Exception:
+        pass
 
-    flight_list = FlightList(str(occupancy_path), str(indexer_path))
+    indexer = res.indexer
+    flight_list = res.flight_list
 
-    # Align occupancy matrix width (defensive, mirroring examples/flow_agent/run_agent.py)
-    # This ensures that the occupancy matrix has a column for every TVTW defined
-    # in the indexer. If the matrix was generated with a slightly different set
-    # of TVTWs, this padding prevents index-out-of-bounds errors.
+    # Defensive occupancy width alignment (keep as before)
     expected_tvtws = len(indexer.tv_id_to_idx) * indexer.num_time_bins
     if getattr(flight_list, "num_tvtws", 0) < expected_tvtws:
         from scipy import sparse  # type: ignore
-
         pad_cols = expected_tvtws - int(flight_list.num_tvtws)
         pad_matrix = sparse.lil_matrix((int(flight_list.num_flights), pad_cols))
         flight_list._occupancy_matrix_lil = sparse.hstack(  # type: ignore[attr-defined]
@@ -180,20 +183,19 @@ def build_data(occupancy_path: Path, indexer_path: Path, caps_path: Path) -> Tup
         flight_list._lil_matrix_dirty = True  # type: ignore[attr-defined]
         flight_list._sync_occupancy_matrix()  # type: ignore[attr-defined]
 
-    # Capacities
-    caps_gdf = gpd.read_file(str(caps_path))
-    if caps_gdf.empty:
+    # Capacities from resources
+    caps_gdf = res.traffic_volumes_gdf
+    if getattr(caps_gdf, "empty", False):
         raise SystemExit("Traffic volume capacity file is empty; cannot proceed.")
 
     evaluator = NetworkEvaluator(caps_gdf, flight_list)
-    # Preserve capacities path for later use by _build_capacities_by_tv.
-    # This allows the more robust capacity builder in `parrhesia` to be used,
-    # which directly reads and processes the GeoJSON file.
+    # Preserve the original GeoJSON path so the shared capacity builder can be used.
     try:
         evaluator._capacities_path = str(caps_path)  # type: ignore[attr-defined]
     except Exception:
-        print(f"[warning] Failed to set capacities path on evaluator")
+        print("[warning] Failed to set capacities path on evaluator")
         pass
+
     return flight_list, indexer, evaluator
 
 
@@ -244,64 +246,15 @@ def _build_capacities_by_tv(
         A dictionary mapping each traffic volume ID to a NumPy array of its
         per-bin normalized capacity values.
     """
-    # Prefer the shared builder from parrhesia.optim.capacity when a source path is known
+    # Strictly require the shared builder from parrhesia.optim.capacity with a known source path
     caps_path = getattr(evaluator, "_capacities_path", None)
-    if caps_path:
-        try:
-            # This is the preferred, more robust method using the original GeoJSON.
-            raw_caps = build_bin_capacities(str(caps_path), indexer)
-            capacities_by_tv = normalize_capacities(raw_caps)
-            if capacities_by_tv:
-                sample_items = list(capacities_by_tv.items())[:5]
-                sample_stats = []
-                for tv, arr in sample_items:
-                    arr_np = np.asarray(arr, dtype=np.float64)
-                    if arr_np.size == 0:
-                        sample_stats.append(f"{tv}:empty")
-                        continue
-                    sample_stats.append(
-                        f"{tv}:min={float(arr_np.min()):.1f},max={float(arr_np.max()):.1f}"
-                    )
-                print(
-                    f"Regen: normalized capacities (from GeoJSON) ready for {len(capacities_by_tv)} TVs; samples: "
-                    + "; ".join(sample_stats)
-                )
-            return capacities_by_tv
-        except Exception as exc:
-            print(f"Regen: capacity builder fallback due to error: {exc}")
-
-    # Fallback method: construct capacities from the evaluator's hourly map.
-    T = int(indexer.num_time_bins)
-    bins_per_hour = int(indexer.rolling_window_size())
-
-    # Construct raw per-bin capacities from evaluator's hourly map
-    per_hour = getattr(evaluator, "hourly_capacity_by_tv", {}) or {}
-    raw_capacities: Dict[str, np.ndarray] = {}
-    for tv_id in indexer.tv_id_to_idx.keys():
-        arr = np.zeros(T, dtype=np.float64)
-        hours = per_hour.get(tv_id, {}) or {}
-        for h, cap in hours.items():
-            try:
-                hour = int(h)
-            except Exception:
-                continue
-            start = hour * bins_per_hour
-            if start >= T:
-                continue
-            end = min(start + bins_per_hour, T)
-            arr[start:end] = float(cap)
-        raw_capacities[str(tv_id)] = arr
-
-    if raw_capacities:
-        non_positive = [tv for tv, arr in raw_capacities.items() if float(np.max(arr)) <= 0.0]
-        if non_positive:
-            print(
-                f"Regen: capacity rows are non-positive for {len(non_positive)}/{len(raw_capacities)} TVs; sample="
-                + ",".join([str(x) for x in non_positive[:5]])
-            )
-
-    # Normalize: treat missing/zero bins as unconstrained
-    capacities_by_tv = normalize_capacities(raw_capacities)
+    if not caps_path:
+        raise RuntimeError("Capacity GeoJSON path missing on evaluator; resources path is required.")
+    try:
+        raw_caps = build_bin_capacities(str(caps_path), indexer)
+        capacities_by_tv = normalize_capacities(raw_caps)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to build capacities from GeoJSON {caps_path}: {exc}")
 
     if capacities_by_tv:
         sample_items = list(capacities_by_tv.items())[:5]
@@ -315,7 +268,7 @@ def _build_capacities_by_tv(
                 f"{tv}:min={float(arr_np.min()):.1f},max={float(arr_np.max()):.1f}"
             )
         print(
-            f"Regen: normalized capacities ready for {len(capacities_by_tv)} TVs; samples: "
+            f"Regen: normalized capacities (from GeoJSON) ready for {len(capacities_by_tv)} TVs; samples: "
             + "; ".join(sample_stats)
         )
 
@@ -555,15 +508,21 @@ def propose_regulations(
 
     # Prepare shared inputs required by the regen engine.
     capacities_by_tv = _build_capacities_by_tv(evaluator, indexer)
-    centroids = _tv_centroids(evaluator.traffic_volumes_gdf, indexer)
-    travel_minutes_map = _travel_minutes_from_centroids(centroids)
+    # Reuse shared resources for centroids/travel and flows
+    res = get_resources().preload_all()
+    centroids = res.tv_centroids
+    travel_minutes_map = res.travel_minutes()
 
-    # Flow payload via API (reuse in-memory artifacts)
-    # This step identifies the distinct flows of traffic that contribute to the
-    # congestion in the hotspot control volume during the time window.
-    set_global_resources(indexer, flight_list)
+    # Flow payload via API (reuse in-memory artifacts). Ensure globals match resources
+    set_global_resources(res.indexer, res.flight_list)
     direction_opts = {"mode": "coord_cosine", "tv_centroids": centroids} if centroids else {"mode": "coord_cosine"}
-    flows_payload = compute_flows(tvs=[control_tv], timebins=timebins_h, direction_opts=direction_opts, threshold=leiden_params["threshold"], resolution=leiden_params["resolution"])
+    flows_payload = compute_flows(
+        tvs=[control_tv],
+        timebins=timebins_h,
+        direction_opts=direction_opts,
+        threshold=leiden_params["threshold"],
+        resolution=leiden_params["resolution"],
+    )
 
     # Flow-to-flights metadata from hotspot discovery (string keys)
     meta = hotspot_payload.get("metadata", {}) or {}
@@ -685,8 +644,10 @@ def main() -> None:
     control_tv = str(hotspot_payload["control_volume_id"])
     timebins_h = _timebins_from_window(hotspot_payload.get("window_bins", []))
     # First, compute the flows for the given hotspot TV and time window.
-    set_global_resources(indexer, flight_list)
-    centroids = _tv_centroids(evaluator.traffic_volumes_gdf, indexer)
+    # Ensure global resources match the shared AppResources
+    res = get_resources().preload_all()
+    set_global_resources(res.indexer, res.flight_list)
+    centroids = res.tv_centroids
     direction_opts = {"mode": "coord_cosine", "tv_centroids": centroids} if centroids else {"mode": "coord_cosine"}
     flows_payload = compute_flows(
         tvs=[control_tv],
