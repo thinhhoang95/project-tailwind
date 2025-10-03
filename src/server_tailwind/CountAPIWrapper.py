@@ -43,6 +43,10 @@ class CountAPIWrapper:
         self._hourly_capacity_by_tv: Dict[str, Dict[int, float]] = res.hourly_capacity_by_tv
         self._capacity_per_bin_matrix: Optional[np.ndarray] = res.capacity_per_bin_matrix
 
+    def invalidate_caches(self) -> None:
+        """Drop cached occupancy aggregates so subsequent queries recompute from the flight list."""
+        self._total_occupancy_vector = None
+
     def _init_capacity_data(self) -> None:
         """Load hourly capacity by TV from GeoJSON and build per-bin matrix."""
         # Try absolute path first (as used elsewhere), then fallback
