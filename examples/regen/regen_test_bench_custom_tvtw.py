@@ -20,7 +20,6 @@ if str(SRC_PATH) not in sys.path:
 from project_tailwind.impact_eval.distance_computation import haversine_vectorized
 from project_tailwind.impact_eval.tvtw_indexer import TVTWIndexer
 from project_tailwind.optimize.eval.flight_list import FlightList
-from project_tailwind.optimize.eval.network_evaluator import NetworkEvaluator
 
 # Flow regeneration engine
 from parrhesia.api.flows import compute_flows
@@ -29,7 +28,7 @@ from parrhesia.flow_agent35.regen.engine import propose_regulations_for_hotspot
 from parrhesia.flow_agent35.regen.exceedance import compute_hotspot_exceedance
 from parrhesia.flow_agent35.regen.rates import compute_e_target
 from parrhesia.flow_agent35.regen.types import RegenConfig
-from parrhesia.optim.capacity import build_bin_capacities, normalize_capacities
+from parrhesia.optim.capacity import normalize_capacities
 from server_tailwind.core.resources import AppResources, ResourcePaths  # NEW
 from server_tailwind.core.resources import get_resources  # NEW
 
@@ -133,7 +132,7 @@ def load_artifacts() -> Tuple[Path, Path, Path]:
     return occupancy_path, indexer_path, caps_path
 
 
-def build_data(occupancy_path: Path, indexer_path: Path, caps_path: Path) -> Tuple[FlightList, TVTWIndexer, NetworkEvaluator]:
+def build_data(occupancy_path: Path, indexer_path: Path, caps_path: Path) -> Tuple[FlightList, TVTWIndexer]:
     """
     Loads core data structures using shared AppResources (delta-enabled).
 
@@ -147,8 +146,7 @@ def build_data(occupancy_path: Path, indexer_path: Path, caps_path: Path) -> Tup
         caps_path: Path to the traffic volume capacities GeoJSON file.
 
     Returns:
-        A tuple containing the initialized FlightList, TVTWIndexer, and
-        NetworkEvaluator objects.
+        A tuple containing the initialized FlightList and TVTWIndexer objects.
     """
     # Use AppResources so flows/regen share the same flight list/indexer as the server
     res = AppResources(
@@ -188,15 +186,7 @@ def build_data(occupancy_path: Path, indexer_path: Path, caps_path: Path) -> Tup
     if getattr(caps_gdf, "empty", False):
         raise SystemExit("Traffic volume capacity file is empty; cannot proceed.")
 
-    evaluator = NetworkEvaluator(caps_gdf, flight_list)
-    # Preserve the original GeoJSON path so the shared capacity builder can be used.
-    try:
-        evaluator._capacities_path = str(caps_path)  # type: ignore[attr-defined]
-    except Exception:
-        print("[warning] Failed to set capacities path on evaluator")
-        pass
-
-    return flight_list, indexer, evaluator
+    return flight_list, indexer
 
 
 def _timebins_from_window(window_bins: Iterable[int]) -> List[int]:
@@ -212,64 +202,51 @@ def _timebins_from_window(window_bins: Iterable[int]) -> List[int]:
         end_exclusive = start + 1
     return list(range(int(start), int(end_exclusive)))
 
-# INSTRUCTIONS FOR CODING AGENTS AND DEVELOPERS: This function could be a source of inconsistency
-# since it replicates regen_api_wrapper's _build_capacities_by_tv function
-# If the objective function seem very high, one common culprit is the normalization of missing capacity values
 def _build_capacities_by_tv(
-    evaluator: NetworkEvaluator,
     indexer: TVTWIndexer,
 ) -> Dict[str, np.ndarray]:
     """
-    Build per-bin capacities for each traffic volume and normalize them,
-    mirroring the approach used by the server-side wrapper.
+    Build per-bin capacities strictly from AppResources cache and normalize.
 
-    This function is critical for providing the regen engine with the correct
-    capacity information. It has two primary methods of building capacities:
-    1.  **Preferred:** If a path to the capacity GeoJSON is available on the
-        evaluator, it uses the `build_bin_capacities` and `normalize_capacities`
-        functions from `parrhesia.optim.capacity`. This is more robust as it
-        handles various capacity definitions (e.g., time-varying).
-    2.  **Fallback:** If the path is not available, it constructs per-bin capacities
-        from the `hourly_capacity_by_tv` map stored within the evaluator. This
-        is less flexible and assumes capacities are constant within each hour.
+    This mirrors the server API behavior: reuse the process-wide resources
+    cache to obtain the capacity-per-bin matrix and align it to the indexer's
+    TV ordering. No file/path fallbacks are used here; if resources are not
+    available, an exception is raised.
 
-    Normalization is a key step: it replaces zero or missing capacity values
-    with a very large number (effectively infinite capacity) to signify that
-    those bins are unconstrained. This prevents the optimizer from incorrectly
-    penalizing traffic in volumes or times that simply lack a defined capacity.
-
-    Args:
-        evaluator: The NetworkEvaluator instance.
-        indexer: The TVTWIndexer for time bin information.
-
-    Returns:
-        A dictionary mapping each traffic volume ID to a NumPy array of its
-        per-bin normalized capacity values.
+    Returns a mapping of tv_id -> np.ndarray[T], normalized so non-positive
+    bins are treated as unconstrained.
     """
-    # Strictly require the shared builder from parrhesia.optim.capacity with a known source path
-    caps_path = getattr(evaluator, "_capacities_path", None)
-    if not caps_path:
-        raise RuntimeError("Capacity GeoJSON path missing on evaluator; resources path is required.")
-    try:
-        raw_caps = build_bin_capacities(str(caps_path), indexer)
-        capacities_by_tv = normalize_capacities(raw_caps)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to build capacities from GeoJSON {caps_path}: {exc}")
+    res = get_resources().preload_all()
+    mat = res.capacity_per_bin_matrix  # shape: [num_tvs, T]
+    if mat is None:
+        raise RuntimeError("AppResources has no capacity_per_bin_matrix; ensure resources are loaded.")
 
-    if capacities_by_tv:
-        sample_items = list(capacities_by_tv.items())[:5]
-        sample_stats = []
-        for tv, arr in sample_items:
-            arr_np = np.asarray(arr, dtype=np.float64)
-            if arr_np.size == 0:
-                sample_stats.append(f"{tv}:empty")
-                continue
-            sample_stats.append(
-                f"{tv}:min={float(arr_np.min()):.1f},max={float(arr_np.max()):.1f}"
-            )
+    # Sanity check shape consistency with the provided indexer
+    T_expected = int(indexer.num_time_bins)
+    if mat.shape[1] != T_expected:
+        raise RuntimeError(
+            f"Capacity matrix width {mat.shape[1]} does not match indexer bins {T_expected}."
+        )
+
+    capacities_by_tv: Dict[str, np.ndarray] = {}
+    # Iterate by the flight_list tv ordering to ensure consistency
+    for tv_id, row_idx in res.flight_list.tv_id_to_idx.items():
+        arr = mat[int(row_idx), :]
+        capacities_by_tv[str(tv_id)] = np.asarray(arr, dtype=np.float64)
+
+    # Normalize: treat non-positive bins as unconstrained
+    capacities_by_tv = normalize_capacities(capacities_by_tv)
+
+    # Optional small sample log for visibility
+    sample = list(capacities_by_tv.items())[:3]
+    if sample:
+        stats = []
+        for tv, arr in sample:
+            a = np.asarray(arr, dtype=np.float64)
+            stats.append(f"{tv}:min={float(a.min()):.1f},max={float(a.max()):.1f}")
         print(
-            f"Regen: normalized capacities (from GeoJSON) ready for {len(capacities_by_tv)} TVs; samples: "
-            + "; ".join(sample_stats)
+            f"Regen: normalized capacities (from resources) for {len(capacities_by_tv)} TVs; "
+            + "; ".join(stats)
         )
 
     return capacities_by_tv
@@ -466,7 +443,7 @@ def _proposal_to_dict(
 def propose_regulations(
     *,
     hotspot_payload: Dict[str, Any],
-    evaluator: NetworkEvaluator,
+    flight_list: FlightList,
     indexer: TVTWIndexer,
     top_k: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
@@ -487,7 +464,7 @@ def propose_regulations(
     Args:
         hotspot_payload: A dictionary describing the hotspot, including the
             control TV ID and time window.
-        evaluator: The configured NetworkEvaluator.
+        flight_list: The shared `FlightList` object sourced from `AppResources`.
         indexer: The configured TVTWIndexer.
         top_k: If specified, returns only the top `k` proposals.
 
@@ -502,12 +479,8 @@ def propose_regulations(
     if not timebins_h:
         raise ValueError("hotspot payload missing time window bins")
 
-    flight_list = getattr(evaluator, "flight_list", None)
-    if flight_list is None:
-        raise ValueError("network evaluator missing flight_list reference")
-
     # Prepare shared inputs required by the regen engine.
-    capacities_by_tv = _build_capacities_by_tv(evaluator, indexer)
+    capacities_by_tv = _build_capacities_by_tv(indexer)
     # Reuse shared resources for centroids/travel and flows
     res = get_resources().preload_all()
     centroids = res.tv_centroids
@@ -597,7 +570,7 @@ def propose_regulations(
 def propose_top_regulations(
     *,
     hotspot_payload: Dict[str, Any],
-    evaluator: NetworkEvaluator,
+    flight_list: FlightList,
     indexer: TVTWIndexer,
     top_k: int = 8,
 ) -> Dict[str, Any]:
@@ -607,7 +580,7 @@ def propose_top_regulations(
     """
     return propose_regulations(
         hotspot_payload=hotspot_payload,
-        evaluator=evaluator,
+        flight_list=flight_list,
         indexer=indexer,
         top_k=top_k,
     )[0]
@@ -624,7 +597,7 @@ def main() -> None:
     print(f"[regen] capacities:{caps_path}")
 
     print("[regen] Loading data ...")
-    flight_list, indexer, evaluator = build_data(occ_path, idx_path, caps_path)
+    flight_list, indexer = build_data(occ_path, idx_path, caps_path)
 
     # Manually define the hotspot to be analyzed. In a real application, this
     # would come from an automated hotspot detection system.
@@ -699,7 +672,7 @@ def main() -> None:
     # This is the main call to the proposal generation logic.
     proposals = propose_regulations(
         hotspot_payload=hotspot_payload,
-        evaluator=evaluator,
+        flight_list=flight_list,
         indexer=indexer,
     )
     print(f"[regen] Retrieved {len(proposals)} regulation candidate(s).")
