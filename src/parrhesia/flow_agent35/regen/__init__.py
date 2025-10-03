@@ -1,6 +1,10 @@
 """Regulation proposal generator ("regen") package."""
 
 from .engine import propose_regulations_for_hotspot
+from .hotspot_segment_extractor import (
+    extract_hotspot_segments_from_resources,
+    segment_to_hotspot_payload,
+)
 from .types import (
     Bundle,
     BundleVariant,
@@ -26,4 +30,6 @@ __all__ = [
     "RateCut",
     "RegenConfig",
     "Window",
+    "extract_hotspot_segments_from_resources",
+    "segment_to_hotspot_payload",
 ]
