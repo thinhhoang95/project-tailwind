@@ -1,0 +1,10 @@
+numpy
+matplotlib
+geopandas
+scipy
+pytest
+shapely
+pytest-cov
+ijson
+rich
+jay

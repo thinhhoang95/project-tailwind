@@ -1,0 +1,145 @@
+# Flow Cache Extraction Configuration Examples
+# =============================================
+#
+# This file contains example configurations for different analysis scenarios.
+# You can use these as reference for setting up your own runs.
+
+# Basic Configuration
+basic:
+  description: "Simple analysis with limited hotspots for quick testing"
+  command_args:
+    - "--threshold"
+    - "0.0"
+    - "--limit-hotspots"
+    - "5"
+    - "--output-dir"
+    - "output/examples/basic"
+
+# Focused Analysis
+focused_tv_hour:
+  description: "Deep dive into specific traffic volume and time period"
+  command_args:
+    - "--threshold"
+    - "0.0"
+    - "--only-tv"
+    - "EDG6PAD"  # Change to your traffic volume of interest
+    - "--only-hour"
+    - "11"       # Peak hour analysis
+    - "--output-dir"
+    - "output/examples/focused"
+
+# Bin-Level Analysis
+bin_mode:
+  description: "Fine-grained analysis at 15-minute bin level"
+  command_args:
+    - "--mode"
+    - "bin"
+    - "--threshold"
+    - "0.0"
+    - "--limit-hotspots"
+    - "10"
+    - "--output-dir"
+    - "output/examples/bin_level"
+
+# Custom FlowX Parameters
+custom_flowx:
+  description: "Tuned FlowX parameters for specific analysis needs"
+  command_args:
+    - "--threshold"
+    - "0.0"
+    - "--limit-hotspots"
+    - "5"
+    - "--max-groups"
+    - "20"        # Allow more groups per hotspot
+    - "--alpha"
+    - "0.05"      # Sparsification parameter
+    - "--group-size-lam"
+    - "0.1"       # Group size penalty
+    - "--path-length-gamma"
+    - "2.0"       # Path length preference
+    - "--avg-objective"  # Use average objective
+    - "--output-dir"
+    - "output/examples/custom_flowx"
+
+# High Threshold Analysis
+severe_overload:
+  description: "Focus only on severely overloaded hotspots"
+  command_args:
+    - "--threshold"
+    - "10.0"      # Only hotspots with excess >= 10 flights
+    - "--limit-hotspots"
+    - "20"
+    - "--output-dir"
+    - "output/examples/severe_overload"
+
+# Specific TVTW Analysis
+specific_bin:
+  description: "Analyze a specific time-window bin"
+  command_args:
+    - "--mode"
+    - "bin"
+    - "--threshold"
+    - "0.0"
+    - "--only-tvtw"
+    - "5900"      # Change to your TVTW index of interest
+    - "--output-dir"
+    - "output/examples/specific_bin"
+
+# Production Analysis
+production:
+  description: "Full-scale production analysis with optimized parameters"
+  command_args:
+    - "--threshold"
+    - "1.0"       # Meaningful overload threshold
+    - "--max-groups"
+    - "50"        # Allow many groups for comprehensive analysis
+    - "--alpha"
+    - "0.03"      # Fine-tuned sparsification
+    - "--group-size-lam"
+    - "0.05"      # Balanced group size penalty
+    - "--path-length-gamma"
+    - "1.8"       # Moderate path length preference
+    - "--output-dir"
+    - "output/production/flow_analysis"
+
+# Debug Analysis
+debug:
+  description: "Detailed logging for troubleshooting"
+  command_args:
+    - "--threshold"
+    - "0.0"
+    - "--limit-hotspots"
+    - "2"
+    - "--debug"   # Enable verbose logging
+    - "--output-dir"
+    - "output/examples/debug"
+
+# Performance Testing
+performance:
+  description: "Test with slow fallback implementation for validation"
+  command_args:
+    - "--threshold"
+    - "0.0"
+    - "--limit-hotspots"
+    - "3"
+    - "--slow"    # Use slow but simple cache computation
+    - "--output-dir"
+    - "output/examples/performance_test"
+
+# Usage Notes:
+# -----------
+# To use these configurations, you can create a simple Python script like:
+#
+# import yaml
+# import subprocess
+# 
+# with open('examples/flow_extraction_configs.yaml', 'r') as f:
+#     configs = yaml.safe_load(f)
+# 
+# config = configs['basic']  # Choose your configuration
+# cmd = ['python', 'src/project_tailwind/flow_x/cache_flow_extract.py',
+#        '--tv-geojson', '/path/to/your/traffic_volumes.geojson'] + config['command_args']
+# 
+# subprocess.run(cmd)
+#
+# Or manually copy the arguments to your command line.

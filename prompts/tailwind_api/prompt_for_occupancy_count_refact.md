@@ -1,0 +1,1 @@
+Can you help me refactor all functions that depend on the *rolling-hour capacity accumulation* 

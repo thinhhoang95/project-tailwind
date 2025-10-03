@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""
+Exemplary Run Script for Flow Cache Extraction
+
+This script demonstrates various ways to use the cache_flow_extract.py tool
+with different configurations and parameters.
+"""
+
+import sys
+from pathlib import Path
+
+# Import the wrapper function from cache_flow_extract_mp
+from project_tailwind.flow_x.cache_flow_extract_debug1 import run_flow_cache_extraction
+
+def run_extraction(description, **kwargs):
+    """Run flow cache extraction with given parameters."""
+    print(f"\n{'='*60}")
+    print(f"Running: {description}")
+    print(f"Parameters: {kwargs}")
+    print(f"{'='*60}")
+    
+    try:
+        success = run_flow_cache_extraction(**kwargs)
+        if success:
+            print("✅ SUCCESS")
+        else:
+            print("❌ FAILED")
+        return success
+    except Exception as e:
+        print("❌ FAILED")
+        print(f"Error: {e}")
+        return False
+
+def main():
+    """Run exemplary flow cache extraction scenarios."""
+    
+    # Get the project root directory
+    script_dir = Path(__file__).parent
+    project_root = script_dir.parent
+    
+    # Common parameters
+    tv_geojson = "D:/project-cirrus/cases/scenarios/wxm_sm_ih_maxpool.geojson"
+    
+    print("Flow Cache Extraction - Exemplary Runs")
+    print("=====================================")
+    print(f"Project root: {project_root}")
+    print(f"Traffic volumes: {tv_geojson}")
+    
+    # Check if required files exist
+    if not Path(tv_geojson).exists():
+        print(f"❌ Traffic volume GeoJSON not found: {tv_geojson}")
+        print("Please update the path in this script to point to your traffic volume GeoJSON file")
+        return
+    
+    # Change to project root directory for relative paths to work
+    import os
+    os.chdir(project_root)
+    
+    success_count = 0
+    total_runs = 0
+    
+    # Example 1: Basic run with limited hotspots
+    total_runs += 1
+    if run_extraction(
+        "Basic run",
+        tv_geojson=tv_geojson,
+        threshold=0.0,
+        # limit_hotspots=1,
+        output_dir="output/examples/basic_run",
+        alpha=0.05,
+        max_groups=128,
+        k_max=20,
+        avg_objective=False,
+        group_size_lam=-0.05,
+        path_length_gamma=2.0,
+        debug=True
+    ):
+        success_count += 1
+    
+    # Summary
+    print(f"\n{'='*60}")
+    print("SUMMARY")
+    print(f"{'='*60}")
+    print(f"Successful runs: {success_count}/{total_runs}")
+    
+    if success_count == total_runs:
+        print("🎉 All exemplary runs completed successfully!")
+        print("\nOutput directories created:")
+        for example_dir in ["basic_run"]:
+            output_dir = project_root / "output" / "examples" / example_dir
+            if output_dir.exists():
+                print(f"  - {output_dir}")
+                # List CSV files in each directory
+                csv_files = list(output_dir.glob("*.csv"))
+                for csv_file in csv_files:
+                    print(f"    └── {csv_file.name}")
+    else:
+        print(f"⚠️  {total_runs - success_count} runs failed. Check the output above for details.")
+    
+    print(f"\nTo explore the results, check the CSV files in:")
+    print(f"  {project_root / 'output' / 'examples'}")
+
+
+if __name__ == "__main__":
+    main()

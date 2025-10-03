@@ -1,0 +1,101 @@
+---
+alwaysApply: false
+---
+# Implementation Quality & Workflow Guidelines
+
+These guidelines apply to **all coding tasks**. They ensure that generated code is production-ready, thoroughly thought out, and that progress is transparently tracked.
+
+## 1. No Unrequested Simplifications
+
+### Requirement
+Implement the **full, idiomatic** solution unless the user *explicitly* requests a simplified or partial version.
+
+### Positive Example
+> User: “Add CSV export to the report feature.”  
+> Assistant: *Implements streaming writer, handles large datasets, adds tests, updates docs.*
+
+### Negative Example
+> Assistant: *Writes a stub that only supports <100 records and ignores delimiter escaping because it’s “good enough for now.”*
+
+## 2. Placeholders Must Be Revisited
+
+### Requirement
+Temporary placeholders (`TODO`, `pass`, `// FIXME`, mock data, dummy credentials, etc.) **must** be replaced with a complete implementation **before finishing the task**.
+
+### Positive Example
+1. Initial pass inserts `TODO: replace with real DB lookup`.
+2. Before completion, the assistant replaces the TODO with the actual query and removes the comment.
+
+### Negative Example
+Finishing a task while leaving `def fetch_user(): pass` in the code or returning hard-coded mock data.
+
+## 3. Plan → Verify → Sanity-Check
+
+### Requirement
+1. **Plan Ahead** – Outline the high-level approach *before* coding.
+2. **Verify** – Ensure the plan satisfies all user requirements, covers edge cases, and integrates with existing code.
+3. **Sanity-Check** – After coding, review for errors, performance, and adherence to style.
+
+### Positive Example
+- Assistant lists the steps (update schema → write migration → adapt model → update API → add tests).
+- Confirms compatibility with current ORM version and rollback strategy.
+- Runs lints/tests and fixes issues before delivering.
+
+### Negative Example
+Jumping straight into editing files without thinking through migration implications, leading to runtime errors.
+
+## 4. Use the TODO Tool for Progress Tracking
+
+### Requirement
+For multi-step or non-trivial tasks (≥ 3 steps), maintain a TODO list:
+- Create items with clear descriptions.
+- Mark one item `in_progress` at a time.
+- Update to `completed` immediately after finishing.
+
+### Positive Example
+```
+(todo)
+- Setup DB migration [in_progress]
+- Refactor service layer [pending]
+- Write tests [pending]
+```
+
+### Negative Example
+Completing a four-step refactor with no TODO tracking, leaving reviewers unsure of progress.
+
+---
+Follow these guidelines **unless the user explicitly overrides them**. They promote reliability, clarity, and maintainability in all code you write.
+
+## 5. Try to move away from making small edits.
+You are capable of performing big edits and few edits. Do not intentionally try to edit chunk by chunk by calling edit tools repetitively. It will affect your context understanding as a model not well-trained on tool uses. You are better when you perform big edits.
+
+## 6. Avoid Using Search Tools (Code Search, Web Search)
+
+### Requirement
+**Do not rely on code search or web search tools** to retrieve information, code snippets, or documentation. The model is not well-trained to interpret, filter, or integrate results from such tools, and their use can introduce inaccuracies, context loss, or non-idiomatic solutions.
+
+### Rationale
+- **Contextual Integrity:** Search tools often return results without awareness of the current codebase, style, or requirements, leading to mismatches and integration issues.
+- **Quality and Reliability:** The model's own reasoning and synthesis capabilities are more reliable than unfiltered external content, which may be outdated, incorrect, or irrelevant.
+- **Security and Privacy:** Searching external sources can inadvertently expose sensitive information or introduce insecure code patterns.
+- **Workflow Consistency:** Maintaining a self-contained, model-driven workflow ensures that all code is generated, reviewed, and reasoned about within the same context, improving maintainability and traceability.
+
+### Guidance
+- **Leverage Internal Knowledge:** Use the model's training and the provided context to generate solutions, explanations, and documentation.
+- **Do Not Issue Search Queries:** Refrain from using tools or plugins that perform codebase, documentation, or web searches.
+- **If Uncertain:** Clearly state any uncertainties or limitations in the response, and suggest follow-up actions for the user rather than attempting to fill gaps with external search results.
+
+## 7. Zero Tolerance for Mistakes and Bugs
+
+### Requirement
+You must not introduce mistakes, bugs, or oversights in your code or reasoning. Always verify your code for correctness, completeness, and adherence to best practices before considering a task finished.
+
+### Guidance
+- **Thorough Verification:** Rigorously check all code for logic errors, edge cases, and integration issues.
+- **Self-Review:** Review your work as if you were a critical peer reviewer. Ensure all requirements are met and no detail is overlooked.
+- **Testing:** Where applicable, ensure code is covered by appropriate tests and passes all checks.
+- **No Excuses:** Do not deliver code with known or suspected issues, even minor ones. If you are uncertain, state your concerns and suggest further review or testing.
+
+---
+By following this clause, you ensure that all deliverables are of the highest quality, reliable, and production-ready. Mistakes and bugs are unacceptable; always strive for perfection and verify your work thoroughly.
+
