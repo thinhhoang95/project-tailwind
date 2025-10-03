@@ -1,5 +1,27 @@
 from __future__ import annotations
 
+"""
+This script serves as a test bench for the regulation proposal (regen) engine.
+
+It simulates a second-order workflow where an initial regulation is applied,
+and the system's response is evaluated by re-running hotspot detection. The process
+involves:
+1. Identifying an initial traffic hotspot from baseline data.
+2. Calling the regeneration (regen) engine to generate potential mitigation
+   strategies in the form of flow regulations.
+3. Selecting the best proposal and converting it into a formal regulation plan.
+4. Applying this plan to the system state, which simulates the effects of the
+   regulation by assigning delays to flights.
+5. Re-running hotspot detection on the modified state to observe the impact
+   of the regulation and identify any new or remaining congestion points.
+
+The script loads all necessary data artifacts, prepares inputs in the format
+expected by the backend APIs, invokes the core proposal and evaluation logic,
+and presents the results in human-readable summary tables. It is useful for
+debugging the regen engine's logic, tuning its parameters, and verifying that
+its outputs are sensible without needing to run the full backend server.
+"""
+
 import json
 import sys
 from pathlib import Path
@@ -31,6 +53,15 @@ from parrhesia.flow_agent35.regen.types import RegenConfig
 from parrhesia.optim.capacity import normalize_capacities
 from server_tailwind.core.resources import AppResources, ResourcePaths  # NEW
 from server_tailwind.core.resources import get_resources  # NEW
+from parrhesia.flow_agent35.regen.hotspot_segment_extractor import (
+    extract_hotspot_segments_from_resources,
+    segment_to_hotspot_payload,
+)
+from parrhesia.actions.regulations import DFRegulationPlan
+from parrhesia.actions.dfplan_evaluator import evaluate_df_regulation_plan
+from project_tailwind.stateman.delay_assignment import DelayAssignmentTable
+from project_tailwind.stateman.delta_view import DeltaOccupancyView
+from server_tailwind.core.cache_refresh import refresh_after_state_update
 
 
 # Time Profiling helpers ===
@@ -49,6 +80,13 @@ import time, atexit
 # and verifying that its outputs are sensible without needing to run the full
 # backend server.
 
+# Time Profiling helpers ===
+# A simple performance profiling utility to measure execution time of code blocks.
+# It uses a global dictionary `_stats` to accumulate call counts and total time
+# for each named section. The `timed` context manager wraps the code to be
+
+# measured, and the `_report_timings` function, registered with `atexit`, prints
+# a summary upon script completion.
 _stats = defaultdict(lambda: [0, 0.0])  # name -> [calls, total_seconds]
 @contextmanager
 def timed(name: str):
@@ -73,6 +111,12 @@ def _report_timings():
         print(f"{name:<{width}}  total {sec*1000:8.1f} ms  avg {avg*1000:7.1f} ms  calls {calls:5d}  share {share:5.1%}")
 # End profiling helpers ===
 
+# Configuration parameters for the Leiden algorithm, which is used for community
+# detection to identify traffic flows.
+# - threshold: Similarity threshold for grouping flights into flows.
+# - resolution: Affects the size of the communities (flows) detected. Higher
+#   values lead to more, smaller communities.
+# - seed: Random seed for reproducibility.
 leiden_params = {
     "threshold": 0.64,
     "resolution": 1.0,
@@ -80,6 +124,7 @@ leiden_params = {
 }
 
 def _pick_existing_path(candidates: List[Path]) -> Optional[Path]:
+    """Finds the first existing file from a list of candidate paths."""
     for p in candidates:
         if p.exists():
             return p
@@ -91,9 +136,11 @@ def load_artifacts() -> Tuple[Path, Path, Path]:
     Resolve and validate artifact paths (occupancy, indexer, capacities).
 
     This function searches for the required data files in a list of candidate
-    locations, which can be in the project's 'output' or 'data' directories,
-    or in system-specific paths for larger files like the capacity GeoJSON.
-    It ensures that all necessary files are present before proceeding.
+    locations. This makes the script more portable by not relying on hardcoded
+    absolute paths, allowing it to run in different environments where data may
+    be stored in different directories (e.g., 'output' for local runs, 'data'
+    for checked-in test data). It ensures that all necessary files are present
+    before proceeding.
 
     Returns:
         A tuple containing the resolved Paths for the occupancy matrix,
@@ -158,6 +205,9 @@ def build_data(occupancy_path: Path, indexer_path: Path, caps_path: Path) -> Tup
     ).preload_all()
 
     # Ensure subsequent calls to get_resources() return this same instance
+    # by patching the global variable in the resources module. This is a
+    # workaround to inject the locally-created resources into the shared
+    # context used by other library functions.
     try:
         from server_tailwind.core import resources as _res_mod  # type: ignore
         _res_mod._GLOBAL_RESOURCES = res  # type: ignore[attr-defined]
@@ -167,7 +217,13 @@ def build_data(occupancy_path: Path, indexer_path: Path, caps_path: Path) -> Tup
     indexer = res.indexer
     flight_list = res.flight_list
 
-    # Defensive occupancy width alignment (keep as before)
+    # Defensive occupancy width alignment
+    # The flight list's occupancy matrix width must match the total number of
+    # TVTWs (Traffic Volume Time Windows) defined by the indexer. If the loaded
+    # flight list is from an older run or has a different configuration, its
+    # occupancy matrix might be narrower. This block pads the matrix with zeros
+    # on the right to ensure its dimensions are consistent with the indexer,
+    # preventing index-out-of-bounds errors during calculations.
     expected_tvtws = len(indexer.tv_id_to_idx) * indexer.num_time_bins
     if getattr(flight_list, "num_tvtws", 0) < expected_tvtws:
         from scipy import sparse  # type: ignore
@@ -234,7 +290,10 @@ def _build_capacities_by_tv(
         arr = mat[int(row_idx), :]
         capacities_by_tv[str(tv_id)] = np.asarray(arr, dtype=np.float64)
 
-    # Normalize: treat non-positive bins as unconstrained
+    # Normalize capacities: treat non-positive bins as unconstrained.
+    # This standardizes the capacity data, where a value of zero or less implies
+    # there is no limit on traffic for that time bin. The `normalize_capacities`
+    # function typically replaces such values with a very large number (infinity).
     capacities_by_tv = normalize_capacities(capacities_by_tv)
 
     # Optional small sample log for visibility
@@ -268,6 +327,8 @@ def _tv_centroids(
     """
     try:
         # Ensure the GeoDataFrame is in the standard WGS 84 coordinate system.
+        # This is a defensive step to ensure consistency before calculating
+        # centroids, as geographic calculations depend on a common CRS.
         geo = gdf.to_crs(epsg=4326) if gdf.crs and "4326" not in str(gdf.crs) else gdf
     except Exception:
         geo = gdf
@@ -318,6 +379,9 @@ def _travel_minutes_from_centroids(
     lat_arr = np.asarray([centroids[i][0] for i in ids], dtype=np.float64)
     lon_arr = np.asarray([centroids[i][1] for i in ids], dtype=np.float64)
     # Compute all-pairs distance matrix efficiently with vectorized haversine.
+    # This avoids slow, iterative calculations by computing the distances between
+    # all pairs of centroids in a single NumPy operation, which is highly optimized.
+    # The arrays are broadcasted against each other to achieve this.
     dist_nm = haversine_vectorized(lat_arr[:, None], lon_arr[:, None], lat_arr[None, :], lon_arr[None, :])
     minutes = (dist_nm / float(speed_kts)) * 60.0
     out: Dict[str, Dict[str, float]] = {}
@@ -377,6 +441,9 @@ def _build_flow_summary(
         demand = payload_entry.get("demand") or []
         entrants = 0.0
         # Calculate total entrants (demand) for the flow during the hotspot window.
+        # This sums the demand values for each time bin within the hotspot's
+        # duration. If the primary 'demand' data is unavailable, it falls back
+        # to using pre-computed 'proxies' from the hotspot metadata.
         if demand and end_exclusive > start:
             entrants = float(sum(float(demand[t]) for t in range(start, min(end_exclusive, len(demand)))))
         elif proxies.get(fid_key):
@@ -438,6 +505,264 @@ def _proposal_to_dict(
         "diagnostics": diag,
     }
     return result
+
+
+def _print_top_segments(segments, k=5) -> None:
+    """
+    Prints a formatted table of the top hotspot segments using the `rich` library.
+
+    Args:
+        segments: A list of hotspot segment dictionaries to display.
+        k: The number of top segments to print from the list.
+    """
+    from rich.console import Console
+    from rich.table import Table
+    console = Console()
+    table = Table(title="Top Hotspot Segments")
+    table.add_column("Rank", justify="right")
+    table.add_column("Traffic Volume", style="cyan")
+    table.add_column("Start")
+    table.add_column("End")
+    table.add_column("Max Excess", justify="right")
+    table.add_column("Sum Excess", justify="right")
+    for i, seg in enumerate(segments[:k], start=1):
+        table.add_row(
+            str(i),
+            str(seg["traffic_volume_id"]),
+            str(seg["start_label"]),
+            str(seg["end_label"]),
+            f'{float(seg["max_excess"]):.1f}',
+            f'{float(seg["sum_excess"]):.1f}',
+        )
+    console.print(table)
+
+def _bin_label(bin_offset: int, tbm: int) -> str:
+    """Converts a time bin offset to a human-readable 'HH:MM' label."""
+    m = int(bin_offset) * int(tbm)
+    hh = (m // 60) % 24
+    mm = m % 60
+    return f"{hh:02d}:{mm:02d}"
+
+def _decode_tvtw(col: int, bins_per_tv: int, idx_to_tv_id: Mapping[int, str], tbm: int) -> tuple[str, str]:
+    """
+    Decodes a flattened TVTW index into its constituent TV ID and time label.
+
+    The occupancy matrix uses a flattened index for TVTWs, where all time bins
+    for the first TV are followed by all bins for the second, and so on. This
+    function performs the reverse mapping from this 1D index to the original
+    (TV ID, time) pair.
+    """
+    tv_row = int(col) // int(bins_per_tv)
+    bin_off = int(col) % int(bins_per_tv)
+    tv = str(idx_to_tv_id.get(int(tv_row), ""))
+    return tv, _bin_label(bin_off, tbm)
+
+def _build_flows_payload_for_hotspot(hotspot_payload: Mapping[str, Any]) -> tuple[Dict[str, List[str]], Dict[str, List[float]], Dict[str, Any]]:
+    """
+    Prepares inputs and computes the flows payload for a specific hotspot.
+
+    This function is a precursor to running the regulation proposal engine. It
+    takes a hotspot definition, sets up the necessary global resources, and then
+    calls the `compute_flows` API to identify and characterize the traffic flows
+    contributing to that hotspot. It also post-processes the flow results to
+    create mappings of flow-to-flights and flow demand proxies, which are needed
+    by the proposal engine.
+
+    Args:
+        hotspot_payload: A dictionary describing the hotspot.
+
+    Returns:
+        A tuple containing:
+        - flow_to_flights: A dict mapping flow IDs to lists of flight IDs.
+        - flow_proxies: A dict mapping flow IDs to their demand per time bin.
+        - flows_payload: The full raw response from the `compute_flows` API.
+    """
+    res = get_resources().preload_all()
+    set_global_resources(res.indexer, res.flight_list)
+    control_tv = str(hotspot_payload["control_volume_id"])
+    timebins_h = _timebins_from_window(hotspot_payload.get("window_bins", []))
+    centroids = res.tv_centroids
+    direction_opts = {"mode": "coord_cosine", "tv_centroids": centroids} if centroids else {"mode": "coord_cosine"}
+    flows_payload = compute_flows(
+        tvs=[control_tv],
+        timebins=timebins_h,
+        direction_opts=direction_opts,
+        threshold=leiden_params["threshold"],
+        resolution=leiden_params["resolution"],
+    )
+    flow_to_flights: Dict[str, List[str]] = {}
+    flow_proxies: Dict[str, List[float]] = {}
+    demand_key = "demand"
+    for flow in flows_payload.get("flows", []) or []:
+        try:
+            fid_key = str(int(flow.get("flow_id")))
+        except Exception:
+            fid_key = str(flow.get("flow_id"))
+        flights: List[str] = []
+        for spec in flow.get("flights", []) or []:
+            fid = spec.get("flight_id")
+            if fid is not None:
+                flights.append(str(fid))
+        flow_to_flights[fid_key] = flights
+        demand = flow.get(demand_key) or []
+        proxy: List[float] = []
+        for b in timebins_h:
+            try:
+                proxy.append(float(demand[int(b)]))
+            except Exception:
+                proxy.append(0.0)
+        flow_proxies[fid_key] = proxy
+    return flow_to_flights, flow_proxies, flows_payload
+
+def _best_proposal_for_hotspot(
+    *,
+    hotspot_payload: Mapping[str, Any],
+    flight_list: FlightList,
+    indexer: TVTWIndexer,
+) -> tuple[Any, Dict[str, List[str]], Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Finds the best regulation proposal for a given hotspot.
+
+    This function orchestrates the core regulation generation (regen) process.
+    It prepares all necessary data (capacities, travel times, flows), calls the
+    `propose_regulations_for_hotspot` engine to generate a list of candidate
+    solutions, and then selects the best one based on the predicted improvement
+    in the objective score.
+
+    Args:
+        hotspot_payload: A dictionary describing the hotspot.
+        flight_list: The main FlightList object.
+        indexer: The TVTWIndexer object.
+
+    Returns:
+        A tuple containing:
+        - best: The highest-scoring proposal object from the regen engine.
+        - flow_to_flights: A mapping of flow IDs to flight IDs for the hotspot.
+        - flows_payload: The raw flows payload used for proposal generation.
+        - dicts: A list of all generated proposals, serialized to dictionaries.
+    """
+    capacities_by_tv = _build_capacities_by_tv(indexer)
+    res = get_resources().preload_all()
+    travel_minutes_map = res.travel_minutes()
+    flow_to_flights, flow_proxies, flows_payload = _build_flows_payload_for_hotspot(hotspot_payload)
+
+    fallback_cfg = RegenConfig(
+        g_min=-float("inf"),
+        rho_max=float("inf"),
+        slack_min=-float("inf"),
+        distinct_controls_required=False,
+        raise_on_edge_cases=True,
+        min_num_flights=4,
+    )
+    control_tv = str(hotspot_payload["control_volume_id"])
+    timebins_h = _timebins_from_window(hotspot_payload.get("window_bins", []))
+    proposals = propose_regulations_for_hotspot(
+        indexer=indexer,
+        flight_list=flight_list,
+        capacities_by_tv=capacities_by_tv,
+        travel_minutes_map=travel_minutes_map,
+        hotspot_tv=control_tv,
+        timebins_h=timebins_h,
+        flows_payload=flows_payload,
+        flow_to_flights=flow_to_flights,
+        config=fallback_cfg,
+    )
+    if not proposals:
+        raise RuntimeError("regen engine returned no proposals")
+    # Pick by max delta_objective_score, though engine already sorts
+    best = max(proposals, key=lambda p: float(p.predicted_improvement.delta_objective_score))
+    # Build dicts for display
+    exceedance_stats = compute_hotspot_exceedance(
+        indexer=indexer,
+        flight_list=flight_list,
+        capacities_by_tv=capacities_by_tv,
+        hotspot_tv=control_tv,
+        timebins_h=timebins_h,
+    )
+    dicts = [
+        _proposal_to_dict(
+            p, hotspot_payload=hotspot_payload, flows_payload=flows_payload, exceedance_stats=exceedance_stats
+        )
+        for p in proposals
+    ]
+    return best, flow_to_flights, flows_payload, dicts
+
+def _evaluate_and_apply_plan(
+    plan: DFRegulationPlan,
+    *,
+    resources: AppResources,
+    debug_verbose: bool = False,
+) -> None:
+    """
+    Evaluates a regulation plan and applies its effects to the system state.
+
+    This function simulates the operational impact of a proposed regulation. It
+    first calls the `evaluate_df_regulation_plan` API to determine the specific
+    delays that would be assigned to each flight under the plan. Then, it uses
+    this delay information to mutate the central `FlightList` object, effectively
+    applying the regulation and updating the predicted air traffic occupancy
+    across the entire network. Finally, it triggers a cache refresh to ensure
+    all downstream data reflects the new state.
+
+    Args:
+        plan: The `DFRegulationPlan` to be evaluated and applied.
+        resources: The shared `AppResources` object.
+        debug_verbose: If True, prints additional logging during the process.
+    """
+    res = resources
+    fl = res.flight_list
+    idx = res.indexer
+    tbm = int(fl.time_bin_minutes)
+    bins_per_tv = int(fl.num_time_bins_per_tv)
+    pre_total = fl.get_total_occupancy_by_tvtw().astype(np.int64, copy=False)
+
+    # Evaluate plan to get delays
+    eval_res = evaluate_df_regulation_plan(
+        plan,
+        indexer_path=str(res.paths.tvtw_indexer_path),
+        flights_path=str(res.paths.occupancy_file_path),
+    )
+    delays = DelayAssignmentTable.from_dict(eval_res.delays_by_flight)
+
+    # Snapshot old intervals for changed flights
+    old_intervals: Dict[str, List[Dict[str, Any]]] = {}
+    for fid, d in list(eval_res.delays_by_flight.items())[:3]:
+        meta = fl.flight_metadata.get(str(fid)) or {}
+        old_intervals[str(fid)] = list(meta.get("occupancy_intervals") or [])
+
+    if debug_verbose:
+        nonzero = list(delays.nonzero_items())
+        print(f"[apply] Nonzero delay assignments: {len(nonzero)}")
+        for k, v in nonzero[:10]:
+            print(f"  {k}: +{v} min")
+
+    # This is the key state mutation step. A DeltaOccupancyView is created
+    # from the calculated delays, which represents the change in occupancy that
+    # will result from applying the regulation. The `step_by_delay` method
+    # then applies this delta to the main flight list, updating the trajectories
+    # of all affected flights.
+    view = DeltaOccupancyView.from_delay_table(flights=fl, delays=delays, regulation_id="regen_1")
+    fl.step_by_delay(view)
+
+    post_total = fl.get_total_occupancy_by_tvtw().astype(np.int64, copy=False)
+    diff = post_total - pre_total
+    changed = int((diff != 0).sum())
+    l1 = int(np.abs(diff).sum())
+    print(f"[apply] Occupancy changed cells: {changed}, L1 delta: {l1}")
+
+    if debug_verbose:
+        cf = view.changed_flights()[:3]
+        print(f"[apply] Changed flights (sample): {cf}")
+        for fid in cf:
+            before = old_intervals.get(str(fid), [])[:3]
+            after = (view.per_flight_new_intervals.get(str(fid)) or [])[:3]
+            print(f"  Flight {fid}:")
+            for i, (b, a) in enumerate(zip(before, after), start=1):
+                tv_b, label_b = _decode_tvtw(int(b.get('tvtw_index', -1)), bins_per_tv, fl.idx_to_tv_id, tbm) if b else ("", "")
+                tv_a, label_a = _decode_tvtw(int(a.get('tvtw_index', -1)), bins_per_tv, fl.idx_to_tv_id, tbm) if a else ("", "")
+                print(f"    #{i} {tv_b} {label_b} -> {tv_a} {label_a}")
+
+    refresh_after_state_update(res)
 
 
 def propose_regulations(
@@ -589,6 +914,16 @@ def propose_top_regulations(
 def main() -> None:
     """
     Main execution function for the test bench.
+
+    This function orchestrates the entire second-order regulation workflow:
+    1. Loads all required data artifacts.
+    2. Identifies an initial set of hotspots from the baseline data.
+    3. Selects one of these hotspots as a target for regulation.
+    4. Generates a set of regulation proposals for the target hotspot.
+    5. Selects the best proposal and converts it to a regulation plan.
+    6. Applies the plan, mutating the system state to reflect flight delays.
+    7. Re-runs hotspot detection on the new state to assess the impact.
+    8. Prints detailed summaries and saves the results to a file.
     """
     print("[regen] Resolving artifacts ...")
     occ_path, idx_path, caps_path = load_artifacts()
@@ -599,167 +934,134 @@ def main() -> None:
     print("[regen] Loading data ...")
     flight_list, indexer = build_data(occ_path, idx_path, caps_path)
 
-    # Manually define the hotspot to be analyzed. In a real application, this
-    # would come from an automated hotspot detection system.
-    hotspot_payload = {
-        "control_volume_id": "LFBZX15",
-        "window_bins": [45, 49], # means [45, 46, 47, 48]
-        "metadata": {}, # will be filled in below
-        "mode": "manual",
-    }
+    # Second-order workflow parameters
+    debug_verbose = True  # toggle extra logging
 
-    # Build metadata in the same schema as HotspotInventory descriptors.
-    # This metadata, particularly `flow_to_flights`, provides the ground truth
-    # for which flights belong to which flow, which is essential for the regen
-    # engine to correctly model the impact of regulations.
-    # - flow_to_flights: { flow_id(str): [flight_id(str), ...] }
-    # - flow_proxies: { flow_id(str): [entrants per bin within window] }
-    control_tv = str(hotspot_payload["control_volume_id"])
-    timebins_h = _timebins_from_window(hotspot_payload.get("window_bins", []))
-    # First, compute the flows for the given hotspot TV and time window.
-    # Ensure global resources match the shared AppResources
+    # 1) Discover hotspot segments from the initial system state.
+    # We then select a specific hotspot to focus on for regulation. Here, we
+    # deterministically pick the 3rd-ranked hotspot for consistent test runs.
+    print("\n[bold blue]== 1. Initial Hotspot Detection ==[/bold blue]")
     res = get_resources().preload_all()
-    set_global_resources(res.indexer, res.flight_list)
-    centroids = res.tv_centroids
-    direction_opts = {"mode": "coord_cosine", "tv_centroids": centroids} if centroids else {"mode": "coord_cosine"}
-    flows_payload = compute_flows(
-        tvs=[control_tv],
-        timebins=timebins_h,
-        direction_opts=direction_opts,
-        threshold=leiden_params["threshold"],
-        resolution=leiden_params["resolution"],
+    segments = extract_hotspot_segments_from_resources(resources=res)
+    if debug_verbose:
+        print("[regen] First extraction: top hotspot segments")
+        _print_top_segments(segments, k=5)
+    if len(segments) < 3:
+        raise SystemExit("Fewer than 3 hotspot segments found; cannot select 3rd-ranked.")
+    hotspot_payload = segment_to_hotspot_payload(segments[2])
+    print(f"\n[regen] Selected hotspot for mitigation: TV "
+          f"[cyan]{hotspot_payload['control_volume_id']}[/cyan] from "
+          f"[yellow]{hotspot_payload['metadata']['start_label']}[/yellow] to "
+          f"[yellow]{hotspot_payload['metadata']['end_label']}[/yellow]")
+
+
+    # 2) Run the regen engine on the selected hotspot to get proposals, and
+    # choose the best one. Then, convert this proposal into a formal
+    # `DFRegulationPlan` object, which is the standard representation used
+    # for evaluation and application.
+    print("\n[bold blue]== 2. Generating Regulation Proposals ==[/bold blue]")
+    best_proposal, flow_to_flights, flows_payload, proposals_dicts = _best_proposal_for_hotspot(
+        hotspot_payload=hotspot_payload, flight_list=flight_list, indexer=indexer
     )
-
-    # Now, iterate through the computed flows to extract the required metadata.
-    flow_to_flights: Dict[str, List[str]] = {}
-    flow_proxies: Dict[str, List[float]] = {}
-    for flow in flows_payload.get("flows", []) or []:
-        # Normalize flow id to string
-        try:
-            fid_key = str(int(flow.get("flow_id")))
-        except Exception:
-            fid_key = str(flow.get("flow_id"))
-
-        # Collect all flight IDs belonging to this flow.
-        flights: List[str] = []
-        for spec in flow.get("flights", []) or []:
-            fid = spec.get("flight_id")
-            if fid is not None:
-                flights.append(str(fid))
-        flow_to_flights[fid_key] = flights
-
-        # Calculate demand proxies: entrants per bin within the window [t0, t1).
-        # This gives a time-series view of how demand for the flow is distributed.
-        demand = flow.get("demand") or []
-        proxy: List[float] = []
-        for b in timebins_h:
-            try:
-                proxy.append(float(demand[int(b)]))
-            except Exception:
-                proxy.append(0.0)
-        flow_proxies[fid_key] = proxy
-
-    hotspot_payload["metadata"] = {
-        "flow_to_flights": flow_to_flights,
-        "flow_proxies": flow_proxies,
-    }
-    print(
-        "[regen] Using manual hotspot selection: "
-        f"TV={hotspot_payload['control_volume_id']} window={hotspot_payload['window_bins']}"
+    plan = DFRegulationPlan.from_proposal(
+        best_proposal,
+        flights_by_flow=flow_to_flights,
+        time_bin_minutes=int(indexer.time_bin_minutes),
     )
-
-    print("[regen] Proposing regulations (per-flow) ...")
-    # This is the main call to the proposal generation logic.
-    proposals = propose_regulations(
-        hotspot_payload=hotspot_payload,
-        flight_list=flight_list,
-        indexer=indexer,
-    )
-    print(f"[regen] Retrieved {len(proposals)} regulation candidate(s).")
 
     # Use the `rich` library to print a well-formatted summary of the proposals.
-    # This makes the output much easier to review and understand.
+    # This section iterates through the generated proposals and displays their
+    # key attributes in a series of tables, making the output easy to interpret.
     from rich.console import Console
     from rich.table import Table
-
     console = Console()
-
-    for rank, proposal in enumerate(proposals, start=1):
-        # Header info mirrors previous single-proposal view
-        diag = proposal["diagnostics"]
-        improvement = proposal.get("predicted_improvement", {})
-        components_before = diag.get("score_components_before", {}) or {}
-        components_after = diag.get("score_components_after", {}) or {}
-        console.print(f"\n[bold green][regen] Proposal Summary #{rank}[/bold green]")
-        console.print(f"Control Volume: [cyan]{proposal['control_volume_id']}[/cyan]")
-        console.print(
-            f"Window Bins: [cyan]{proposal['window_bins'][0]}-{proposal['window_bins'][1]}[/cyan]"
-        )
-        console.print(
-            f"Target Exceedance to Remove: [yellow]{diag['E_target']:.1f}[/yellow] "
-            f"(D_peak={diag['D_peak']:.1f}, D_sum={diag['D_sum']:.1f})"
-        )
-        delta_obj = float(improvement.get("delta_objective_score", 0.0))
-        console.print(f"Predicted Objective Improvement: [yellow]{delta_obj:.3f}[/yellow]")
-
-        # If available, show the breakdown of the objective function score
-        # before and after the proposed regulation. This helps in understanding
-        # what trade-offs the optimizer made.
-        if components_before or components_after:
-            comp_table = Table(title="Objective Components")
-            comp_table.add_column("Component", style="cyan")
-            comp_table.add_column("Baseline", justify="right", style="magenta")
-            comp_table.add_column("Regulated", justify="right", style="green")
-            comp_table.add_column("Delta", justify="right", style="yellow")
-
-            component_keys = sorted(set(components_before.keys()) | set(components_after.keys()))
-            for key in component_keys:
-                before_val = float(components_before.get(key, 0.0))
-                after_val = float(components_after.get(key, 0.0))
-                delta_val = after_val - before_val
-                comp_table.add_row(
-                    key,
-                    f"{before_val:.3f}",
-                    f"{after_val:.3f}",
-                    f"{delta_val:+.3f}",
-                )
-
-            console.print(comp_table)
-
-        # Display the specific regulations applied to each flow.
-        table = Table(title="Flow Regulations")
-        table.add_column("Flow ID", style="cyan", no_wrap=True)
-        table.add_column("Control TV", style="magenta")
-        table.add_column("Baseline Rate\n(per hour)", justify="right", style="green")
-        table.add_column("Allowed Rate\n(per hour)", justify="right", style="yellow")
-        table.add_column("Cut\n(per hour)", justify="right", style="red")
-        table.add_column("Entrants in\nWindow", justify="right")
-        table.add_column("Num\nFlights", justify="right")
-
-        for flow in proposal["flows"]:
-            table.add_row(
-                str(flow["flow_id"]),
-                str(flow["control_tv_id"]),
-                f"{flow['baseline_rate_per_hour']:.1f}",
-                f"{flow['allowed_rate_per_hour']:.1f}",
-                f"{flow['assigned_cut_per_hour']:.0f}",
-                f"{flow['entrants_in_window']:.0f}",
-                str(flow["num_flights"]),
+    if debug_verbose and proposals_dicts:
+        for rank, proposal in enumerate(proposals_dicts, start=1):
+            diag = proposal["diagnostics"]
+            improvement = proposal.get("predicted_improvement", {})
+            components_before = diag.get("score_components_before", {}) or {}
+            components_after = diag.get("score_components_after", {}) or {}
+            console.print(f"\n[bold green][regen] Proposal Summary #{rank}[/bold green]")
+            console.print(f"Control Volume: [cyan]{proposal['control_volume_id']}[/cyan]")
+            console.print(f"Window Bins: [cyan]{proposal['window_bins'][0]}-{proposal['window_bins'][1]}[/cyan]")
+            console.print(
+                f"Target Exceedance to Remove: [yellow]{diag['E_target']:.1f}[/yellow] "
+                f"(D_peak={diag.get('D_peak', 0.0):.1f}, D_sum={diag.get('D_sum', 0.0):.1f})"
             )
+            delta_obj = float(improvement.get("delta_objective_score", 0.0))
+            console.print(f"Predicted Objective Improvement: [yellow]{delta_obj:.3f}[/yellow]")
 
-        console.print(table)
+            # Display the components of the objective function before and after
+            # the proposed regulation, to show what factors are driving the score.
+            if components_before or components_after:
+                comp_table = Table(title="Objective Components")
+                comp_table.add_column("Component", style="cyan")
+                comp_table.add_column("Baseline", justify="right", style="magenta")
+                comp_table.add_column("Regulated", justify="right", style="green")
+                comp_table.add_column("Delta", justify="right", style="yellow")
+                component_keys = sorted(set(components_before.keys()) | set(components_after.keys()))
+                for key in component_keys:
+                    before_val = float(components_before.get(key, 0.0))
+                    after_val = float(components_after.get(key, 0.0))
+                    delta_val = after_val - before_val
+                    comp_table.add_row(key, f"{before_val:.3f}", f"{after_val:.3f}", f"{delta_val:+.3f}")
+                console.print(comp_table)
+
+            # Display the specific rate changes for each regulated flow.
+            flow_table = Table(title="Flow Regulations")
+            flow_table.add_column("Flow ID", style="cyan", no_wrap=True)
+            flow_table.add_column("Control TV", style="magenta")
+            flow_table.add_column("Baseline Rate\n(per hour)", justify="right", style="green")
+            flow_table.add_column("Allowed Rate\n(per hour)", justify="right", style="yellow")
+            flow_table.add_column("Cut\n(per hour)", justify="right", style="red")
+            flow_table.add_column("Entrants in\nWindow", justify="right")
+            flow_table.add_column("Num\nFlights", justify="right")
+            for flow in proposal["flows"]:
+                flow_table.add_row(
+                    str(flow["flow_id"]),
+                    str(flow["control_tv_id"]),
+                    f"{flow['baseline_rate_per_hour']:.1f}",
+                    f"{flow['allowed_rate_per_hour']:.1f}",
+                    f"{flow['assigned_cut_per_hour']:.0f}",
+                    f"{flow['entrants_in_window']:.0f}",
+                    str(flow["num_flights"]),
+                )
+            console.print(flow_table)
+
+    # 3) Evaluate the DFRegulationPlan to calculate flight delays, then apply
+    # these delays to the flight list, which mutates the system state.
+    print("\n[bold blue]== 3. Applying Regulation Plan to State ==[/bold blue]")
+    _evaluate_and_apply_plan(plan, resources=res, debug_verbose=debug_verbose)
+
+    # 4) Re-extract hotspots on the updated state to see the effect of the
+    # regulation. This is the "second-order" part of the workflow, assessing
+    # the system's response to the intervention.
+    print("\n[bold blue]== 4. Second Hotspot Detection (Post-Regulation) ==[/bold blue]")
+    segments2 = extract_hotspot_segments_from_resources(resources=res)
+    if debug_verbose:
+        print("[regen] Second extraction (after apply): top hotspot segments")
+        _print_top_segments(segments2, k=5)
+
+    # Optional second regen pass (not applied here): uncomment to run again
+    # on a hotspot from the post-regulation state.
+    # best2, flow2, _, _ = _best_proposal_for_hotspot(
+    #     hotspot_payload=segment_to_hotspot_payload(segments2[2]),
+    #     flight_list=flight_list,
+    #     indexer=indexer,
+    # )
 
     # Optional: write the full proposal data to a JSON file for later analysis.
+    print("\n[bold blue]== 5. Saving Results ==[/bold blue]")
     out_dir = REPO_ROOT / "agent_runs" / "runs"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "regen_proposal.json"
     output_payload = {
         "top_hotspot": hotspot_payload,
-        "proposals": proposals,
+        "proposals": proposals_dicts,
     }
     with out_path.open("w", encoding="utf-8") as fh:
         json.dump(output_payload, fh, indent=2)
-    print(f"[regen] Saved {len(proposals)} proposal(s): {out_path}")
+    print(f"[regen] Saved {len(output_payload['proposals'])} proposal(s): {out_path}")
 
 
 if __name__ == "__main__":
