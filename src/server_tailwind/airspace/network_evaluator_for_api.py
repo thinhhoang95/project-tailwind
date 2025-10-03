@@ -1143,6 +1143,10 @@ class NetworkEvaluator:
         
         return results
 
+    # NOTICE FOR MAINTAINERS AND CODING AGENTS: This hotspot segment extractor is the original source for reimplementation in `hotspot_segment_extractor.py` used by the `regen` module.
+    # if you read this, please be aware that any changes to this file may cause inconsistency in the /hotspots API endpoint.
+    # We have plan to migrate this API function to `hotspot_segment_extractor.py` in the future.
+
     def get_hotspot_segments(self, threshold: float = 0.0) -> List[Dict[str, Any]]:
         """
         Detect hotspots using a sliding rolling-hour count at each bin (stride = time_bin_minutes).
