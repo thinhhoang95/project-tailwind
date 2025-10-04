@@ -148,6 +148,7 @@ def clone_flight_list_structural(src: FlightListWithDelta) -> FlightListWithDelt
     dst.total_delay_assigned_min = int(getattr(src, "total_delay_assigned_min", 0))
     dst.num_delayed_flights = int(getattr(src, "num_delayed_flights", 0))
     dst.num_regulations = int(getattr(src, "num_regulations", 0))
+    dst._delay_by_flight = dict(getattr(src, "_delay_by_flight", {}) or {})
     agg = getattr(src, "_delta_aggregate", None)
     dst._delta_aggregate = np.array(agg, copy=True) if agg is not None else np.zeros(dst.num_tvtws, dtype=np.int64)
     dst._applied_views = []
@@ -446,7 +447,7 @@ class RZSandbox:
         delays = DelayAssignmentTable.from_dict(eval_res.delays_by_flight)
         # If fail_fast, raise an error if the evaluation produced no delays,
         # which could indicate a problem (e.g., the regulation targeted no flights).
-        if self._cfg.fail_fast and not delays.delays_by_flight:
+        if self._cfg.fail_fast and len(delays) == 0:
             raise RuntimeError(
                 "Evaluation produced no delays; likely misbound resources or empty targets"
             )
@@ -476,4 +477,3 @@ __all__ = [
     "with_core_resources",
     "segment_to_hotspot_payload",
 ]
-

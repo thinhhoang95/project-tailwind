@@ -5,8 +5,12 @@ from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from parrhesia.flow_agent.safespill_objective import score_with_context
-from parrhesia.optim.objective import ObjectiveWeights, ScoreContext, build_score_context
+from parrhesia.optim.objective import (
+    ObjectiveWeights,
+    ScoreContext,
+    build_score_context,
+    score_with_context,
+)
 
 from .rates import distribute_hourly_rate_to_bins
 from .types import RateCut, Window
